@@ -162,8 +162,10 @@ class HVEBTStage(nn.Module):
                 nn.init.normal_(m.weight, std=self.cfg.init_std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # zero-init final energy head for stable initial energies
-        nn.init.zeros_(self.energy_head.weight)
+        # Energy head gets a SMALL nonzero init. Zero-init would make
+        # grad(E, pred) == 0 identically at step 0 and break the MCMC bootstrap
+        # (pred never moves -> no gradient flows to weights).
+        nn.init.normal_(self.energy_head.weight, std=self.cfg.init_std * 0.1)
         nn.init.zeros_(self.energy_head.bias)
 
     def _get_rope(self, T: int, device: torch.device, dtype: torch.dtype) -> RoPE3DCache:

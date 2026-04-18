@@ -40,6 +40,7 @@ class MobileClipMultiStageEncoder(nn.Module):
         weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt",
         model_name: str = "MobileCLIP2-S0",
         return_stages: Optional[Iterable[str]] = None,
+        normalize_features: bool = True,
     ):
         super().__init__()
         import open_clip  # lazy
@@ -52,6 +53,7 @@ class MobileClipMultiStageEncoder(nn.Module):
         for s in self.return_stages:
             if s not in self.ALL_STAGES:
                 raise ValueError(f"Unknown stage '{s}'. Valid: {self.ALL_STAGES}")
+        self.normalize_features = bool(normalize_features)
 
         self.register_buffer(
             "clip_mean", torch.tensor(_CLIP_MEAN).view(1, 3, 1, 1), persistent=False
@@ -71,6 +73,23 @@ class MobileClipMultiStageEncoder(nn.Module):
 
     def _apply_norm(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.clip_mean) / self.clip_std
+
+    @staticmethod
+    def _layernorm_channels(x: torch.Tensor) -> torch.Tensor:
+        """
+        Per-token channel-wise LayerNorm (no learnable params).
+        Handles (B, C, H, W) and (B, C) tensors.
+        """
+        if x.dim() == 4:
+            # Normalize over C for each (B, H, W) position.
+            mu = x.mean(dim=1, keepdim=True)
+            var = x.var(dim=1, keepdim=True, unbiased=False)
+            return (x - mu) / torch.sqrt(var + 1e-5)
+        if x.dim() == 2:
+            mu = x.mean(dim=-1, keepdim=True)
+            var = x.var(dim=-1, keepdim=True, unbiased=False)
+            return (x - mu) / torch.sqrt(var + 1e-5)
+        raise ValueError(f"Unsupported feature shape: {x.shape}")
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -110,6 +129,10 @@ class MobileClipMultiStageEncoder(nn.Module):
             pooled = head.drop(pooled)
             pooled = head.fc(pooled)  # (B, 512)
             feats["pooled"] = pooled
+
+        if self.normalize_features:
+            for k in list(feats.keys()):
+                feats[k] = self._layernorm_channels(feats[k])
 
         return feats
 
