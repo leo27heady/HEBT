@@ -37,6 +37,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from data.vid.preprocessed_clip_dataset import PreprocessedCLIPDataset  # noqa: E402
 from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset  # noqa: E402
 from model.vid.hvebt import (  # noqa: E402
     HierarchicalHVEBT,
@@ -105,15 +106,18 @@ def build_stage_configs(args) -> List[HVEBTStageConfig]:
 
 def make_model(args, device: torch.device) -> HierarchicalHVEBT:
     stage_cfgs = build_stage_configs(args)
+    weights = "" if args.preprocessed_dir else "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
         mcmc_num_steps=args.mcmc_steps,
         mcmc_step_size=args.mcmc_step_size,
         mcmc_step_size_learnable=True,
         denoising_init=args.denoising_init,
+        disable_cross_attn=args.disable_cross_attn,
         decoder_enabled=args.decoder,
         decoder_out_size=args.image_size,
         decoder_loss_weight=args.decoder_loss_weight,
+        weights_path=weights,
     )
     return HierarchicalHVEBT(cfg).to(device)
 
@@ -142,8 +146,17 @@ def train(args):
     torch.manual_seed(args.seed)
 
     print(f"[hvebt-h] device={device}  stages={args.stages}  decoder={args.decoder}")
-    hparams = make_hparams(args)
-    dataset = VIDShapeSyntheticDataset(hparams, size=args.dataset_size)
+    if args.disable_cross_attn:
+        print("[hvebt-h] *** ABLATION MODE: cross-attention DISABLED ***")
+    use_preprocessed = args.preprocessed_dir is not None
+
+    if use_preprocessed:
+        dataset = PreprocessedCLIPDataset(args.preprocessed_dir, stages=args.stages)
+        print(f"[hvebt-h] Using preprocessed features from: {args.preprocessed_dir}")
+    else:
+        hparams = make_hparams(args)
+        dataset = VIDShapeSyntheticDataset(hparams, size=args.dataset_size)
+
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=(device.type == "cuda"), drop_last=True,
@@ -183,10 +196,14 @@ def train(args):
     while not done:
         for batch in loader:
             t0 = time.time()
-            batch = batch.to(device, non_blocking=True)
-            video01 = denormalize_imnet(batch)
-
-            out = model.forward_loss(video01, learning=True)
+            if use_preprocessed:
+                # batch is dict {stage_name: (B, T, C, H, W)}
+                feats_dict = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                out = model.forward_loss_from_features(feats_dict, learning=True)
+            else:
+                batch = batch.to(device, non_blocking=True)
+                video01 = denormalize_imnet(batch)
+                out = model.forward_loss(video01, learning=True)
             loss_total = out["loss_total"]
 
             opt.zero_grad(set_to_none=True)
@@ -269,6 +286,9 @@ def parse_args():
     ap.add_argument("--context_length", type=int, default=8)
     ap.add_argument("--dataset_size", type=int, default=128)
     ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--preprocessed_dir", type=str, default=None,
+                    help="Path to preprocessed CLIP features (from preprocess_clip_features.py). "
+                         "If set, skips CLIP encoder during training.")
     # stages
     ap.add_argument("--stages", nargs="+", default=["s1", "s2"],
                     help="Ordered list of MobileCLIP stages from finest to coarsest, e.g. 's1 s2 s3'.")
@@ -282,6 +302,10 @@ def parse_args():
     ap.add_argument("--mcmc_step_size", type=float, default=1000.0)
     ap.add_argument("--denoising_init", type=str, default="zeros",
                     choices=["zeros", "random_noise", "real_current"])
+    # ablation
+    ap.add_argument("--disable_cross_attn", action="store_true",
+                    help="Ablation: disable parent KV conditioning between stages. "
+                         "Each stage runs independent MCMC without top-down signal.")
     # decoder
     ap.add_argument("--decoder", action="store_true")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0)

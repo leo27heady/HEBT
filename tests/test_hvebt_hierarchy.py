@@ -34,7 +34,7 @@ from model.vid.hvebt import (  # noqa: E402
     HVEBTStage,
     HVEBTStageConfig,
     PixelDecoder,
-    build_parent_child_2x2_mask,
+    build_child_to_parent_mask,
     save_recon_grid,
 )
 from model.vid.hvebt.positional import build_rope3d  # noqa: E402
@@ -93,12 +93,14 @@ def _make_model_no_encoder(cfg: HierarchicalHVEBTConfig) -> HierarchicalHVEBT:
 
     stages = []
     for i, sc in enumerate(cfg.stages):
-        if i == 0:
+        if i == len(cfg.stages) - 1:
+            # Apex (coarsest) stage: no cross-attention
             stages.append(HVEBTStage(sc))
         else:
-            child_sc = cfg.stages[i - 1]
-            stages.append(HVEBTStage(sc, child_channels=child_sc.clip_channels,
-                                     child_HW=(child_sc.H, child_sc.W)))
+            # Non-apex stages cross-attend to the coarser stage above
+            parent_sc = cfg.stages[i + 1]
+            stages.append(HVEBTStage(sc, parent_channels=parent_sc.clip_channels,
+                                     parent_HW=(parent_sc.H, parent_sc.W)))
     model.stages = torch.nn.ModuleList(stages)
     model.alphas = torch.nn.ParameterList([
         torch.nn.Parameter(torch.tensor(float(cfg.mcmc_step_size)),
@@ -145,48 +147,47 @@ def _forward_loss_with_fake_feats(model: HierarchicalHVEBT, feats_dict, learning
 # --------------------------------------------------------------------------- #
 
 
-def test_parent_child_2x2_mask_shape():
+def test_child_to_parent_mask_shape():
     T, Hp, Wp = 3, 4, 5
     Hc, Wc = 2 * Hp, 2 * Wp
-    m = build_parent_child_2x2_mask(T, Hp, Wp, DEVICE)
-    assert m.shape == (T * Hp * Wp, T * Hc * Wc)
+    m = build_child_to_parent_mask(T, Hp, Wp, DEVICE)
+    # Queries are child (finer), keys are parent (coarser)
+    assert m.shape == (T * Hc * Wc, T * Hp * Wp)
 
 
-def test_parent_child_2x2_mask_exhaustive_tiny():
-    """For a tiny grid, verify mask allows EXACTLY the 4 spatial children at the same t."""
+def test_child_to_parent_mask_exhaustive_tiny():
+    """For a tiny grid, verify mask allows EXACTLY 1 parent per child (the spatial parent)."""
     T, Hp, Wp = 2, 2, 2
     Hc, Wc = 4, 4
-    m = build_parent_child_2x2_mask(T, Hp, Wp, DEVICE)
-    Np, Nc = m.shape
+    m = build_child_to_parent_mask(T, Hp, Wp, DEVICE)
+    Nc, Np = m.shape
     allowed = torch.isfinite(m)  # 0 vs -inf
-    # Each row should have exactly 4 allowed entries (one 2x2 block at same t).
-    assert (allowed.sum(dim=-1) == 4).all(), "every parent must have exactly 4 children"
+    # Each child row should have exactly 1 allowed entry (its parent).
+    assert (allowed.sum(dim=-1) == 1).all(), "every child must have exactly 1 parent"
     # Build the brute-force ground truth.
-    expected = torch.zeros(Np, Nc, dtype=torch.bool)
-    for tp in range(T):
-        for yp in range(Hp):
-            for xp in range(Wp):
-                pi = tp * (Hp * Wp) + yp * Wp + xp
-                for dy in range(2):
-                    for dx in range(2):
-                        ys = 2 * yp + dy
-                        xs = 2 * xp + dx
-                        ci = tp * (Hc * Wc) + ys * Wc + xs
-                        expected[pi, ci] = True
+    expected = torch.zeros(Nc, Np, dtype=torch.bool)
+    for tc in range(T):
+        for yc in range(Hc):
+            for xc in range(Wc):
+                ci = tc * (Hc * Wc) + yc * Wc + xc
+                yp = yc // 2
+                xp = xc // 2
+                pi = tc * (Hp * Wp) + yp * Wp + xp
+                expected[ci, pi] = True
     assert torch.equal(allowed, expected)
 
 
-def test_parent_child_2x2_mask_no_cross_time_leak():
+def test_child_to_parent_mask_no_cross_time_leak():
     T, Hp, Wp = 4, 2, 2
     Hc, Wc = 4, 4
-    m = build_parent_child_2x2_mask(T, Hp, Wp, DEVICE)
+    m = build_child_to_parent_mask(T, Hp, Wp, DEVICE)
     allowed = torch.isfinite(m)
-    # For every (parent, child) allowed pair, parent_t must equal child_t.
-    p_t = (torch.arange(allowed.shape[0]) // (Hp * Wp))
-    c_t = (torch.arange(allowed.shape[1]) // (Hc * Wc))
-    for pi in range(allowed.shape[0]):
-        ci = torch.where(allowed[pi])[0]
-        assert (c_t[ci] == p_t[pi]).all()
+    # For every (child, parent) allowed pair, child_t must equal parent_t.
+    c_t = (torch.arange(allowed.shape[0]) // (Hc * Wc))
+    p_t = (torch.arange(allowed.shape[1]) // (Hp * Wp))
+    for ci in range(allowed.shape[0]):
+        pi = torch.where(allowed[ci])[0]
+        assert (p_t[pi] == c_t[ci]).all()
 
 
 # --------------------------------------------------------------------------- #
@@ -198,14 +199,15 @@ def test_cross_attention_forward_shape():
     B, T, Hp, Wp = 2, 3, 2, 2
     Hc, Wc = 4, 4
     Dq, Dkv, H, dh = 16, 16, 2, 8
-    q_tok = torch.randn(B, T * Hp * Wp, Dq)
-    kv_tok = torch.randn(B, T * Hc * Wc, Dkv)
-    rope_q = build_rope3d(T, Hp, Wp, dh, DEVICE)
-    rope_kv = build_rope3d(T, Hc, Wc, dh, DEVICE)
-    mask = build_parent_child_2x2_mask(T, Hp, Wp, DEVICE)
+    # Child is query (finer), parent is KV (coarser)
+    q_tok = torch.randn(B, T * Hc * Wc, Dq)
+    kv_tok = torch.randn(B, T * Hp * Wp, Dkv)
+    rope_q = build_rope3d(T, Hc, Wc, dh, DEVICE)
+    rope_kv = build_rope3d(T, Hp, Wp, dh, DEVICE)
+    mask = build_child_to_parent_mask(T, Hp, Wp, DEVICE)
     attn = CrossAttention3DRoPE(Dq, Dkv, H)
     out = attn(q_tok, kv_tok, rope_q, rope_kv, mask)
-    assert out.shape == (B, T * Hp * Wp, Dq)
+    assert out.shape == (B, T * Hc * Wc, Dq)
     assert torch.isfinite(out).all()
 
 
@@ -215,11 +217,11 @@ def test_cross_attention_deterministic():
     Dq, Dkv, H, dh = 16, 16, 2, 8
     torch.manual_seed(0)
     attn = CrossAttention3DRoPE(Dq, Dkv, H)
-    q_tok = torch.randn(B, T * Hp * Wp, Dq)
-    kv_tok = torch.randn(B, T * Hc * Wc, Dkv)
-    rope_q = build_rope3d(T, Hp, Wp, dh, DEVICE)
-    rope_kv = build_rope3d(T, Hc, Wc, dh, DEVICE)
-    mask = build_parent_child_2x2_mask(T, Hp, Wp, DEVICE)
+    q_tok = torch.randn(B, T * Hc * Wc, Dq)
+    kv_tok = torch.randn(B, T * Hp * Wp, Dkv)
+    rope_q = build_rope3d(T, Hc, Wc, dh, DEVICE)
+    rope_kv = build_rope3d(T, Hp, Wp, dh, DEVICE)
+    mask = build_child_to_parent_mask(T, Hp, Wp, DEVICE)
     attn.eval()
     with torch.no_grad():
         a = attn(q_tok, kv_tok, rope_q, rope_kv, mask)
@@ -227,43 +229,45 @@ def test_cross_attention_deterministic():
     assert torch.allclose(a, b)
 
 
-def test_cross_attention_only_uses_allowed_children():
+def test_cross_attention_only_uses_allowed_parent():
     """
-    Perturb a child token at a position that is NOT allowed for parent[0]; the
-    output for parent[0] must be unchanged. Perturb an allowed child and the
-    output for parent[0] MUST change.
+    Perturb a parent token at a position that is NOT the parent of child[0]; the
+    output for child[0] must be unchanged. Perturb the allowed parent and the
+    output for child[0] MUST change.
     """
     torch.manual_seed(42)
     B, T, Hp, Wp = 1, 1, 2, 2
     Hc, Wc = 4, 4
     Dq, Dkv, H, dh = 16, 16, 2, 8
     attn = CrossAttention3DRoPE(Dq, Dkv, H, bias=False).eval()
-    q_tok = torch.randn(B, T * Hp * Wp, Dq)
-    kv_tok = torch.randn(B, T * Hc * Wc, Dkv)
-    rope_q = build_rope3d(T, Hp, Wp, dh, DEVICE)
-    rope_kv = build_rope3d(T, Hc, Wc, dh, DEVICE)
-    mask = build_parent_child_2x2_mask(T, Hp, Wp, DEVICE)
+    # Child queries, parent KV
+    q_tok = torch.randn(B, T * Hc * Wc, Dq)
+    kv_tok = torch.randn(B, T * Hp * Wp, Dkv)
+    rope_q = build_rope3d(T, Hc, Wc, dh, DEVICE)
+    rope_kv = build_rope3d(T, Hp, Wp, dh, DEVICE)
+    mask = build_child_to_parent_mask(T, Hp, Wp, DEVICE)
 
     with torch.no_grad():
         out0 = attn(q_tok, kv_tok, rope_q, rope_kv, mask)
 
-    # parent (yp=0, xp=0) -> children at (y in {0,1}, x in {0,1}). Child (2,0) is NOT allowed.
-    forbidden_child = 2 * Wc + 0           # y=2, x=0 -> idx=8
-    allowed_child = 0 * Wc + 1             # y=0, x=1 -> idx=1
+    # child[0] is at (yc=0, xc=0), so its parent is at (yp=0, xp=0) = parent idx 0.
+    # Parent at (yp=1, xp=1) = parent idx 3 is NOT the parent of child[0].
+    forbidden_parent = 1 * Wp + 1   # idx=3
+    allowed_parent = 0 * Wp + 0     # idx=0
 
     kv_pert = kv_tok.clone()
-    kv_pert[0, forbidden_child] += 5.0
+    kv_pert[0, forbidden_parent] += 5.0
     with torch.no_grad():
         out_forbidden = attn(q_tok, kv_pert, rope_q, rope_kv, mask)
     assert torch.allclose(out_forbidden[0, 0], out0[0, 0], atol=1e-6), \
-        "parent[0] changed when a forbidden child was perturbed"
+        "child[0] changed when a forbidden parent was perturbed"
 
     kv_pert2 = kv_tok.clone()
-    kv_pert2[0, allowed_child] += 5.0
+    kv_pert2[0, allowed_parent] += 5.0
     with torch.no_grad():
         out_allowed = attn(q_tok, kv_pert2, rope_q, rope_kv, mask)
     assert not torch.allclose(out_allowed[0, 0], out0[0, 0], atol=1e-6), \
-        "parent[0] did NOT change when an allowed child was perturbed"
+        "child[0] did NOT change when its parent was perturbed"
 
 
 # --------------------------------------------------------------------------- #
@@ -318,91 +322,79 @@ def _params_of_stage(model: HierarchicalHVEBT, stage_idx: int):
 
 def test_upper_stage_loss_does_not_grad_lower_stage_params():
     """
-    Compute loss using ONLY the upper stage's per-stage loss; backprop. The
-    lower stage's parameters must have None or all-zero grads (proves the
-    cross-attention KV is genuinely detached).
+    Top-down processing: apex (stages[-1]) runs first, then stage 0.
+    Compute loss using ONLY the lower (finer) stage's per-stage loss; backprop.
+    The upper (coarser) stage's parameters must have None or all-zero grads
+    (proves the cross-attention KV from the parent is genuinely detached).
     """
     torch.manual_seed(0)
     cfg = _tiny_2stage_cfg(n_layers=2)
     model = _make_model_no_encoder(cfg)
     feats = _fake_feats(cfg, B=2, T_plus_1=3)
 
-    out = _forward_loss_with_fake_feats(model, feats, learning=True)
-    # Take the LIVE per-stage loss without `.detach()`. We need to recompute
-    # because forward_loss only returns detached loss inside per_stage.
-    # Re-run, summing only the upper stage's contribution:
-    real_encode = model.encode
-    model.encode = lambda v: feats  # type: ignore
-
-    fake_video = torch.zeros(2, 3, 3, cfg.decoder_out_size, cfg.decoder_out_size)
-    out_live = model.forward_loss(fake_video, learning=True)
-    # Get upper-stage gradient by picking a fresh forward where we manually
-    # compute upper-stage loss against ground truth.
-    model.encode = real_encode  # type: ignore
-
-    # Manual single-stage backward: run stage 0's MCMC (no grad-required for
-    # downstream loss), get its detached final pred, run stage 1's MCMC + loss,
-    # and backward only stage 1's loss.
-    real_ctx_0 = feats["s1"][:, :-1]
-    real_gt_0 = feats["s1"][:, 1:]
-    init_0 = torch.zeros_like(real_gt_0)
-    preds_0, _ = model._mcmc_for_stage(model.stages[0], model.alphas[0],
-                                       real_ctx_0, init_0, child_ctx=None,
-                                       learning=True)
-    child_for_upper = preds_0[-1].detach()
-
+    # Manual top-down MCMC: first apex (stage 1, no cross-attn), then stage 0
+    # with detached parent context from stage 1.
     real_ctx_1 = feats["s2"][:, :-1]
     real_gt_1 = feats["s2"][:, 1:]
     init_1 = torch.zeros_like(real_gt_1)
     preds_1, _ = model._mcmc_for_stage(model.stages[1], model.alphas[1],
-                                       real_ctx_1, init_1,
-                                       child_ctx=child_for_upper, learning=True)
-    upper_loss = sum(F.smooth_l1_loss(p, real_gt_1) for p in preds_1) / len(preds_1)
+                                       real_ctx_1, init_1, parent_ctx=None,
+                                       learning=True)
+    parent_for_lower = preds_1[-1].detach()
+
+    real_ctx_0 = feats["s1"][:, :-1]
+    real_gt_0 = feats["s1"][:, 1:]
+    init_0 = torch.zeros_like(real_gt_0)
+    preds_0, _ = model._mcmc_for_stage(model.stages[0], model.alphas[0],
+                                       real_ctx_0, init_0,
+                                       parent_ctx=parent_for_lower, learning=True)
+    lower_loss = sum(F.smooth_l1_loss(p, real_gt_0) for p in preds_0) / len(preds_0)
 
     # Zero all grads.
     for p in model.parameters():
         if p.grad is not None:
             p.grad = None
-    upper_loss.backward()
+    lower_loss.backward()
 
-    # Lower stage params must have NO gradient (or zero).
-    for p in _params_of_stage(model, 0):
+    # Upper (apex) stage params must have NO gradient (or zero).
+    for p in _params_of_stage(model, 1):
         if p.grad is not None:
             assert torch.allclose(p.grad, torch.zeros_like(p.grad)), \
-                "lower-stage param received gradient via cross-attention!"
+                "upper-stage param received gradient via cross-attention!"
 
-    # Upper stage params MUST have non-zero gradient.
-    upper_grads_present = False
-    upper_grads_finite = True
-    for p in _params_of_stage(model, 1):
+    # Lower stage params MUST have non-zero gradient.
+    lower_grads_present = False
+    lower_grads_finite = True
+    for p in _params_of_stage(model, 0):
         if p.grad is not None and p.grad.abs().sum() > 0:
-            upper_grads_present = True
-            upper_grads_finite = upper_grads_finite and torch.isfinite(p.grad).all().item()
-    assert upper_grads_present, "upper stage got no gradient from its own loss"
-    assert upper_grads_finite, "upper stage got non-finite gradient"
+            lower_grads_present = True
+            lower_grads_finite = lower_grads_finite and torch.isfinite(p.grad).all().item()
+    assert lower_grads_present, "lower stage got no gradient from its own loss"
+    assert lower_grads_finite, "lower stage got non-finite gradient"
 
 
 def test_each_stage_loss_grads_only_its_own_params():
     """For each stage i, backprop only that stage's loss; only stage i's params
-    (and lower-stage NOT, upper-stage NOT) should have non-zero grad."""
+    (and NO other stage) should have non-zero grad."""
     torch.manual_seed(1)
     cfg = _tiny_3stage_cfg(n_layers=2)
     model = _make_model_no_encoder(cfg)
     feats = _fake_feats(cfg, B=2, T_plus_1=3)
 
-    # Build per-stage live losses manually, with detached cross-stage KV.
+    # Build per-stage live losses manually, top-down, with detached cross-stage KV.
     prev_pred_det = None
-    losses = []
-    for i, stage in enumerate(model.stages):
+    losses = [None] * len(model.stages)
+    for i in reversed(range(len(model.stages))):
+        stage = model.stages[i]
         sc = cfg.stages[i]
         f = feats[sc.clip_stage_name]
         real_ctx = f[:, :-1]; real_gt = f[:, 1:]
         init = torch.zeros_like(real_gt)
         preds, _ = model._mcmc_for_stage(stage, model.alphas[i],
                                          real_ctx, init,
-                                         child_ctx=prev_pred_det, learning=True)
+                                         parent_ctx=prev_pred_det, learning=True)
         loss_i = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / len(preds)
-        losses.append(loss_i)
+        losses[i] = loss_i
         prev_pred_det = preds[-1].detach()
 
     for i, loss_i in enumerate(losses):

@@ -1,17 +1,20 @@
 """
-Cross-attention for HVEBT hierarchy.
+Cross-attention for HVEBT hierarchy (top-down prediction tower).
 
-Each upper (coarser) stage cross-attends to the lower (finer) stage's detached
-predicted features with two restrictions:
+The prediction tower processes stages from coarsest (apex) to finest. Each
+finer stage cross-attends to the coarser stage's **detached** predicted
+features (parent → child conditioning) with two restrictions:
 
-  1. Same time step:    a parent at frame tp may only attend keys at frame tp.
-  2. 2x2 parent-child:  a parent at spatial position (yp, xp) may only attend
-                         the 4 children at (2*yp + dy, 2*xp + dx) for dy,dx in {0,1}.
+  1. Same time step:    a child at frame tc may only attend keys at frame tc.
+  2. Spatial parent:    a child at spatial position (yc, xc) may only attend
+                        the parent at (yc // 2, xc // 2).
 
-This keeps the hierarchy strictly local in space and time, mirrors the spatial
-downsampling factor of the underlying CLIP backbone (each MobileCLIP stage is
-1/2 the previous stage's spatial size), and gives a finite, predictable
-receptive field for each parent token.
+This gives each child token exactly 1 parent key (many-to-one: 4 children
+share the same parent). The parent provides abstract context that the child
+specializes into finer detail.
+
+The CLIP encoder is bottom-up (fine→coarse), the prediction tower is top-down
+(coarse→fine).
 """
 from __future__ import annotations
 
@@ -24,11 +27,15 @@ import torch.nn.functional as F
 from model.vid.hvebt.positional import RoPE3DCache, apply_rope3d
 
 
-def build_parent_child_2x2_mask(
+def build_child_to_parent_mask(
     T: int, Hp: int, Wp: int, device: torch.device
 ) -> torch.Tensor:
     """
-    Additive cross-attention mask of shape (T*Hp*Wp, T*Hc*Wc) with Hc=2*Hp, Wc=2*Wp.
+    Additive cross-attention mask of shape (T*Hc*Wc, T*Hp*Wp) with Hc=2*Hp, Wc=2*Wp.
+
+    Queries are from the child (finer) grid, keys are from the parent (coarser) grid.
+    A child at (yc, xc, tc) attends to the parent at (yc//2, xc//2, tc).
+    Each child row has exactly 1 allowed entry.
 
     Token order is t-major then y-major then x-major (matches `build_rope3d`).
     Returns 0 where attention is allowed and -inf elsewhere.
@@ -36,14 +43,8 @@ def build_parent_child_2x2_mask(
     if Hp <= 0 or Wp <= 0 or T <= 0:
         raise ValueError("T, Hp, Wp must be positive")
     Hc, Wc = 2 * Hp, 2 * Wp
-    Np = T * Hp * Wp
-    Nc = T * Hc * Wc
-
-    p_idx = torch.arange(Np, device=device)
-    p_t = p_idx // (Hp * Wp)
-    p_yx = p_idx % (Hp * Wp)
-    p_y = p_yx // Wp
-    p_x = p_yx % Wp
+    Nc = T * Hc * Wc   # child (query) positions
+    Np = T * Hp * Wp   # parent (key) positions
 
     c_idx = torch.arange(Nc, device=device)
     c_t = c_idx // (Hc * Wc)
@@ -51,24 +52,33 @@ def build_parent_child_2x2_mask(
     c_y = c_yx // Wc
     c_x = c_yx % Wc
 
-    same_t = p_t[:, None] == c_t[None, :]                # (Np, Nc)
-    y_match = (c_y[None, :] // 2) == p_y[:, None]        # (Np, Nc)
-    x_match = (c_x[None, :] // 2) == p_x[:, None]        # (Np, Nc)
-    allowed = same_t & y_match & x_match                 # exactly 4 trues per row
+    p_idx = torch.arange(Np, device=device)
+    p_t = p_idx // (Hp * Wp)
+    p_yx = p_idx % (Hp * Wp)
+    p_y = p_yx // Wp
+    p_x = p_yx % Wp
 
-    mask = torch.zeros(Np, Nc, device=device, dtype=torch.float32)
+    same_t = c_t[:, None] == p_t[None, :]                    # (Nc, Np)
+    y_match = (c_y[:, None] // 2) == p_y[None, :]            # (Nc, Np)
+    x_match = (c_x[:, None] // 2) == p_x[None, :]            # (Nc, Np)
+    allowed = same_t & y_match & x_match                     # exactly 1 true per row
+
+    mask = torch.zeros(Nc, Np, device=device, dtype=torch.float32)
     mask.masked_fill_(~allowed, float("-inf"))
     return mask
 
 
 class CrossAttention3DRoPE(nn.Module):
     """
-    Cross-attention with 3D RoPE on Q (parent grid) and K (child grid).
+    Cross-attention with 3D RoPE on Q (child/finer grid) and K (parent/coarser grid).
 
-    Projections operate in `dim_q`. Child KV input has channel `dim_kv` and is
+    In the top-down prediction tower, the child (finer, query) cross-attends to
+    the parent (coarser, key/value) to receive abstract conditioning.
+
+    Projections operate in `dim_q`. Parent KV input has channel `dim_kv` and is
     projected to `dim_q`. Manual scaled dot-product attention is used (instead
     of `F.scaled_dot_product_attention`) to support double-backward through the
-    parent's MCMC unroll on CPU.
+    MCMC unroll on CPU.
     """
 
     def __init__(
@@ -94,40 +104,40 @@ class CrossAttention3DRoPE(nn.Module):
 
     def forward(
         self,
-        q_tokens: torch.Tensor,        # (B, Np, dim_q)
-        kv_tokens: torch.Tensor,       # (B, Nc, dim_kv)
-        rope_q: RoPE3DCache,           # parent grid (T, Hp, Wp)
-        rope_kv: RoPE3DCache,          # child  grid (T, Hc, Wc)
-        attn_mask: torch.Tensor,       # (Np, Nc) additive
+        q_tokens: torch.Tensor,        # (B, Nq, dim_q) - child (finer) queries
+        kv_tokens: torch.Tensor,       # (B, Nkv, dim_kv) - parent (coarser) keys/values
+        rope_q: RoPE3DCache,           # child grid (T, Hc, Wc)
+        rope_kv: RoPE3DCache,          # parent grid (T, Hp, Wp)
+        attn_mask: torch.Tensor,       # (Nq, Nkv) additive
     ) -> torch.Tensor:
-        B, Np, _ = q_tokens.shape
-        Nc = kv_tokens.shape[1]
+        B, Nq, _ = q_tokens.shape
+        Nkv = kv_tokens.shape[1]
 
         q = (
             self.q_proj(q_tokens)
-            .reshape(B, Np, self.n_heads, self.head_dim)
-            .transpose(1, 2)                              # (B, H, Np, dh)
+            .reshape(B, Nq, self.n_heads, self.head_dim)
+            .transpose(1, 2)                              # (B, H, Nq, dh)
         )
         k = (
             self.k_proj(kv_tokens)
-            .reshape(B, Nc, self.n_heads, self.head_dim)
-            .transpose(1, 2)                              # (B, H, Nc, dh)
+            .reshape(B, Nkv, self.n_heads, self.head_dim)
+            .transpose(1, 2)                              # (B, H, Nkv, dh)
         )
         v = (
             self.v_proj(kv_tokens)
-            .reshape(B, Nc, self.n_heads, self.head_dim)
-            .transpose(1, 2)                              # (B, H, Nc, dh)
+            .reshape(B, Nkv, self.n_heads, self.head_dim)
+            .transpose(1, 2)                              # (B, H, Nkv, dh)
         )
 
         q = apply_rope3d(q, rope_q)
         k = apply_rope3d(k, rope_kv)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, Np, Nc)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, Nq, Nkv)
         scores = scores + attn_mask                              # broadcast
         attn = torch.softmax(scores, dim=-1)
         if self.dropout > 0.0 and self.training:
             attn = F.dropout(attn, p=self.dropout)
-        out = torch.matmul(attn, v)                              # (B, H, Np, dh)
-        out = out.transpose(1, 2).reshape(B, Np, self.n_heads * self.head_dim)
+        out = torch.matmul(attn, v)                              # (B, H, Nq, dh)
+        out = out.transpose(1, 2).reshape(B, Nq, self.n_heads * self.head_dim)
         return self.out_proj(out)

@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from model.vid.hvebt.clip_encoder import MobileClipMultiStageEncoder
 from model.vid.hvebt.cross_attention import (
     CrossAttention3DRoPE,
-    build_parent_child_2x2_mask,
+    build_child_to_parent_mask,
 )
 from model.vid.hvebt.positional import RoPE3DCache, apply_rope3d, build_rope3d
 
@@ -124,16 +124,16 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, cfg: HVEBTStageConfig, child_channels: Optional[int] = None):
+    def __init__(self, cfg: HVEBTStageConfig, cross_attn_dim: Optional[int] = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(cfg.embed_dim)
         self.attn = SelfAttention3DRoPE(cfg.embed_dim, cfg.n_heads, cfg.attn_bias, cfg.dropout)
-        self.use_cross_attn = child_channels is not None
+        self.use_cross_attn = cross_attn_dim is not None
         if self.use_cross_attn:
             self.norm_cross_q = nn.LayerNorm(cfg.embed_dim)
             self.cross_attn = CrossAttention3DRoPE(
                 dim_q=cfg.embed_dim,
-                dim_kv=cfg.embed_dim,                  # child has been pre-projected to embed_dim
+                dim_kv=cfg.embed_dim,                  # parent has been pre-projected to embed_dim
                 n_heads=cfg.n_heads,
                 bias=cfg.attn_bias,
                 dropout=cfg.dropout,
@@ -169,48 +169,53 @@ class HVEBTStage(nn.Module):
     Single stage of the hierarchical EBT. Given real clip features and current
     predicted features (both same shape), outputs a per-token scalar energy.
 
-    Optionally accepts `child_context` from a finer (lower) stage. When
-    enabled (`child_channels` is not None), every transformer block adds a
-    cross-attention layer that lets each parent token attend to its 2x2
-    spatial children at the same time step. The child KV is pre-projected
-    inside this module from `child_channels` -> `embed_dim` and is expected
-    to be detached by the caller (so gradient does NOT flow into the child
-    stage's parameters during this stage's MCMC / loss).
+    Optionally accepts `parent_context` from a coarser (upper) stage. When
+    enabled (`parent_channels` is not None), every transformer block adds a
+    cross-attention layer that lets each child token attend to its
+    corresponding parent at (y//2, x//2) at the same time step. The parent KV
+    is pre-projected inside this module from `parent_channels` -> `embed_dim`
+    and is expected to be detached by the caller (so gradient does NOT flow
+    into the parent stage's parameters during this stage's MCMC / loss).
+
+    NOTE: The prediction tower is top-down (coarse→fine). The CLIP encoder
+    provides features bottom-up but the MCMC stages process from apex (coarsest)
+    to base (finest), with each finer stage receiving parent context from the
+    coarser stage above.
     """
 
     def __init__(
         self,
         cfg: HVEBTStageConfig,
-        child_channels: Optional[int] = None,
-        child_HW: Optional[Tuple[int, int]] = None,
+        parent_channels: Optional[int] = None,
+        parent_HW: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
         self.cfg = cfg
-        self.use_cross_attn = child_channels is not None
+        self.use_cross_attn = parent_channels is not None
         if self.use_cross_attn:
-            if child_HW is None:
-                raise ValueError("child_HW must be set when child_channels is not None")
-            Hc, Wc = child_HW
-            if Hc != 2 * cfg.H or Wc != 2 * cfg.W:
+            if parent_HW is None:
+                raise ValueError("parent_HW must be set when parent_channels is not None")
+            Hp, Wp = parent_HW
+            if cfg.H != 2 * Hp or cfg.W != 2 * Wp:
                 raise ValueError(
-                    f"Child grid must be exactly 2x2 of parent: parent={cfg.H}x{cfg.W}, child={Hc}x{Wc}"
+                    f"Current stage must be exactly 2x of parent: current={cfg.H}x{cfg.W}, parent={Hp}x{Wp}"
                 )
-            self.child_HW = (Hc, Wc)
-            self.child_proj = nn.Linear(child_channels, cfg.embed_dim, bias=True)
-            self.child_norm = nn.LayerNorm(cfg.embed_dim)
+            self.parent_HW = (Hp, Wp)
+            self.parent_proj = nn.Linear(parent_channels, cfg.embed_dim, bias=True)
+            self.parent_norm = nn.LayerNorm(cfg.embed_dim)
         else:
-            self.child_HW = None
+            self.parent_HW = None
         # channel-wise concat of (real_t, pred_{t+1}) -> D
         self.input_proj = nn.Linear(2 * cfg.clip_channels, cfg.embed_dim, bias=True)
         self.blocks = nn.ModuleList([
-            Block(cfg, child_channels=(cfg.embed_dim if self.use_cross_attn else None))
+            Block(cfg, cross_attn_dim=(cfg.embed_dim if self.use_cross_attn else None))
             for _ in range(cfg.n_layers)
         ])
         self.norm_out = nn.LayerNorm(cfg.embed_dim)
         self.energy_head = nn.Linear(cfg.embed_dim, 1)
         self._rope_cache: Dict[Tuple[int, torch.device], RoPE3DCache] = {}
         self._mask_cache: Dict[Tuple[int, torch.device], torch.Tensor] = {}
-        self._child_rope_cache: Dict[Tuple[int, torch.device], RoPE3DCache] = {}
+        self._parent_rope_cache: Dict[Tuple[int, torch.device], RoPE3DCache] = {}
         self._cross_mask_cache: Dict[Tuple[int, torch.device], torch.Tensor] = {}
         self._init_weights()
 
@@ -242,15 +247,15 @@ class HVEBTStage(nn.Module):
             self._mask_cache[key] = mask
         return mask
 
-    def _get_child_rope(self, T: int, device: torch.device, dtype: torch.dtype) -> RoPE3DCache:
+    def _get_parent_rope(self, T: int, device: torch.device, dtype: torch.dtype) -> RoPE3DCache:
         if not self.use_cross_attn:
             raise RuntimeError("Cross-attention is disabled for this stage")
         key = (T, device)
-        cache = self._child_rope_cache.get(key)
+        cache = self._parent_rope_cache.get(key)
         if cache is None or cache.cos.dtype != dtype:
-            Hc, Wc = self.child_HW
-            cache = build_rope3d(T, Hc, Wc, self.cfg.embed_dim // self.cfg.n_heads, device, dtype)
-            self._child_rope_cache[key] = cache
+            Hp, Wp = self.parent_HW
+            cache = build_rope3d(T, Hp, Wp, self.cfg.embed_dim // self.cfg.n_heads, device, dtype)
+            self._parent_rope_cache[key] = cache
         return cache
 
     def _get_cross_mask(self, T: int, device: torch.device) -> torch.Tensor:
@@ -259,7 +264,9 @@ class HVEBTStage(nn.Module):
         key = (T, device)
         mask = self._cross_mask_cache.get(key)
         if mask is None:
-            mask = build_parent_child_2x2_mask(T, self.cfg.H, self.cfg.W, device)
+            # Hp, Wp are the parent's spatial dims; child is self (2*Hp, 2*Wp)
+            Hp, Wp = self.parent_HW
+            mask = build_child_to_parent_mask(T, Hp, Wp, device)
             self._cross_mask_cache[key] = mask
         return mask
 
@@ -267,7 +274,7 @@ class HVEBTStage(nn.Module):
         self,
         real_feats: torch.Tensor,                             # (B, T, C, H, W)
         pred_feats: torch.Tensor,                             # (B, T, C, H, W)
-        child_context: Optional[torch.Tensor] = None,         # (B, T, Cc, Hc, Wc) - already detached by caller
+        parent_context: Optional[torch.Tensor] = None,        # (B, T, Cp, Hp, Wp) - already detached by caller
     ) -> torch.Tensor:
         """
         Returns per-token scalar energy of shape (B, T*H*W).
@@ -280,10 +287,10 @@ class HVEBTStage(nn.Module):
                 f"Expected features (C={self.cfg.clip_channels}, H={self.cfg.H}, W={self.cfg.W}), "
                 f"got ({C}, {H}, {W})"
             )
-        if self.use_cross_attn and child_context is None:
-            raise ValueError("This stage was built with cross-attention; child_context is required")
-        if child_context is not None and not self.use_cross_attn:
-            raise ValueError("This stage was built without cross-attention; child_context must be None")
+        if self.use_cross_attn and parent_context is None:
+            raise ValueError("This stage was built with cross-attention; parent_context is required")
+        if parent_context is not None and not self.use_cross_attn:
+            raise ValueError("This stage was built without cross-attention; parent_context must be None")
 
         # (B, T, C, H, W) -> (B, T, H, W, C) -> (B, T*H*W, C)
         r = real_feats.permute(0, 1, 3, 4, 2).reshape(B, T * H * W, C)
@@ -297,20 +304,20 @@ class HVEBTStage(nn.Module):
         rope_ctx: Optional[RoPE3DCache] = None
         cross_mask: Optional[torch.Tensor] = None
         if self.use_cross_attn:
-            Bc, Tc, Cc, Hc, Wc = child_context.shape
-            if Bc != B or Tc != T:
+            Bp, Tp, Cp, Hp, Wp = parent_context.shape
+            if Bp != B or Tp != T:
                 raise ValueError(
-                    f"child_context batch/time mismatch: parent (B,T)=({B},{T}), child=({Bc},{Tc})"
+                    f"parent_context batch/time mismatch: child (B,T)=({B},{T}), parent=({Bp},{Tp})"
                 )
-            if (Hc, Wc) != self.child_HW:
+            if (Hp, Wp) != self.parent_HW:
                 raise ValueError(
-                    f"child_context spatial mismatch: expected {self.child_HW}, got ({Hc},{Wc})"
+                    f"parent_context spatial mismatch: expected {self.parent_HW}, got ({Hp},{Wp})"
                 )
-            c = child_context.permute(0, 1, 3, 4, 2).reshape(B, T * Hc * Wc, Cc)
-            c = self.child_proj(c)
-            c = self.child_norm(c)
+            c = parent_context.permute(0, 1, 3, 4, 2).reshape(B, T * Hp * Wp, Cp)
+            c = self.parent_proj(c)
+            c = self.parent_norm(c)
             ctx_proj = c
-            rope_ctx = self._get_child_rope(T, x.device, x.dtype)
+            rope_ctx = self._get_parent_rope(T, x.device, x.dtype)
             cross_mask = self._get_cross_mask(T, x.device)
 
         for blk in self.blocks:

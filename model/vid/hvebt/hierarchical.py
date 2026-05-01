@@ -1,15 +1,17 @@
 """
 Hierarchical Video EBT (Phase 2 + Phase 3).
 
-Stacks N HVEBTStage modules ordered finest -> coarsest. Each stage:
+Stacks N HVEBTStage modules ordered finest -> coarsest (index 0 = finest).
+The **prediction** (MCMC) tower runs **top-down**: from the apex (coarsest)
+stage to the base (finest) stage. Each stage:
   - Has its own MCMC over its own predicted features at its own CLIP feature
     space (e.g. s1 32x32, s2 16x16, s3 8x8).
-  - Beyond the lowest, cross-attends to the previous (finer) stage's final
+  - Beyond the apex, cross-attends to the previous (coarser) stage's final
     MCMC prediction with **detached** KV. This means:
-        * The lower stage's params get NO gradient from the upper stage's loss.
-        * The lower stage's prediction quality DOES condition the upper stage.
-  - Strict 2x2 parent-child + same-time mask on the cross-attention (see
-    `cross_attention.py`).
+        * The upper stage's params get NO gradient from the lower stage's loss.
+        * The upper stage's prediction quality DOES condition the lower stage.
+  - Strict child→parent mask + same-time constraint on the cross-attention
+    (see `cross_attention.py`).
 
 Optional pixel decoder is attached to the **finest** stage and trained
 independently on detached features.
@@ -59,6 +61,8 @@ class HierarchicalHVEBTConfig:
     denoising_init: str = "zeros"          # "zeros" | "random_noise" | "real_current"
     truncate_mcmc: bool = False
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
+    # Ablation ---------------------------------------------------------------- #
+    disable_cross_attn: bool = False       # If True, no parent KV conditioning between stages
     # Decoder ---------------------------------------------------------------- #
     decoder_enabled: bool = False
     decoder_out_size: int = 256
@@ -89,21 +93,26 @@ class HierarchicalHVEBT(nn.Module):
                 )
 
         stage_names = tuple(s.clip_stage_name for s in cfg.stages)
-        self.encoder = MobileClipMultiStageEncoder(
-            weights_path=cfg.weights_path,
-            return_stages=stage_names,
-        )
+        if cfg.weights_path:
+            self.encoder = MobileClipMultiStageEncoder(
+                weights_path=cfg.weights_path,
+                return_stages=stage_names,
+            )
+        else:
+            self.encoder = None  # preprocessed features mode
 
         stages: List[HVEBTStage] = []
         for i, sc in enumerate(cfg.stages):
-            if i == 0:
+            if cfg.disable_cross_attn or i == len(cfg.stages) - 1:
+                # Apex (coarsest) stage or ablation mode: no cross-attention
                 stages.append(HVEBTStage(sc))
             else:
-                child_sc = cfg.stages[i - 1]
+                # Every non-apex stage cross-attends to the coarser stage above
+                parent_sc = cfg.stages[i + 1]
                 stages.append(HVEBTStage(
                     sc,
-                    child_channels=child_sc.clip_channels,
-                    child_HW=(child_sc.H, child_sc.W),
+                    parent_channels=parent_sc.clip_channels,
+                    parent_HW=(parent_sc.H, parent_sc.W),
                 ))
         self.stages = nn.ModuleList(stages)
 
@@ -136,6 +145,11 @@ class HierarchicalHVEBT(nn.Module):
         Args: video (B, T+1, 3, Hi, Wi) in [0, 1].
         Returns dict of stage_name -> (B, T+1, C, H, W).
         """
+        if self.encoder is None:
+            raise RuntimeError(
+                "Encoder not loaded (weights_path was empty). "
+                "Use forward_loss_from_features() with precomputed features."
+            )
         feats = self.encoder.encode_video(video)
         return {k: v.float() for k, v in feats.items()}
 
@@ -158,7 +172,7 @@ class HierarchicalHVEBT(nn.Module):
         alpha_param: torch.Tensor,
         real_ctx: torch.Tensor,
         init_pred: torch.Tensor,
-        child_ctx: Optional[torch.Tensor],
+        parent_ctx: Optional[torch.Tensor],
         learning: bool,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         preds: List[torch.Tensor] = []
@@ -169,7 +183,7 @@ class HierarchicalHVEBT(nn.Module):
         with torch.set_grad_enabled(True):
             for step in range(K):
                 pred = pred.detach().requires_grad_(True)
-                energy = stage(real_ctx, pred, child_context=child_ctx)
+                energy = stage(real_ctx, pred, parent_context=parent_ctx)
                 energies.append(energy)
                 create_graph = learning and (
                     not self.cfg.truncate_mcmc or step == K - 1
@@ -193,12 +207,31 @@ class HierarchicalHVEBT(nn.Module):
         learning: bool = True,
     ) -> Dict[str, object]:
         feats_dict = self.encode(video)
+        return self._forward_loss_impl(feats_dict, video=video, learning=learning)
 
-        per_stage: List[Dict[str, torch.Tensor]] = []
+    def forward_loss_from_features(
+        self,
+        feats_dict: Dict[str, torch.Tensor],  # {stage_name: (B, T+1, C, H, W)}
+        video: Optional[torch.Tensor] = None,  # only needed if decoder is enabled
+        learning: bool = True,
+    ) -> Dict[str, object]:
+        """Forward pass using precomputed CLIP features (skips the encoder)."""
+        return self._forward_loss_impl(feats_dict, video=video, learning=learning)
+
+    def _forward_loss_impl(
+        self,
+        feats_dict: Dict[str, torch.Tensor],
+        video: Optional[torch.Tensor] = None,
+        learning: bool = True,
+    ) -> Dict[str, object]:
+
+        per_stage: List[Dict[str, torch.Tensor]] = [None] * len(self.stages)
         prev_pred_detached: Optional[torch.Tensor] = None
-        total_loss = video.new_zeros(())
+        total_loss = next(iter(feats_dict.values())).new_zeros(())
 
-        for i, stage in enumerate(self.stages):
+        # Top-down: process from apex (coarsest, last index) to base (finest, index 0)
+        for i in reversed(range(len(self.stages))):
+            stage = self.stages[i]
             sc = self.cfg.stages[i]
             feats = feats_dict[sc.clip_stage_name]                 # (B, T+1, C, H, W)
             real_ctx = feats[:, :-1]
@@ -210,7 +243,7 @@ class HierarchicalHVEBT(nn.Module):
                 self.alphas[i],
                 real_ctx,
                 init_pred,
-                child_ctx=prev_pred_detached,
+                parent_ctx=prev_pred_detached if stage.use_cross_attn else None,
                 learning=learning,
             )
 
@@ -228,7 +261,7 @@ class HierarchicalHVEBT(nn.Module):
                 final_e = energies[-1].mean()
                 # Copy-last-frame baseline in this stage's feature space
                 baseline = F.smooth_l1_loss(real_ctx, real_gt)
-            per_stage.append({
+            per_stage[i] = {
                 "loss": stage_loss.detach(),
                 "init_recon": init_recon,
                 "final_recon": final_recon,
@@ -239,10 +272,10 @@ class HierarchicalHVEBT(nn.Module):
                 "baseline_copy_last": baseline,
                 "final_pred": preds[-1].detach(),
                 "real_gt": real_gt.detach(),
-            })
+            }
 
-            # IMPORTANT: detach for the next stage's cross-attention.
-            # This severs the gradient path from stage i+1's loss back into
+            # IMPORTANT: detach for the next (finer) stage's cross-attention.
+            # This severs the gradient path from stage i-1's loss back into
             # stage i's parameters via the cross-attention KV.
             prev_pred_detached = preds[-1].detach()
 
@@ -253,6 +286,8 @@ class HierarchicalHVEBT(nn.Module):
 
         # Decoder (independent training; uses detached input).
         if self.decoder is not None:
+            if video is None:
+                raise ValueError("Decoder requires `video` tensor for target RGB")
             base_pred = per_stage[0]["final_pred"]                # already .detach()'d above
             decoded = self.decoder(base_pred)                      # (B, T, 3, S, S)
             target_rgb = video[:, 1:, :, : self.cfg.decoder_out_size, : self.cfg.decoder_out_size]
