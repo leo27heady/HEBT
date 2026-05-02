@@ -2,6 +2,7 @@ from model.vid.hvebt.clip_encoder import MobileClipMultiStageEncoder
 from model.vid.hvebt.cross_attention import (
     CrossAttention3DRoPE,
     build_child_to_parent_mask,
+    build_cross_attn_mask,
 )
 from model.vid.hvebt.decoder import PixelDecoder, save_recon_grid
 from model.vid.hvebt.hierarchical import (
@@ -22,6 +23,7 @@ __all__ = [
     "default_3stage_configs",
     "CrossAttention3DRoPE",
     "build_child_to_parent_mask",
+    "build_cross_attn_mask",
     "PixelDecoder",
     "save_recon_grid",
 ]

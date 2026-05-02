@@ -68,6 +68,60 @@ def build_child_to_parent_mask(
     return mask
 
 
+def build_cross_attn_mask(
+    T: int, Hc: int, Wc: int, Hp: int, Wp: int, device: torch.device
+) -> torch.Tensor:
+    """
+    Generalized cross-attention mask: child (Hc, Wc) queries attend to
+    parent (Hp, Wp) keys at the same time step.
+
+    Three cases:
+      1. Parent is a vector (Hp=1, Wp=1): every child token at time t attends
+         to the single parent token at time t (broadcast).
+      2. Child is exactly 2x parent (Hc=2*Hp, Wc=2*Wp): standard spatial
+         parent mapping, child at (yc,xc) attends to parent at (yc//2, xc//2).
+      3. General case: child at (yc,xc) attends to the nearest parent via
+         floor division: parent_y = yc * Hp // Hc, parent_x = xc * Wp // Wc.
+
+    Token order: t-major, then y-major, then x-major.
+    Returns additive mask (0 = allowed, -inf = blocked).
+    """
+    if T <= 0 or Hc <= 0 or Wc <= 0 or Hp <= 0 or Wp <= 0:
+        raise ValueError("All dimensions must be positive")
+
+    Nc = T * Hc * Wc
+    Np = T * Hp * Wp
+
+    c_idx = torch.arange(Nc, device=device)
+    c_t = c_idx // (Hc * Wc)
+    c_yx = c_idx % (Hc * Wc)
+    c_y = c_yx // Wc
+    c_x = c_yx % Wc
+
+    p_idx = torch.arange(Np, device=device)
+    p_t = p_idx // (Hp * Wp)
+    p_yx = p_idx % (Hp * Wp)
+    p_y = p_yx // Wp
+    p_x = p_yx % Wp
+
+    same_t = c_t[:, None] == p_t[None, :]
+
+    if Hp == 1 and Wp == 1:
+        # Vector parent: every child at time t attends to the 1 parent at time t.
+        allowed = same_t
+    else:
+        # Map child spatial to parent spatial via floor division.
+        mapped_py = c_y * Hp // Hc  # (Nc,)
+        mapped_px = c_x * Wp // Wc  # (Nc,)
+        y_match = mapped_py[:, None] == p_y[None, :]
+        x_match = mapped_px[:, None] == p_x[None, :]
+        allowed = same_t & y_match & x_match
+
+    mask = torch.zeros(Nc, Np, device=device, dtype=torch.float32)
+    mask.masked_fill_(~allowed, float("-inf"))
+    return mask
+
+
 class CrossAttention3DRoPE(nn.Module):
     """
     Cross-attention with 3D RoPE on Q (child/finer grid) and K (parent/coarser grid).

@@ -90,12 +90,12 @@ def _make_model_no_encoder(cfg: HierarchicalHVEBTConfig) -> HierarchicalHVEBT:
     # Validate geometry (mirror the constructor's check).
     for i in range(1, len(cfg.stages)):
         child, parent = cfg.stages[i - 1], cfg.stages[i]
-        assert child.H == 2 * parent.H and child.W == 2 * parent.W
+        assert child.H >= parent.H and child.W >= parent.W
 
     stages = []
     for i, sc in enumerate(cfg.stages):
-        if i == len(cfg.stages) - 1:
-            # Apex (coarsest) stage: no cross-attention
+        if cfg.disable_cross_attn or i == len(cfg.stages) - 1:
+            # Apex (coarsest) stage or ablation: no cross-attention
             stages.append(HVEBTStage(sc))
         else:
             # Non-apex stages cross-attend to the coarser stage above
@@ -662,3 +662,81 @@ def test_real_hierarchical_forward_with_encoder():
     for i, s in enumerate(out["per_stage"]):
         sc = cfg.stages[i]
         assert s["final_pred"].shape == (1, 2, sc.clip_channels, sc.H, sc.W)
+
+
+# --------------------------------------------------------------------------- #
+# Non-2x geometry + vector parent (pooled stage)
+# --------------------------------------------------------------------------- #
+
+
+def _cfg_with_pooled_apex(n_layers: int = 1) -> HierarchicalHVEBTConfig:
+    """3-stage config: s1(4x4) -> s2(2x2) -> pooled(1x1)."""
+    return HierarchicalHVEBTConfig(
+        stages=[
+            HVEBTStageConfig(clip_stage_name="s1", clip_channels=8, H=4, W=4,
+                             embed_dim=16, n_heads=2, n_layers=n_layers),
+            HVEBTStageConfig(clip_stage_name="s2", clip_channels=16, H=2, W=2,
+                             embed_dim=16, n_heads=2, n_layers=n_layers),
+            HVEBTStageConfig(clip_stage_name="pooled", clip_channels=32, H=1, W=1,
+                             embed_dim=16, n_heads=2, n_layers=n_layers),
+        ],
+        mcmc_num_steps=2,
+        mcmc_step_size=10.0,
+    )
+
+
+def test_pooled_apex_forward_shape():
+    """A hierarchy with pooled (1x1) apex stage should work end-to-end."""
+    cfg = _cfg_with_pooled_apex()
+    model = _make_model_no_encoder(cfg)
+    feats = _fake_feats(cfg, B=2, T_plus_1=3)
+    out = model.forward_loss_from_features(feats, learning=True)
+    assert torch.isfinite(out["loss_total"])
+    for i, s in enumerate(out["per_stage"]):
+        sc = cfg.stages[i]
+        assert s["final_pred"].shape == (2, 2, sc.clip_channels, sc.H, sc.W)
+
+
+def test_pooled_3d_features_auto_unsqueeze():
+    """3D (B, T, C) features for pooled stage get auto-unsqueezed to 5D."""
+    cfg = _cfg_with_pooled_apex()
+    model = _make_model_no_encoder(cfg)
+    feats = _fake_feats(cfg, B=2, T_plus_1=3)
+    # Simulate pooled being 3D (as CLIP would output)
+    feats["pooled"] = feats["pooled"].squeeze(-1).squeeze(-1)  # (B, T, C)
+    assert feats["pooled"].dim() == 3
+    out = model.forward_loss_from_features(feats, learning=True)
+    assert torch.isfinite(out["loss_total"])
+
+
+def test_non_2x_stage_geometry():
+    """Non-power-of-2 adjacent stages (e.g., 8x8 -> 1x1) should be accepted."""
+    cfg = HierarchicalHVEBTConfig(
+        stages=[
+            HVEBTStageConfig(clip_stage_name="s3", clip_channels=16, H=8, W=8,
+                             embed_dim=16, n_heads=2, n_layers=1),
+            HVEBTStageConfig(clip_stage_name="pooled", clip_channels=32, H=1, W=1,
+                             embed_dim=16, n_heads=2, n_layers=1),
+        ],
+        mcmc_num_steps=2,
+        mcmc_step_size=10.0,
+    )
+    model = _make_model_no_encoder(cfg)
+    feats = _fake_feats(cfg, B=2, T_plus_1=3)
+    out = model.forward_loss_from_features(feats, learning=True)
+    assert torch.isfinite(out["loss_total"])
+
+
+def test_temporal_window_self_attention():
+    """Temporal window=1 means each frame only self-attends (no cross-time)."""
+    cfg = HVEBTStageConfig(
+        clip_stage_name="s1", clip_channels=8, H=2, W=2,
+        embed_dim=16, n_heads=2, n_layers=1, temporal_window=1,
+    )
+    stage = HVEBTStage(cfg)
+    B, T = 2, 3
+    ctx = torch.randn(B, T, 8, 2, 2)
+    nxt = torch.randn(B, T, 8, 2, 2)
+    energy = stage(ctx, nxt)
+    assert energy.shape[0] == B
+    assert torch.isfinite(energy).all()

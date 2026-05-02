@@ -94,15 +94,15 @@ class HierarchicalHVEBT(nn.Module):
         # Progressive: start with apex only; otherwise all active.
         self._num_active_stages: int = 1 if cfg.progressive else len(cfg.stages)
 
-        # Validate parent-child geometry: each stage above stage 0 must be
-        # exactly half the spatial size of the stage below.
+        # Validate parent-child geometry: each finer stage must have
+        # spatial dims >= the coarser stage above it.
         for i in range(1, len(cfg.stages)):
             child = cfg.stages[i - 1]
             parent = cfg.stages[i]
-            if child.H != 2 * parent.H or child.W != 2 * parent.W:
+            if child.H < parent.H or child.W < parent.W:
                 raise ValueError(
-                    f"Stage {i} parent {parent.H}x{parent.W} must be exactly "
-                    f"half of child stage {i-1} {child.H}x{child.W}"
+                    f"Stage {i-1} ({child.H}x{child.W}) must be >= "
+                    f"parent stage {i} ({parent.H}x{parent.W})"
                 )
 
         stage_names = tuple(s.clip_stage_name for s in cfg.stages)
@@ -201,7 +201,14 @@ class HierarchicalHVEBT(nn.Module):
                 "Use forward_loss_from_features() with precomputed features."
             )
         feats = self.encoder.encode_video(video)
-        return {k: v.float() for k, v in feats.items()}
+        return {k: self._ensure_5d(v).float() for k, v in feats.items()}
+
+    @staticmethod
+    def _ensure_5d(x: torch.Tensor) -> torch.Tensor:
+        """Normalize feature shape: (B, T, C) -> (B, T, C, 1, 1) for pooled vectors."""
+        if x.dim() == 3:
+            return x.unsqueeze(-1).unsqueeze(-1)
+        return x
 
     # ------------------------------------------------------------------ #
     # MCMC for a single stage
@@ -261,12 +268,13 @@ class HierarchicalHVEBT(nn.Module):
 
     def forward_loss_from_features(
         self,
-        feats_dict: Dict[str, torch.Tensor],  # {stage_name: (B, T+1, C, H, W)}
+        feats_dict: Dict[str, torch.Tensor],  # {stage_name: (B, T+1, C, H, W) or (B, T+1, C)}
         video: Optional[torch.Tensor] = None,  # only needed if decoder is enabled
         learning: bool = True,
     ) -> Dict[str, object]:
         """Forward pass using precomputed CLIP features (skips the encoder)."""
-        return self._forward_loss_impl(feats_dict, video=video, learning=learning)
+        normed = {k: self._ensure_5d(v) for k, v in feats_dict.items()}
+        return self._forward_loss_impl(normed, video=video, learning=learning)
 
     def _forward_loss_impl(
         self,

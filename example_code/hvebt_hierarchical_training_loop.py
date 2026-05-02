@@ -53,9 +53,13 @@ _IMNET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
 
 # Mapping from clip stage name -> (channels, H, W) at 256x256 input.
 _STAGE_INFO: Dict[str, Tuple[int, int, int]] = {
-    "s1": (128, 32, 32),
-    "s2": (256, 16, 16),
-    "s3": (512, 8,  8),
+    "stem":   (64,  64, 64),
+    "s0":     (64,  64, 64),
+    "s1":     (128, 32, 32),
+    "s2":     (256, 16, 16),
+    "s3":     (512, 8,  8),
+    "final":  (1024, 8, 8),
+    "pooled": (512, 1,  1),
 }
 
 
@@ -88,6 +92,7 @@ def make_hparams(args) -> SimpleNamespace:
 
 def build_stage_configs(args) -> List[HVEBTStageConfig]:
     cfgs: List[HVEBTStageConfig] = []
+    N = len(args.stages)
     for i, name in enumerate(args.stages):
         if name not in _STAGE_INFO:
             raise ValueError(f"Unknown stage '{name}'; choose from {list(_STAGE_INFO)}")
@@ -97,9 +102,26 @@ def build_stage_configs(args) -> List[HVEBTStageConfig]:
             d = args.embed_dim_per_stage[i]
         else:
             d = args.embed_dim
+
+        # Temporal window: coarsest (last) = full causal (None), finest (0) = self-frame only (1).
+        # Intermediate stages linearly interpolate the window size.
+        tw = None  # default: full causal
+        if args.temporal_window:
+            if N == 1:
+                tw = None  # single stage: full causal
+            else:
+                # i=0 is finest, i=N-1 is coarsest
+                # finest gets window=1, coarsest gets None (full).
+                if i == N - 1:
+                    tw = None   # apex: full causal
+                else:
+                    # linear: window = 1 + i * (context_length - 1) / (N - 1)
+                    tw = max(1, 1 + int(i * (args.context_length - 1) / (N - 1)))
+
         cfgs.append(HVEBTStageConfig(
             clip_stage_name=name, clip_channels=c, H=h, W=w,
             embed_dim=d, n_heads=args.n_heads, n_layers=args.n_layers,
+            temporal_window=tw,
         ))
     return cfgs
 
@@ -160,6 +182,13 @@ def train(args):
         print("[hvebt-h] KV detach: OFF (gradients flow through cross-attn KV)")
     if args.progressive:
         print(f"[hvebt-h] Progressive training: {args.progressive_steps} steps per stage")
+    if args.temporal_window:
+        stage_cfgs = build_stage_configs(args)
+        tw_info = ", ".join(
+            f"{s.clip_stage_name}={'full' if s.temporal_window is None else s.temporal_window}"
+            for s in stage_cfgs
+        )
+        print(f"[hvebt-h] Temporal windows: {tw_info}")
     use_preprocessed = args.preprocessed_dir is not None
 
     if use_preprocessed:
@@ -323,6 +352,9 @@ def parse_args():
                     help="Optional per-stage override (must match #stages).")
     ap.add_argument("--n_heads", type=int, default=4)
     ap.add_argument("--n_layers", type=int, default=2)
+    ap.add_argument("--temporal_window", action="store_true",
+                    help="Enable per-stage temporal windowing: apex gets full causal, "
+                         "finest stage gets self-frame only, intermediate stages interpolate.")
     # mcmc
     ap.add_argument("--mcmc_steps", type=int, default=2)
     ap.add_argument("--mcmc_step_size", type=float, default=1000.0)

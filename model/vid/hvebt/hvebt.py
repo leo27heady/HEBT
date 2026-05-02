@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from model.vid.hvebt.clip_encoder import MobileClipMultiStageEncoder
 from model.vid.hvebt.cross_attention import (
     CrossAttention3DRoPE,
-    build_child_to_parent_mask,
+    build_cross_attn_mask,
 )
 from model.vid.hvebt.positional import RoPE3DCache, apply_rope3d, build_rope3d
 
@@ -45,8 +45,8 @@ from model.vid.hvebt.positional import RoPE3DCache, apply_rope3d, build_rope3d
 class HVEBTStageConfig:
     clip_stage_name: str = "final"      # which MobileCLIP stage to condition on / target
     clip_channels: int = 1024            # C of that stage
-    H: int = 8                           # spatial H at this stage
-    W: int = 8                           # spatial W
+    H: int = 8                           # spatial H at this stage (1 for pooled)
+    W: int = 8                           # spatial W (1 for pooled)
     embed_dim: int = 256                 # transformer hidden D (must be divisible by n_heads and yield even head_dim)
     n_heads: int = 4
     n_layers: int = 4
@@ -54,6 +54,8 @@ class HVEBTStageConfig:
     dropout: float = 0.0
     attn_bias: bool = False
     init_std: float = 0.02
+    temporal_window: Optional[int] = None  # Self-attn temporal window. None/0 = full causal,
+                                            # 1 = self-frame only, W = last W frames.
 
 
 # --------------------------------------------------------------------------- #
@@ -61,14 +63,25 @@ class HVEBTStageConfig:
 # --------------------------------------------------------------------------- #
 
 
-def build_block_causal_mask(T: int, HW: int, device: torch.device) -> torch.Tensor:
+def build_block_causal_mask(
+    T: int, HW: int, device: torch.device, temporal_window: Optional[int] = None,
+) -> torch.Tensor:
     """
     Returns additive attention mask of shape (T*HW, T*HW): 0 where allowed, -inf where not.
-    Token at frame tq can attend to tokens at frames tk <= tq (no restriction within a frame).
+
+    By default (temporal_window=None or 0), token at frame tq can attend to
+    tokens at frames tk <= tq (full causal).
+
+    With temporal_window=W (W >= 1): token at frame tq attends only to frames
+    max(0, tq-W+1) <= tk <= tq. So window=1 means self-frame only,
+    window=T means full causal.
     """
-    # frame index of each token position
-    idx = torch.arange(T * HW, device=device) // HW  # (T*HW,)
-    allowed = idx[:, None] >= idx[None, :]  # (N, N) bool, True = allowed
+    idx = torch.arange(T * HW, device=device) // HW  # frame index per token
+    tq = idx[:, None]  # (N, 1)
+    tk = idx[None, :]  # (1, N)
+    allowed = tq >= tk  # causal
+    if temporal_window is not None and temporal_window >= 1:
+        allowed = allowed & (tq - tk < temporal_window)
     mask = torch.zeros(T * HW, T * HW, device=device, dtype=torch.float32)
     mask.masked_fill_(~allowed, float("-inf"))
     return mask
@@ -196,9 +209,10 @@ class HVEBTStage(nn.Module):
             if parent_HW is None:
                 raise ValueError("parent_HW must be set when parent_channels is not None")
             Hp, Wp = parent_HW
-            if cfg.H != 2 * Hp or cfg.W != 2 * Wp:
+            # Validate: parent must be same or smaller spatially.
+            if Hp > cfg.H or Wp > cfg.W:
                 raise ValueError(
-                    f"Current stage must be exactly 2x of parent: current={cfg.H}x{cfg.W}, parent={Hp}x{Wp}"
+                    f"Parent spatial {Hp}x{Wp} must be <= child {cfg.H}x{cfg.W}"
                 )
             self.parent_HW = (Hp, Wp)
             self.parent_proj = nn.Linear(parent_channels, cfg.embed_dim, bias=True)
@@ -243,7 +257,10 @@ class HVEBTStage(nn.Module):
         key = (T, device)
         mask = self._mask_cache.get(key)
         if mask is None:
-            mask = build_block_causal_mask(T, self.cfg.H * self.cfg.W, device)
+            mask = build_block_causal_mask(
+                T, self.cfg.H * self.cfg.W, device,
+                temporal_window=self.cfg.temporal_window,
+            )
             self._mask_cache[key] = mask
         return mask
 
@@ -264,9 +281,9 @@ class HVEBTStage(nn.Module):
         key = (T, device)
         mask = self._cross_mask_cache.get(key)
         if mask is None:
-            # Hp, Wp are the parent's spatial dims; child is self (2*Hp, 2*Wp)
             Hp, Wp = self.parent_HW
-            mask = build_child_to_parent_mask(T, Hp, Wp, device)
+            Hc, Wc = self.cfg.H, self.cfg.W
+            mask = build_cross_attn_mask(T, Hc, Wc, Hp, Wp, device)
             self._cross_mask_cache[key] = mask
         return mask
 
