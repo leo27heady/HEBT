@@ -246,9 +246,11 @@ def train(args):
                       f"({stage_name}) — now {model.num_active_stages}/{len(args.stages)} active")
 
             if use_preprocessed:
-                # batch is dict {stage_name: (B, T, C, H, W)}
-                feats_dict = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-                out = model.forward_loss_from_features(feats_dict, learning=True)
+                # batch is dict {stage_name: (B, T, C, H, W), "video": (B, T, 3, H, W)}
+                video = batch["video"].to(device, non_blocking=True)
+                feats_dict = {k: v.to(device, non_blocking=True)
+                              for k, v in batch.items() if k != "video"}
+                out = model.forward_loss(video, features=feats_dict, learning=True)
             else:
                 batch = batch.to(device, non_blocking=True)
                 video01 = denormalize_imnet(batch)

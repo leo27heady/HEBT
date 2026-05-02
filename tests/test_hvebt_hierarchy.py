@@ -129,18 +129,11 @@ def _fake_feats(cfg: HierarchicalHVEBTConfig, B: int, T_plus_1: int):
 
 
 def _forward_loss_with_fake_feats(model: HierarchicalHVEBT, feats_dict, learning: bool = True):
-    """Run the full hierarchical forward but with a pre-computed feature dict."""
-    # Monkey-patch encode for this call only.
-    real_encode = model.encode
-    model.encode = lambda video: feats_dict  # type: ignore
-    # Need a fake video tensor (used only by decoder branch); make it minimal.
+    """Run the full hierarchical forward with pre-computed features + dummy video."""
     B, Tp1 = next(iter(feats_dict.values())).shape[:2]
-    fake_video = torch.zeros(B, Tp1, 3, model.cfg.decoder_out_size, model.cfg.decoder_out_size)
-    try:
-        out = model.forward_loss(fake_video, learning=learning)
-    finally:
-        model.encode = real_encode  # type: ignore
-    return out
+    S = model.cfg.decoder_out_size if model.cfg.decoder_enabled else 16
+    fake_video = torch.rand(B, Tp1, 3, S, S)
+    return model.forward_loss(fake_video, features=feats_dict, learning=learning)
 
 
 # --------------------------------------------------------------------------- #
@@ -690,7 +683,8 @@ def test_pooled_apex_forward_shape():
     cfg = _cfg_with_pooled_apex()
     model = _make_model_no_encoder(cfg)
     feats = _fake_feats(cfg, B=2, T_plus_1=3)
-    out = model.forward_loss_from_features(feats, learning=True)
+    video = torch.rand(2, 3, 3, 16, 16)
+    out = model.forward_loss(video, features=feats, learning=True)
     assert torch.isfinite(out["loss_total"])
     for i, s in enumerate(out["per_stage"]):
         sc = cfg.stages[i]
@@ -705,7 +699,8 @@ def test_pooled_3d_features_auto_unsqueeze():
     # Simulate pooled being 3D (as CLIP would output)
     feats["pooled"] = feats["pooled"].squeeze(-1).squeeze(-1)  # (B, T, C)
     assert feats["pooled"].dim() == 3
-    out = model.forward_loss_from_features(feats, learning=True)
+    video = torch.rand(2, 3, 3, 16, 16)
+    out = model.forward_loss(video, features=feats, learning=True)
     assert torch.isfinite(out["loss_total"])
 
 
@@ -723,7 +718,8 @@ def test_non_2x_stage_geometry():
     )
     model = _make_model_no_encoder(cfg)
     feats = _fake_feats(cfg, B=2, T_plus_1=3)
-    out = model.forward_loss_from_features(feats, learning=True)
+    video = torch.rand(2, 3, 3, 16, 16)
+    out = model.forward_loss(video, features=feats, learning=True)
     assert torch.isfinite(out["loss_total"])
 
 

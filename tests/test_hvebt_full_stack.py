@@ -126,6 +126,20 @@ def _fake_feats(cfg: HierarchicalHVEBTConfig, B: int = 2, T_plus_1: int = 3):
     return d
 
 
+def _fake_video(B: int = 2, T_plus_1: int = 3, S: int = 16):
+    """Generate fake video tensor (B, T+1, 3, S, S) in [0,1]."""
+    return torch.rand(B, T_plus_1, 3, S, S)
+
+
+def _forward(model, feats, learning=True, S=16):
+    """Test helper: calls model.forward_loss with a dummy video + features."""
+    # Infer B, T_plus_1 from features
+    sample = next(iter(feats.values()))
+    B, T_plus_1 = sample.shape[0], sample.shape[1]
+    video = _fake_video(B=B, T_plus_1=T_plus_1, S=S)
+    return model.forward_loss(video, features=feats, learning=learning)
+
+
 # =========================================================================== #
 # 1. Full 5-stage forward + backward
 # =========================================================================== #
@@ -137,7 +151,7 @@ class TestFull5StageForwardBackward:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
 
         assert "loss_total" in out
         assert "loss_energy" in out
@@ -156,7 +170,7 @@ class TestFull5StageForwardBackward:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         out["loss_total"].backward()
 
         for i, stage in enumerate(model.stages):
@@ -168,7 +182,7 @@ class TestFull5StageForwardBackward:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         out["loss_total"].backward()
 
         for i, stage in enumerate(model.stages):
@@ -181,14 +195,14 @@ class TestFull5StageForwardBackward:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert out["loss_total"].item() > 0
 
     def test_alpha_has_gradient(self):
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         out["loss_total"].backward()
         for i, alpha in enumerate(model.alphas):
             assert alpha.grad is not None, f"Alpha {i} has no gradient"
@@ -259,7 +273,7 @@ class TestProgressiveTraining:
         model = _make_model_no_encoder(cfg)
         # 1 active stage (apex = index 4)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         per = out["per_stage"]
         for i in range(4):
             assert per[i] is None, f"Stage {i} should be None when inactive"
@@ -270,7 +284,7 @@ class TestProgressiveTraining:
         model = _make_model_no_encoder(cfg)
         model.set_active_stages(2)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         per = out["per_stage"]
         for i in range(3):
             assert per[i] is None
@@ -282,7 +296,7 @@ class TestProgressiveTraining:
         model = _make_model_no_encoder(cfg)
         model.set_active_stages(3)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         per = out["per_stage"]
         for i in range(2):
             assert per[i] is None
@@ -302,7 +316,7 @@ class TestProgressiveTraining:
         for step in range(total_steps):
             model.update_progressive(step)
             optimizer.zero_grad()
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             loss = out["loss_total"]
             assert torch.isfinite(loss), f"Non-finite loss at step {step}"
             loss.backward()
@@ -324,7 +338,7 @@ class TestProgressiveTraining:
         model.set_active_stages(2)  # stages 3, 4 active
 
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         out["loss_total"].backward()
 
         # Stages 0, 1, 2 should have NO gradient
@@ -399,7 +413,7 @@ class TestTemporalWindowing:
         cfg = _full_5stage_cfg(mcmc_steps=2, temporal_windows=tw)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=4)  # T=3
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
     def test_window_1_limits_information_flow(self):
@@ -565,7 +579,7 @@ class TestGradientFlow:
         cfg = _full_5stage_cfg(mcmc_steps=2)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
 
         # Only backprop loss from stage 0 (finest)
         stage0_loss = out["per_stage"][0]["loss"]
@@ -582,7 +596,7 @@ class TestGradientFlow:
         for p in model2.parameters():
             p.grad = None
 
-        out2 = model2.forward_loss_from_features(feats2, learning=True)
+        out2 = _forward(model2, feats2)
         out2["loss_total"].backward()
 
         # With detached KV, stage 4 (apex) grad should come only from its own loss.
@@ -596,7 +610,7 @@ class TestGradientFlow:
         model3.alphas[4].requires_grad_(False)
 
         feats3 = _fake_feats(cfg3, B=2, T_plus_1=3)
-        out3 = model3.forward_loss_from_features(feats3, learning=True)
+        out3 = _forward(model3, feats3)
         out3["loss_total"].backward()
 
         # Stage 4 is frozen and detached KV means no grad flows back
@@ -609,7 +623,7 @@ class TestGradientFlow:
         cfg = _full_5stage_cfg(mcmc_steps=2)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
 
         sum_stage_losses = sum(
             out["per_stage"][i]["loss"].item()
@@ -675,7 +689,7 @@ class TestMCMCChaining:
             cfg.interleaved_mcmc = interleaved
             model = _make_model_no_encoder(cfg)
             feats = _fake_feats(cfg, B=2, T_plus_1=3)
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             assert torch.isfinite(out["loss_total"]), \
                 f"Non-finite loss with interleaved={interleaved}"
             for i in range(5):
@@ -689,7 +703,7 @@ class TestMCMCChaining:
         # Make pooled 3D
         feats["pooled"] = feats["pooled"].squeeze(-1).squeeze(-1)
         assert feats["pooled"].dim() == 3
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
 
@@ -704,7 +718,7 @@ class TestEnergyDecrease:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         for i in range(5):
             s = out["per_stage"][i]
             assert torch.isfinite(s["init_energy"]), f"Stage {i} init_energy not finite"
@@ -716,7 +730,7 @@ class TestEnergyDecrease:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         for i in range(5):
             s = out["per_stage"][i]
             # Allow some slack — MCMC may not always improve recon in 1 forward
@@ -742,7 +756,7 @@ class TestTrainingLoop:
         losses = []
         for step in range(15):
             optimizer.zero_grad()
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             loss = out["loss_total"]
             assert torch.isfinite(loss), f"Non-finite loss at step {step}"
             losses.append(loss.item())
@@ -766,7 +780,7 @@ class TestTrainingLoop:
         for step in range(20):
             model.update_progressive(step)
             optimizer.zero_grad()
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             loss = out["loss_total"]
             assert torch.isfinite(loss), f"Non-finite loss at step {step}, active={model.num_active_stages}"
             loss.backward()
@@ -790,7 +804,7 @@ class TestTrainingLoop:
         losses = []
         for step in range(15):
             optimizer.zero_grad()
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             loss = out["loss_total"]
             assert torch.isfinite(loss), f"Non-finite loss at step {step}"
             losses.append(loss.item())
@@ -815,14 +829,14 @@ class TestRobustness:
         cfg = _full_5stage_cfg(mcmc_steps=2)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=2)  # T=1
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
     def test_batch_size_1(self):
         cfg = _full_5stage_cfg(mcmc_steps=2)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=1, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
     def test_large_mcmc_steps(self):
@@ -830,7 +844,7 @@ class TestRobustness:
         cfg = _full_5stage_cfg(mcmc_steps=8)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=1, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
     def test_eval_mode(self):
@@ -839,7 +853,7 @@ class TestRobustness:
         model = _make_model_no_encoder(cfg)
         model.eval()
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=False)
+        out = _forward(model, feats, learning=False)
         assert torch.isfinite(out["loss_total"])
 
     def test_zero_init_features(self):
@@ -849,7 +863,7 @@ class TestRobustness:
         feats = {}
         for sc in cfg.stages:
             feats[sc.clip_stage_name] = torch.zeros(2, 3, sc.clip_channels, sc.H, sc.W)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
     def test_deterministic_forward(self):
@@ -859,8 +873,8 @@ class TestRobustness:
         model.eval()
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
 
-        out1 = model.forward_loss_from_features(feats, learning=False)
-        out2 = model.forward_loss_from_features(feats, learning=False)
+        out1 = _forward(model, feats, learning=False)
+        out2 = _forward(model, feats, learning=False)
         assert torch.allclose(out1["loss_total"], out2["loss_total"]), \
             "Same input should give same output in eval mode"
 
@@ -871,7 +885,7 @@ class TestRobustness:
             cfg.denoising_init = init
             model = _make_model_no_encoder(cfg)
             feats = _fake_feats(cfg, B=2, T_plus_1=3)
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             assert torch.isfinite(out["loss_total"]), f"Non-finite with init={init}"
 
 
@@ -957,7 +971,7 @@ class TestPerStageOutputs:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
 
         expected_keys = {
             "loss", "init_recon", "final_recon", "init_energy", "final_energy",
@@ -973,7 +987,7 @@ class TestPerStageOutputs:
         cfg = _full_5stage_cfg(mcmc_steps=4)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
 
         for i, sc in enumerate(cfg.stages):
             s = out["per_stage"][i]
@@ -987,7 +1001,7 @@ class TestPerStageOutputs:
         cfg = _full_5stage_cfg(mcmc_steps=2)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         for i in range(5):
             s = out["per_stage"][i]
             assert not s["final_pred"].requires_grad
@@ -998,7 +1012,7 @@ class TestPerStageOutputs:
         cfg = _full_5stage_cfg(mcmc_steps=2)
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         for i in range(5):
             assert out["per_stage"][i]["alpha"].item() > 0
 
@@ -1070,7 +1084,7 @@ class TestMCMCSchedules:
             cfg.interleaved_mcmc = interleaved
             model = _make_model_no_encoder(cfg)
             feats = _fake_feats(cfg, B=2, T_plus_1=3)
-            out = model.forward_loss_from_features(feats, learning=True)
+            out = _forward(model, feats)
             assert len(out["per_stage"]) == 5
             for i in range(5):
                 sc = cfg.stages[i]
@@ -1082,7 +1096,7 @@ class TestMCMCSchedules:
         cfg.interleaved_mcmc = True
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = model.forward_loss_from_features(feats, learning=True)
+        out = _forward(model, feats)
         out["loss_total"].backward()
         for i, stage in enumerate(model.stages):
             has_grad = any(p.grad is not None and p.grad.abs().sum() > 0

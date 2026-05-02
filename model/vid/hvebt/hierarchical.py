@@ -198,7 +198,7 @@ class HierarchicalHVEBT(nn.Module):
         if self.encoder is None:
             raise RuntimeError(
                 "Encoder not loaded (weights_path was empty). "
-                "Use forward_loss_from_features() with precomputed features."
+                "Pass precomputed features via forward_loss(video, features=...)."
             )
         feats = self.encoder.encode_video(video)
         return {k: self._ensure_5d(v).float() for k, v in feats.items()}
@@ -260,26 +260,29 @@ class HierarchicalHVEBT(nn.Module):
 
     def forward_loss(
         self,
-        video: torch.Tensor,        # (B, T+1, 3, Hi, Wi) in [0,1]
+        video: torch.Tensor,                                # (B, T+1, 3, Hi, Wi) in [0,1]
+        features: Optional[Dict[str, torch.Tensor]] = None, # precomputed {stage_name: (B, T+1, C, H, W)}
         learning: bool = True,
     ) -> Dict[str, object]:
-        feats_dict = self.encode(video)
+        """
+        Args:
+            video:    Raw video tensor — always required (used as decoder target
+                      and as encoder input when features are not provided).
+            features: Optional precomputed CLIP features. If None, extracted via
+                      the CLIP encoder from `video`. Supports 3D (B,T,C) for
+                      pooled stages (auto-unsqueezed to 5D).
+            learning: If True, create_graph for MCMC unroll (training mode).
+        """
+        if features is not None:
+            feats_dict = {k: self._ensure_5d(v) for k, v in features.items()}
+        else:
+            feats_dict = self.encode(video)
         return self._forward_loss_impl(feats_dict, video=video, learning=learning)
-
-    def forward_loss_from_features(
-        self,
-        feats_dict: Dict[str, torch.Tensor],  # {stage_name: (B, T+1, C, H, W) or (B, T+1, C)}
-        video: Optional[torch.Tensor] = None,  # only needed if decoder is enabled
-        learning: bool = True,
-    ) -> Dict[str, object]:
-        """Forward pass using precomputed CLIP features (skips the encoder)."""
-        normed = {k: self._ensure_5d(v) for k, v in feats_dict.items()}
-        return self._forward_loss_impl(normed, video=video, learning=learning)
 
     def _forward_loss_impl(
         self,
         feats_dict: Dict[str, torch.Tensor],
-        video: Optional[torch.Tensor] = None,
+        video: torch.Tensor,
         learning: bool = True,
     ) -> Dict[str, object]:
 
@@ -298,14 +301,7 @@ class HierarchicalHVEBT(nn.Module):
         if self.decoder is not None and per_stage[0] is not None:
             base_pred = per_stage[0]["final_pred"]                # already .detach()'d above
             decoded = self.decoder(base_pred)                      # (B, T, 3, S, S)
-            if video is not None:
-                # Target is the ground truth — never modify it.
-                # decoder.out_size must match the video spatial resolution.
-                target_rgb = video[:, 1:]
-            else:
-                # Cached-features mode: reconstruct from finest-stage ground truth
-                # (self-supervised; target = CLIP→decoder(real_gt), no pixel target).
-                target_rgb = self.decoder(per_stage[0]["real_gt"]).detach()
+            target_rgb = video[:, 1:]
             decoder_loss = F.l1_loss(decoded, target_rgb)
             out["loss_decoder"] = decoder_loss
             out["decoded_rgb"] = decoded.detach()
