@@ -63,6 +63,17 @@ class HierarchicalHVEBTConfig:
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
     # Ablation ---------------------------------------------------------------- #
     disable_cross_attn: bool = False       # If True, no parent KV conditioning between stages
+    # MCMC schedule ----------------------------------------------------------- #
+    interleaved_mcmc: bool = False         # If False, each stage runs ALL K steps to convergence
+                                           # before passing its fully-relaxed prediction as KV to
+                                           # the next (finer) stage. Default (False) = interleaved:
+                                           # 1 MCMC step per stage top→bottom, repeat K times.
+    detach_kv: bool = True                 # If True (default), parent KV is detached so upper
+                                           # stage gets no gradient from lower stage's loss.
+                                           # If False, gradients flow through cross-attn KV.
+    # Progressive training ---------------------------------------------------- #
+    progressive: bool = False              # If True, stages are activated one by one top→down.
+    progressive_steps_per_stage: int = 500 # Steps to train each stage before activating the next.
     # Decoder ---------------------------------------------------------------- #
     decoder_enabled: bool = False
     decoder_out_size: int = 256
@@ -80,6 +91,8 @@ class HierarchicalHVEBT(nn.Module):
         if len(cfg.stages) == 0:
             raise ValueError("Need at least one stage")
         self.cfg = cfg
+        # Progressive: start with apex only; otherwise all active.
+        self._num_active_stages: int = 1 if cfg.progressive else len(cfg.stages)
 
         # Validate parent-child geometry: each stage above stage 0 must be
         # exactly half the spatial size of the stage below.
@@ -134,6 +147,43 @@ class HierarchicalHVEBT(nn.Module):
                 in_HW=(base_sc.H, base_sc.W),
                 out_size=cfg.decoder_out_size,
             )
+
+    # ------------------------------------------------------------------ #
+    # progressive training
+    # ------------------------------------------------------------------ #
+
+    @property
+    def num_active_stages(self) -> int:
+        return self._num_active_stages
+
+    def set_active_stages(self, n: int) -> None:
+        """Set how many stages are active (1 = apex only, len = all).
+        Stages activate top-down: apex is always active."""
+        n = max(1, min(n, len(self.stages)))
+        self._num_active_stages = n
+
+    def active_stage_indices(self) -> List[int]:
+        """Return indices of currently active stages (top-down order).
+        With N total stages and K active:
+          active = [N-1, N-2, ..., N-K]  (apex first, then finer)
+        """
+        N = len(self.stages)
+        K = self._num_active_stages
+        return list(reversed(range(N - K, N)))
+
+    def update_progressive(self, step: int) -> Optional[int]:
+        """Call each step when cfg.progressive=True.
+        Returns the newly activated stage index, or None."""
+        if not self.cfg.progressive:
+            return None
+        N = len(self.stages)
+        # After 0 steps: 1 active (apex). After progressive_steps_per_stage: 2, etc.
+        desired = min(N, 1 + step // self.cfg.progressive_steps_per_stage)
+        if desired > self._num_active_stages:
+            self._num_active_stages = desired
+            # Return the newly activated stage index (finest of active set)
+            return N - desired
+        return None
 
     # ------------------------------------------------------------------ #
     # encoding
@@ -225,26 +275,74 @@ class HierarchicalHVEBT(nn.Module):
         learning: bool = True,
     ) -> Dict[str, object]:
 
-        per_stage: List[Dict[str, torch.Tensor]] = [None] * len(self.stages)
-        prev_pred_detached: Optional[torch.Tensor] = None
-        total_loss = next(iter(feats_dict.values())).new_zeros(())
+        if self.cfg.interleaved_mcmc:
+            per_stage, total_loss = self._mcmc_interleaved(feats_dict, learning)
+        else:
+            per_stage, total_loss = self._mcmc_sequential(feats_dict, learning)
 
-        # Top-down: process from apex (coarsest, last index) to base (finest, index 0)
-        for i in reversed(range(len(self.stages))):
+        out: Dict[str, object] = {
+            "loss_energy": total_loss,
+            "per_stage": per_stage,
+        }
+
+        # Decoder (independent training; uses detached input).
+        # Only runs when the finest stage (index 0) is active.
+        if self.decoder is not None and per_stage[0] is not None:
+            base_pred = per_stage[0]["final_pred"]                # already .detach()'d above
+            decoded = self.decoder(base_pred)                      # (B, T, 3, S, S)
+            if video is not None:
+                # Target is the ground truth — never modify it.
+                # decoder.out_size must match the video spatial resolution.
+                target_rgb = video[:, 1:]
+            else:
+                # Cached-features mode: reconstruct from finest-stage ground truth
+                # (self-supervised; target = CLIP→decoder(real_gt), no pixel target).
+                target_rgb = self.decoder(per_stage[0]["real_gt"]).detach()
+            decoder_loss = F.l1_loss(decoded, target_rgb)
+            out["loss_decoder"] = decoder_loss
+            out["decoded_rgb"] = decoded.detach()
+            out["target_rgb"] = target_rgb.detach()
+            out["loss_total"] = total_loss + self.cfg.decoder_loss_weight * decoder_loss
+        else:
+            out["loss_total"] = total_loss
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # MCMC schedules
+    # ------------------------------------------------------------------ #
+
+    def _mcmc_sequential(
+        self,
+        feats_dict: Dict[str, torch.Tensor],
+        learning: bool,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor]:
+        """
+        Sequential schedule: each stage runs ALL K MCMC steps to convergence
+        before passing its fully-relaxed prediction as KV to the next finer stage.
+        Respects progressive training (only active stages participate).
+        """
+        N = len(self.stages)
+        per_stage: List[Optional[Dict[str, torch.Tensor]]] = [None] * N
+        prev_pred: Optional[torch.Tensor] = None
+        total_loss = next(iter(feats_dict.values())).new_zeros(())
+        active = self.active_stage_indices()  # top-down order
+
+        for i in active:
             stage = self.stages[i]
             sc = self.cfg.stages[i]
-            feats = feats_dict[sc.clip_stage_name]                 # (B, T+1, C, H, W)
+            feats = feats_dict[sc.clip_stage_name]
             real_ctx = feats[:, :-1]
             real_gt = feats[:, 1:]
             init_pred = self._init_pred(real_gt)
 
+            parent_ctx = None
+            if stage.use_cross_attn and prev_pred is not None:
+                parent_ctx = prev_pred.detach() if self.cfg.detach_kv else prev_pred
+
             preds, energies = self._mcmc_for_stage(
-                stage,
-                self.alphas[i],
-                real_ctx,
-                init_pred,
-                parent_ctx=prev_pred_detached if stage.use_cross_attn else None,
-                learning=learning,
+                stage, self.alphas[i], real_ctx, init_pred,
+                parent_ctx=parent_ctx, learning=learning,
             )
 
             K = len(preds)
@@ -259,7 +357,6 @@ class HierarchicalHVEBT(nn.Module):
                 final_recon = F.smooth_l1_loss(preds[-1].detach(), real_gt)
                 init_e = energies[0].mean()
                 final_e = energies[-1].mean()
-                # Copy-last-frame baseline in this stage's feature space
                 baseline = F.smooth_l1_loss(real_ctx, real_gt)
             per_stage[i] = {
                 "loss": stage_loss.detach(),
@@ -273,37 +370,98 @@ class HierarchicalHVEBT(nn.Module):
                 "final_pred": preds[-1].detach(),
                 "real_gt": real_gt.detach(),
             }
+            prev_pred = preds[-1]
 
-            # IMPORTANT: detach for the next (finer) stage's cross-attention.
-            # This severs the gradient path from stage i-1's loss back into
-            # stage i's parameters via the cross-attention KV.
-            prev_pred_detached = preds[-1].detach()
+        return per_stage, total_loss
 
-        out: Dict[str, object] = {
-            "loss_energy": total_loss,
-            "per_stage": per_stage,
-        }
+    def _mcmc_interleaved(
+        self,
+        feats_dict: Dict[str, torch.Tensor],
+        learning: bool,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor]:
+        """
+        Interleaved schedule: 1 MCMC step per stage top->bottom, repeat K times.
+        Respects progressive training (only active stages participate).
+        """
+        K = self.cfg.mcmc_num_steps
+        N = len(self.stages)
+        active = self.active_stage_indices()  # top-down order
 
-        # Decoder (independent training; uses detached input).
-        if self.decoder is not None:
-            if video is None:
-                raise ValueError("Decoder requires `video` tensor for target RGB")
-            base_pred = per_stage[0]["final_pred"]                # already .detach()'d above
-            decoded = self.decoder(base_pred)                      # (B, T, 3, S, S)
-            target_rgb = video[:, 1:, :, : self.cfg.decoder_out_size, : self.cfg.decoder_out_size]
-            if target_rgb.shape != decoded.shape:
-                # video resolution may differ; resize target to match decoder out_size
-                Bv, Tv = target_rgb.shape[:2]
-                target_rgb = F.interpolate(
-                    target_rgb.reshape(Bv * Tv, 3, *target_rgb.shape[-2:]),
-                    size=self.cfg.decoder_out_size, mode="bilinear", align_corners=False,
-                ).reshape(Bv, Tv, 3, self.cfg.decoder_out_size, self.cfg.decoder_out_size)
-            decoder_loss = F.l1_loss(decoded, target_rgb)
-            out["loss_decoder"] = decoder_loss
-            out["decoded_rgb"] = decoded.detach()
-            out["target_rgb"] = target_rgb.detach()
-            out["loss_total"] = total_loss + self.cfg.decoder_loss_weight * decoder_loss
-        else:
-            out["loss_total"] = total_loss
+        real_ctxs: List[Optional[torch.Tensor]] = [None] * N
+        real_gts: List[Optional[torch.Tensor]] = [None] * N
+        cur_preds: List[Optional[torch.Tensor]] = [None] * N
+        for i in active:
+            sc = self.cfg.stages[i]
+            feats = feats_dict[sc.clip_stage_name]
+            real_ctxs[i] = feats[:, :-1]
+            real_gts[i] = feats[:, 1:]
+            cur_preds[i] = self._init_pred(real_gts[i])
 
-        return out
+        all_preds: List[List[torch.Tensor]] = [[] for _ in range(N)]
+        all_energies: List[List[torch.Tensor]] = [[] for _ in range(N)]
+
+        total_loss = next(iter(feats_dict.values())).new_zeros(())
+
+        with torch.set_grad_enabled(True):
+            for k in range(K):
+                for i in active:
+                    stage = self.stages[i]
+                    alpha = torch.clamp(self.alphas[i], min=1e-4)
+                    pred = cur_preds[i].detach().requires_grad_(True)
+
+                    parent_ctx = None
+                    if stage.use_cross_attn:
+                        parent_idx = i + 1
+                        if cur_preds[parent_idx] is not None:
+                            parent_ctx = (cur_preds[parent_idx].detach()
+                                          if self.cfg.detach_kv
+                                          else cur_preds[parent_idx])
+
+                    energy = stage(real_ctxs[i], pred, parent_context=parent_ctx)
+                    all_energies[i].append(energy)
+
+                    create_graph = learning and (
+                        not self.cfg.truncate_mcmc or k == K - 1
+                    )
+                    grad = torch.autograd.grad(
+                        [energy.sum()], [pred], create_graph=create_graph
+                    )[0]
+                    if torch.isnan(grad).any() or torch.isinf(grad).any():
+                        raise RuntimeError(
+                            f"NaN/Inf MCMC grad in stage i={i}, step k={k}"
+                        )
+                    cur_preds[i] = pred - alpha * grad
+                    all_preds[i].append(cur_preds[i])
+
+        per_stage: List[Optional[Dict[str, torch.Tensor]]] = [None] * N
+        for i in active:
+            preds = all_preds[i]
+            energies = all_energies[i]
+            real_gt = real_gts[i]
+
+            if self.cfg.truncate_mcmc:
+                stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
+            else:
+                stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
+            total_loss = total_loss + stage_loss
+
+            with torch.no_grad():
+                init_recon = F.smooth_l1_loss(preds[0].detach(), real_gt)
+                final_recon = F.smooth_l1_loss(preds[-1].detach(), real_gt)
+                init_e = energies[0].mean()
+                final_e = energies[-1].mean()
+                baseline = F.smooth_l1_loss(real_ctxs[i], real_gt)
+            per_stage[i] = {
+                "loss": stage_loss.detach(),
+                "init_recon": init_recon,
+                "final_recon": final_recon,
+                "init_energy": init_e,
+                "final_energy": final_e,
+                "energy_gap": init_e - final_e,
+                "alpha": self.alphas[i].detach(),
+                "baseline_copy_last": baseline,
+                "final_pred": preds[-1].detach(),
+                "real_gt": real_gt.detach(),
+            }
+
+        return per_stage, total_loss

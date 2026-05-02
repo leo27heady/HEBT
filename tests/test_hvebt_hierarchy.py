@@ -86,6 +86,7 @@ def _make_model_no_encoder(cfg: HierarchicalHVEBTConfig) -> HierarchicalHVEBT:
     model = HierarchicalHVEBT.__new__(HierarchicalHVEBT)
     torch.nn.Module.__init__(model)
     model.cfg = cfg
+    model._num_active_stages = len(cfg.stages)
     # Validate geometry (mirror the constructor's check).
     for i in range(1, len(cfg.stages)):
         child, parent = cfg.stages[i - 1], cfg.stages[i]

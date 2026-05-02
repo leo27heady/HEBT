@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -34,6 +34,8 @@ class PixelDecoder(nn.Module):
     out: (B, T, 3, S,   S)    or (N, 3, S,   S)   in [0, 1]
 
     `out_size` must be a power-of-2 multiple of `in_HW[0]==in_HW[1]`.
+    The decoder deconvolves (transpose-conv) from the low-res CLIP feature
+    space up to the full target resolution. The target is never modified.
     """
 
     def __init__(

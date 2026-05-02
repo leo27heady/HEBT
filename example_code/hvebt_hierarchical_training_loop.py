@@ -114,6 +114,10 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         mcmc_step_size_learnable=True,
         denoising_init=args.denoising_init,
         disable_cross_attn=args.disable_cross_attn,
+        interleaved_mcmc=args.interleaved_mcmc,
+        detach_kv=not args.no_detach_kv,
+        progressive=args.progressive,
+        progressive_steps_per_stage=args.progressive_steps,
         decoder_enabled=args.decoder,
         decoder_out_size=args.image_size,
         decoder_loss_weight=args.decoder_loss_weight,
@@ -148,6 +152,14 @@ def train(args):
     print(f"[hvebt-h] device={device}  stages={args.stages}  decoder={args.decoder}")
     if args.disable_cross_attn:
         print("[hvebt-h] *** ABLATION MODE: cross-attention DISABLED ***")
+    if args.interleaved_mcmc:
+        print("[hvebt-h] MCMC schedule: INTERLEAVED (1 step per stage, cycle K times)")
+    else:
+        print("[hvebt-h] MCMC schedule: SEQUENTIAL (all K steps per stage before passing KV)")
+    if args.no_detach_kv:
+        print("[hvebt-h] KV detach: OFF (gradients flow through cross-attn KV)")
+    if args.progressive:
+        print(f"[hvebt-h] Progressive training: {args.progressive_steps} steps per stage")
     use_preprocessed = args.preprocessed_dir is not None
 
     if use_preprocessed:
@@ -196,6 +208,14 @@ def train(args):
     while not done:
         for batch in loader:
             t0 = time.time()
+
+            # Progressive training: activate stages one by one.
+            newly_activated = model.update_progressive(step)
+            if newly_activated is not None:
+                stage_name = args.stages[newly_activated]
+                print(f"[hvebt-h] step {step}: activated stage {newly_activated} "
+                      f"({stage_name}) — now {model.num_active_stages}/{len(args.stages)} active")
+
             if use_preprocessed:
                 # batch is dict {stage_name: (B, T, C, H, W)}
                 feats_dict = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -223,15 +243,19 @@ def train(args):
             # CSV
             row: List[str] = [str(step), f"{loss_total.item():.6f}", f"{out['loss_energy'].item():.6f}"]
             if args.decoder:
-                row += [f"{out['loss_decoder'].item():.6f}"]
+                dl = out.get('loss_decoder')
+                row += [f"{dl.item():.6f}" if dl is not None else ""]
             for i, s in enumerate(out["per_stage"]):
-                row += [
-                    f"{s['init_recon'].item():.6f}", f"{s['final_recon'].item():.6f}",
-                    f"{s['init_energy'].item():.6f}", f"{s['final_energy'].item():.6f}",
-                    f"{s['energy_gap'].item():.6f}",
-                    f"{s['baseline_copy_last'].item():.6f}",
-                    f"{s['alpha'].item():.4f}", f"{stage_norms[i]:.6f}",
-                ]
+                if s is not None:
+                    row += [
+                        f"{s['init_recon'].item():.6f}", f"{s['final_recon'].item():.6f}",
+                        f"{s['init_energy'].item():.6f}", f"{s['final_energy'].item():.6f}",
+                        f"{s['energy_gap'].item():.6f}",
+                        f"{s['baseline_copy_last'].item():.6f}",
+                        f"{s['alpha'].item():.4f}", f"{stage_norms[i]:.6f}",
+                    ]
+                else:
+                    row += [""] * 8  # inactive stage
             if args.decoder:
                 row += [f"{dec_norm:.6f}"]
             row += [f"{dt:.3f}"]
@@ -241,10 +265,12 @@ def train(args):
             # Console
             if step % args.log_every == 0:
                 pieces = [f"[step {step:5d}] L={loss_total.item():.3f}"]
-                if args.decoder:
+                if args.decoder and 'loss_decoder' in out:
                     pieces += [f"Le={out['loss_energy'].item():.3f}",
                                f"Ld={out['loss_decoder'].item():.3f}"]
                 for i, s in enumerate(out["per_stage"]):
+                    if s is None:
+                        continue  # inactive stage
                     name = args.stages[i]
                     fr = s['final_recon'].item()
                     base = s['baseline_copy_last'].item()
@@ -259,7 +285,7 @@ def train(args):
                 print(" ".join(pieces))
 
             # Decoder image dumps
-            if args.decoder and args.decoder_save_every > 0 and step % args.decoder_save_every == 0:
+            if args.decoder and 'decoded_rgb' in out and args.decoder_save_every > 0 and step % args.decoder_save_every == 0:
                 # `decoded_rgb` and `target_rgb` come from forward_loss when decoder is enabled.
                 save_recon_grid(
                     real_rgb=out["target_rgb"].cpu(),
@@ -306,6 +332,17 @@ def parse_args():
     ap.add_argument("--disable_cross_attn", action="store_true",
                     help="Ablation: disable parent KV conditioning between stages. "
                          "Each stage runs independent MCMC without top-down signal.")
+    ap.add_argument("--interleaved_mcmc", action="store_true",
+                    help="Interleaved MCMC: 1 step per stage, cycle K times. "
+                         "Default is sequential (all K steps per stage before passing KV).")
+    ap.add_argument("--no_detach_kv", action="store_true",
+                    help="Allow gradients to flow through cross-attn KV "
+                         "(default: KV is detached).")
+    ap.add_argument("--progressive", action="store_true",
+                    help="Progressive training: start with apex stage only, "
+                         "activate finer stages one by one (StyleGAN-like).")
+    ap.add_argument("--progressive_steps", type=int, default=500,
+                    help="Steps per stage before activating the next finer stage.")
     # decoder
     ap.add_argument("--decoder", action="store_true")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0)
