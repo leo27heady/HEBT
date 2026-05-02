@@ -53,4 +53,8 @@ class PreprocessedCLIPDataset(Dataset):
             path = os.path.join(self.features_dir, stage, f"{idx}.pt")
             feat = torch.load(path, weights_only=True)
             result[stage] = feat.float()  # convert from fp16 if needed
+        # Load video frames (T, 3, H, W) in [0,1]
+        video_path = os.path.join(self.features_dir, "video", f"{idx}.pt")
+        if os.path.isfile(video_path):
+            result["video"] = torch.load(video_path, weights_only=True).float()
         return result

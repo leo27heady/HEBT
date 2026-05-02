@@ -100,6 +100,7 @@ def main():
 
     # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "video"), exist_ok=True)
     for stage in args.stages:
         os.makedirs(os.path.join(args.output_dir, stage), exist_ok=True)
 
@@ -133,8 +134,10 @@ def main():
         with torch.no_grad():
             feats_dict = encoder.encode_video(video_batch)
 
-        # Save per-sample per-stage
+        # Save per-sample per-stage + video
         for i, idx in enumerate(range(batch_start, batch_end)):
+            # Save video frames as fp32 (T, 3, H, W) in [0,1]
+            torch.save(batch_tensors[i].cpu(), os.path.join(args.output_dir, "video", f"{idx}.pt"))
             for stage in args.stages:
                 feat = feats_dict[stage][i]  # (T, C, H, W)
                 if args.fp16:
