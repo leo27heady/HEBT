@@ -363,8 +363,11 @@ class HierarchicalHVEBT(nn.Module):
         bu = self.cfg.bottom_up_loss
         # In bottom-up: finest active stage index (last in the top-down iteration)
         finest_active_idx = active[-1] if active else -1
-        # In bottom-up + decoder: no feature loss at all (decoder provides it)
-        bu_skip_all_loss = bu and self.cfg.decoder_enabled
+        # In bottom-up + decoder: skip feature losses only when the decoder
+        # can actually fire (stage 0 must be active). During progressive
+        # warmup stage 0 isn't active yet, so the finest active stage's
+        # feature loss serves as fallback.
+        bu_skip_all_loss = bu and self.cfg.decoder_enabled and (0 in active)
 
         for i in active:
             stage = self.stages[i]
@@ -438,7 +441,7 @@ class HierarchicalHVEBT(nn.Module):
 
         bu = self.cfg.bottom_up_loss
         finest_active_idx = active[-1] if active else -1
-        bu_skip_all_loss = bu and self.cfg.decoder_enabled
+        bu_skip_all_loss = bu and self.cfg.decoder_enabled and (0 in active)
 
         real_ctxs: List[Optional[torch.Tensor]] = [None] * N
         real_gts: List[Optional[torch.Tensor]] = [None] * N

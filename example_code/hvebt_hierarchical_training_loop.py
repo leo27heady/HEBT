@@ -134,7 +134,7 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
     if args.bottom_up_loss:
         args.decoder = True
         args.no_detach_kv = True
-        cfg.truncate_mcmc = True
+        args.truncate_mcmc = True
 
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
