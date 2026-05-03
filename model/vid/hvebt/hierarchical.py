@@ -71,6 +71,13 @@ class HierarchicalHVEBTConfig:
     detach_kv: bool = True                 # If True (default), parent KV is detached so upper
                                            # stage gets no gradient from lower stage's loss.
                                            # If False, gradients flow through cross-attn KV.
+    # Bottom-up loss ---------------------------------------------------------- #
+    bottom_up_loss: bool = False           # If True: only the finest active stage has loss;
+                                           # gradient flows upward through non-detached KV.
+                                           # Upper stages become learned latents (no own loss).
+                                           # Implies detach_kv=False, truncate_mcmc=True.
+                                           # When decoder_enabled: decoder pixel loss is the
+                                           # SOLE objective (no feature-space loss at all).
     # Progressive training ---------------------------------------------------- #
     progressive: bool = False              # If True, stages are activated one by one top→down.
     progressive_steps_per_stage: int = 500 # Steps to train each stage before activating the next.
@@ -296,17 +303,32 @@ class HierarchicalHVEBT(nn.Module):
             "per_stage": per_stage,
         }
 
-        # Decoder (independent training; uses detached input).
-        # Only runs when the finest stage (index 0) is active.
-        if self.decoder is not None and per_stage[0] is not None:
-            base_pred = per_stage[0]["final_pred"]                # already .detach()'d above
+        # Find finest active stage index
+        finest_active = min(i for i, s in enumerate(per_stage) if s is not None)
+
+        # Decoder branch (decoder is built for stage 0; skip if s0 not yet active)
+        decoder_can_fire = (self.decoder is not None
+                            and finest_active == 0
+                            and per_stage[0] is not None)
+        if decoder_can_fire:
+            if self.cfg.bottom_up_loss:
+                # Bottom-up: decoder is THE loss. Input is NOT detached so
+                # gradient flows through MCMC pred → cross-attn KV → all stages.
+                base_pred = per_stage[0]["final_pred_live"]
+            else:
+                # Standard: decoder trained independently on detached features.
+                base_pred = per_stage[0]["final_pred"]
             decoded = self.decoder(base_pred)                      # (B, T, 3, S, S)
             target_rgb = video[:, 1:]
             decoder_loss = F.l1_loss(decoded, target_rgb)
             out["loss_decoder"] = decoder_loss
             out["decoded_rgb"] = decoded.detach()
             out["target_rgb"] = target_rgb.detach()
-            out["loss_total"] = total_loss + self.cfg.decoder_loss_weight * decoder_loss
+            if self.cfg.bottom_up_loss:
+                # Decoder pixel loss is the sole objective.
+                out["loss_total"] = decoder_loss
+            else:
+                out["loss_total"] = total_loss + self.cfg.decoder_loss_weight * decoder_loss
         else:
             out["loss_total"] = total_loss
 
@@ -325,12 +347,24 @@ class HierarchicalHVEBT(nn.Module):
         Sequential schedule: each stage runs ALL K MCMC steps to convergence
         before passing its fully-relaxed prediction as KV to the next finer stage.
         Respects progressive training (only active stages participate).
+
+        When bottom_up_loss=True:
+          - KV is never detached (gradient flows upward).
+          - Only last MCMC step contributes (truncated).
+          - Only the finest active stage computes feature loss (or none if
+            decoder will provide the loss).
         """
         N = len(self.stages)
         per_stage: List[Optional[Dict[str, torch.Tensor]]] = [None] * N
         prev_pred: Optional[torch.Tensor] = None
         total_loss = next(iter(feats_dict.values())).new_zeros(())
         active = self.active_stage_indices()  # top-down order
+
+        bu = self.cfg.bottom_up_loss
+        # In bottom-up: finest active stage index (last in the top-down iteration)
+        finest_active_idx = active[-1] if active else -1
+        # In bottom-up + decoder: no feature loss at all (decoder provides it)
+        bu_skip_all_loss = bu and self.cfg.decoder_enabled
 
         for i in active:
             stage = self.stages[i]
@@ -349,12 +383,22 @@ class HierarchicalHVEBT(nn.Module):
                 parent_ctx=parent_ctx, learning=learning,
             )
 
+            # Loss computation
             K = len(preds)
-            if self.cfg.truncate_mcmc:
-                stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
+            compute_loss = True
+            if bu:
+                # Bottom-up: only finest active stage gets feature loss
+                # (and even that is skipped when decoder provides the loss)
+                compute_loss = (i == finest_active_idx) and (not bu_skip_all_loss)
+
+            if compute_loss:
+                if self.cfg.truncate_mcmc:
+                    stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
+                else:
+                    stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
+                total_loss = total_loss + stage_loss
             else:
-                stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
-            total_loss = total_loss + stage_loss
+                stage_loss = preds[-1].new_zeros(())
 
             with torch.no_grad():
                 init_recon = F.smooth_l1_loss(preds[0].detach(), real_gt)
@@ -372,6 +416,7 @@ class HierarchicalHVEBT(nn.Module):
                 "alpha": self.alphas[i].detach(),
                 "baseline_copy_last": baseline,
                 "final_pred": preds[-1].detach(),
+                "final_pred_live": preds[-1],  # keeps grad graph for bottom-up decoder
                 "real_gt": real_gt.detach(),
             }
             prev_pred = preds[-1]
@@ -390,6 +435,10 @@ class HierarchicalHVEBT(nn.Module):
         K = self.cfg.mcmc_num_steps
         N = len(self.stages)
         active = self.active_stage_indices()  # top-down order
+
+        bu = self.cfg.bottom_up_loss
+        finest_active_idx = active[-1] if active else -1
+        bu_skip_all_loss = bu and self.cfg.decoder_enabled
 
         real_ctxs: List[Optional[torch.Tensor]] = [None] * N
         real_gts: List[Optional[torch.Tensor]] = [None] * N
@@ -443,11 +492,18 @@ class HierarchicalHVEBT(nn.Module):
             energies = all_energies[i]
             real_gt = real_gts[i]
 
-            if self.cfg.truncate_mcmc:
-                stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
+            compute_loss = True
+            if bu:
+                compute_loss = (i == finest_active_idx) and (not bu_skip_all_loss)
+
+            if compute_loss:
+                if self.cfg.truncate_mcmc:
+                    stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
+                else:
+                    stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
+                total_loss = total_loss + stage_loss
             else:
-                stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
-            total_loss = total_loss + stage_loss
+                stage_loss = preds[-1].new_zeros(())
 
             with torch.no_grad():
                 init_recon = F.smooth_l1_loss(preds[0].detach(), real_gt)
@@ -465,6 +521,7 @@ class HierarchicalHVEBT(nn.Module):
                 "alpha": self.alphas[i].detach(),
                 "baseline_copy_last": baseline,
                 "final_pred": preds[-1].detach(),
+                "final_pred_live": preds[-1],
                 "real_gt": real_gt.detach(),
             }
 

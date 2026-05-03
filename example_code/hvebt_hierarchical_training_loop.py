@@ -129,6 +129,13 @@ def build_stage_configs(args) -> List[HVEBTStageConfig]:
 def make_model(args, device: torch.device) -> HierarchicalHVEBT:
     stage_cfgs = build_stage_configs(args)
     weights = "" if args.preprocessed_dir else "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
+
+    # bottom_up_loss implies decoder + no_detach_kv
+    if args.bottom_up_loss:
+        args.decoder = True
+        args.no_detach_kv = True
+        cfg.truncate_mcmc = True
+
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
         mcmc_num_steps=args.mcmc_steps,
@@ -138,6 +145,7 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         disable_cross_attn=args.disable_cross_attn,
         interleaved_mcmc=args.interleaved_mcmc,
         detach_kv=not args.no_detach_kv,
+        bottom_up_loss=args.bottom_up_loss,
         progressive=args.progressive,
         progressive_steps_per_stage=args.progressive_steps,
         decoder_enabled=args.decoder,
@@ -182,6 +190,9 @@ def train(args):
         print("[hvebt-h] KV detach: OFF (gradients flow through cross-attn KV)")
     if args.progressive:
         print(f"[hvebt-h] Progressive training: {args.progressive_steps} steps per stage")
+    if args.bottom_up_loss:
+        print("[hvebt-h] BOTTOM-UP LOSS: decoder pixel loss drives all stages. "
+              "Upper stages are learned latents (no own feature loss).")
     if args.temporal_window:
         stage_cfgs = build_stage_configs(args)
         tw_info = ", ".join(
@@ -377,6 +388,11 @@ def parse_args():
                          "activate finer stages one by one (StyleGAN-like).")
     ap.add_argument("--progressive_steps", type=int, default=500,
                     help="Steps per stage before activating the next finer stage.")
+    ap.add_argument("--bottom_up_loss", action="store_true",
+                    help="Bottom-up loss: only finest stage (or decoder) has loss. "
+                         "Gradient flows upward through non-detached KV. "
+                         "Upper stages become learned latents. "
+                         "Implies --decoder, --no_detach_kv, truncate_mcmc=True.")
     # decoder
     ap.add_argument("--decoder", action="store_true")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0)

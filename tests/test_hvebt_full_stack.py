@@ -1102,3 +1102,127 @@ class TestMCMCSchedules:
             has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                            for p in stage.parameters())
             assert has_grad, f"Interleaved: stage {i} has no gradient"
+
+
+# =========================================================================== #
+# Bottom-Up Loss Mode Tests
+# =========================================================================== #
+
+class TestBottomUpLoss:
+    """Tests for bottom_up_loss mode (decoder pixel loss drives entire hierarchy)."""
+
+    def _bu_cfg(self, interleaved=False, progressive=False):
+        """5-stage config with bottom_up_loss=True and decoder enabled."""
+        cfg = _full_5stage_cfg(mcmc_steps=2, progressive=progressive)
+        cfg.bottom_up_loss = True
+        cfg.decoder_enabled = True
+        cfg.decoder_out_size = 16
+        cfg.detach_kv = False  # bottom-up implies no detach
+        cfg.interleaved_mcmc = interleaved
+        return cfg
+
+    def test_sequential_forward_backward(self):
+        """Forward/backward works with bottom_up_loss + decoder (sequential)."""
+        cfg = self._bu_cfg(interleaved=False)
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        assert "loss_total" in out
+        assert "loss_decoder" in out
+        out["loss_total"].backward()
+
+    def test_interleaved_forward_backward(self):
+        """Forward/backward works with bottom_up_loss + decoder (interleaved)."""
+        cfg = self._bu_cfg(interleaved=True)
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        assert "loss_total" in out
+        out["loss_total"].backward()
+
+    def test_decoder_loss_is_sole_objective(self):
+        """In bottom-up mode, loss_total == loss_decoder (no feature losses added)."""
+        cfg = self._bu_cfg()
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        assert torch.allclose(out["loss_total"], out["loss_decoder"]), \
+            f"loss_total={out['loss_total'].item():.6f} != loss_decoder={out['loss_decoder'].item():.6f}"
+
+    def test_no_feature_loss_for_any_stage(self):
+        """In bottom-up + decoder, all per-stage losses should be zero."""
+        cfg = self._bu_cfg()
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        for i, ps in enumerate(out["per_stage"]):
+            if ps is not None:
+                assert ps["loss"].item() == 0.0, \
+                    f"Stage {i} has non-zero loss {ps['loss'].item()} in bottom-up mode"
+
+    def test_gradient_flows_to_all_stages(self):
+        """Decoder loss gradient flows upward through all stages (non-detached KV)."""
+        cfg = self._bu_cfg()
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        out["loss_total"].backward()
+        for i, stage in enumerate(model.stages):
+            has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                           for p in stage.parameters())
+            assert has_grad, f"Bottom-up: stage {i} has no gradient from decoder loss"
+
+    def test_decoder_has_gradient(self):
+        """Decoder parameters receive gradient in bottom-up mode."""
+        cfg = self._bu_cfg()
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        out["loss_total"].backward()
+        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                       for p in model.decoder.parameters())
+        assert has_grad, "Decoder has no gradient in bottom-up mode"
+
+    def test_progressive_bottom_up(self):
+        """Progressive training + bottom_up_loss: only active stages run.
+        Decoder only engages once the finest stage (s0) is active."""
+        cfg = self._bu_cfg(progressive=True)
+        cfg.progressive_steps_per_stage = 2
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+
+        # Initially only 1 stage active (pooled). Decoder can't fire yet
+        # because pooled doesn't match decoder input (decoder built for s0).
+        # In bottom-up without decoder matching, loss comes from finest active feature loss.
+        out = _forward(model, feats, S=16)
+        active_count = sum(1 for ps in out["per_stage"] if ps is not None)
+        assert active_count == 1
+
+        # Activate all stages (step big enough)
+        for step in range(2, 12, 2):
+            model.update_progressive(step=step)
+        out2 = _forward(model, feats, S=16)
+        active_count2 = sum(1 for ps in out2["per_stage"] if ps is not None)
+        assert active_count2 == 5
+
+        # With all stages active, decoder fires and loss works
+        assert "loss_decoder" in out2
+        out2["loss_total"].backward()
+
+    def test_bottom_up_loss_decreases(self):
+        """Multiple training steps should decrease loss in bottom-up mode."""
+        cfg = self._bu_cfg()
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        losses = []
+        for _ in range(10):
+            opt.zero_grad()
+            out = _forward(model, feats, S=16)
+            out["loss_total"].backward()
+            opt.step()
+            losses.append(out["loss_total"].item())
+
+        assert losses[-1] < losses[0], \
+            f"Loss did not decrease: first={losses[0]:.4f}, last={losses[-1]:.4f}"
