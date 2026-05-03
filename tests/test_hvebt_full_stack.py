@@ -682,18 +682,15 @@ class TestMCMCChaining:
         assert energy.shape[0] == B
         assert torch.isfinite(energy).all()
 
-    def test_sequential_vs_interleaved_both_work(self):
-        """Both MCMC schedules should produce valid output."""
-        for interleaved in [False, True]:
-            cfg = _full_5stage_cfg(mcmc_steps=4)
-            cfg.interleaved_mcmc = interleaved
-            model = _make_model_no_encoder(cfg)
-            feats = _fake_feats(cfg, B=2, T_plus_1=3)
-            out = _forward(model, feats)
-            assert torch.isfinite(out["loss_total"]), \
-                f"Non-finite loss with interleaved={interleaved}"
-            for i in range(5):
-                assert out["per_stage"][i] is not None
+    def test_sequential_produces_valid_output(self):
+        """Sequential MCMC should produce valid output."""
+        cfg = _full_5stage_cfg(mcmc_steps=4)
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats)
+        assert torch.isfinite(out["loss_total"])
+        for i in range(5):
+            assert out["per_stage"][i] is not None
 
     def test_3d_pooled_features_auto_unsqueeze(self):
         """3D features (B,T,C) for pooled stage are auto-unsqueezed."""
@@ -1072,36 +1069,77 @@ class TestConstructionValidation:
 
 
 # =========================================================================== #
-# 13. Interleaved vs Sequential MCMC consistency
+# Adaptive MCMC Tests
 # =========================================================================== #
 
-class TestMCMCSchedules:
-    """Both MCMC schedules should produce structurally valid output."""
+class TestAdaptiveMCMC:
+    """Tests for adaptive MCMC convergence loop."""
 
-    def test_both_schedules_same_output_shape(self):
-        for interleaved in [False, True]:
-            cfg = _full_5stage_cfg(mcmc_steps=4)
-            cfg.interleaved_mcmc = interleaved
-            model = _make_model_no_encoder(cfg)
-            feats = _fake_feats(cfg, B=2, T_plus_1=3)
-            out = _forward(model, feats)
-            assert len(out["per_stage"]) == 5
-            for i in range(5):
-                sc = cfg.stages[i]
-                assert out["per_stage"][i]["final_pred"].shape == \
-                    (2, 2, sc.clip_channels, sc.H, sc.W)
-
-    def test_interleaved_backward_works(self):
+    def _adaptive_cfg(self):
         cfg = _full_5stage_cfg(mcmc_steps=4)
-        cfg.interleaved_mcmc = True
+        cfg.adaptive_mcmc = True
+        cfg.adaptive_mcmc_max_steps = 20
+        cfg.adaptive_mcmc_tol = 1e-3
+        cfg.adaptive_mcmc_patience = 3
+        cfg.adaptive_mcmc_step_penalty = 0.0
+        cfg.truncate_mcmc = True
+        return cfg
+
+    def test_forward_backward_works(self):
+        """Adaptive MCMC forward/backward produces valid gradients."""
+        cfg = self._adaptive_cfg()
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
         out = _forward(model, feats)
+        assert torch.isfinite(out["loss_total"])
         out["loss_total"].backward()
         for i, stage in enumerate(model.stages):
             has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                            for p in stage.parameters())
-            assert has_grad, f"Interleaved: stage {i} has no gradient"
+            assert has_grad, f"Adaptive: stage {i} has no gradient"
+
+    def test_reports_steps_used(self):
+        """Per-stage output includes mcmc_steps_used."""
+        cfg = self._adaptive_cfg()
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats)
+        for i, ps in enumerate(out["per_stage"]):
+            if ps is not None:
+                assert "mcmc_steps_used" in ps
+                assert 1 <= ps["mcmc_steps_used"] <= cfg.adaptive_mcmc_max_steps
+
+    def test_step_penalty_adds_to_loss(self):
+        """Step penalty > 0 should increase total loss."""
+        cfg = self._adaptive_cfg()
+        cfg.adaptive_mcmc_step_penalty = 0.0
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        torch.manual_seed(42)
+        out_no_pen = _forward(model, feats)
+
+        cfg2 = self._adaptive_cfg()
+        cfg2.adaptive_mcmc_step_penalty = 1.0
+        model2 = _make_model_no_encoder(cfg2)
+        # Copy weights
+        model2.load_state_dict(model.state_dict())
+        torch.manual_seed(42)
+        out_pen = _forward(model2, feats)
+
+        assert out_pen["loss_total"].item() >= out_no_pen["loss_total"].item()
+
+    def test_with_bottom_up_loss(self):
+        """Adaptive MCMC + bottom_up_loss should work together."""
+        cfg = self._adaptive_cfg()
+        cfg.bottom_up_loss = True
+        cfg.decoder_enabled = True
+        cfg.decoder_out_size = 16
+        cfg.detach_kv = False
+        model = _make_model_no_encoder(cfg)
+        feats = _fake_feats(cfg, B=2, T_plus_1=3)
+        out = _forward(model, feats, S=16)
+        assert "loss_decoder" in out
+        out["loss_total"].backward()
 
 
 # =========================================================================== #
@@ -1111,33 +1149,23 @@ class TestMCMCSchedules:
 class TestBottomUpLoss:
     """Tests for bottom_up_loss mode (decoder pixel loss drives entire hierarchy)."""
 
-    def _bu_cfg(self, interleaved=False, progressive=False):
+    def _bu_cfg(self, progressive=False):
         """5-stage config with bottom_up_loss=True and decoder enabled."""
         cfg = _full_5stage_cfg(mcmc_steps=2, progressive=progressive)
         cfg.bottom_up_loss = True
         cfg.decoder_enabled = True
         cfg.decoder_out_size = 16
         cfg.detach_kv = False  # bottom-up implies no detach
-        cfg.interleaved_mcmc = interleaved
         return cfg
 
     def test_sequential_forward_backward(self):
-        """Forward/backward works with bottom_up_loss + decoder (sequential)."""
-        cfg = self._bu_cfg(interleaved=False)
+        """Forward/backward works with bottom_up_loss + decoder."""
+        cfg = self._bu_cfg()
         model = _make_model_no_encoder(cfg)
         feats = _fake_feats(cfg, B=2, T_plus_1=3)
         out = _forward(model, feats, S=16)
         assert "loss_total" in out
         assert "loss_decoder" in out
-        out["loss_total"].backward()
-
-    def test_interleaved_forward_backward(self):
-        """Forward/backward works with bottom_up_loss + decoder (interleaved)."""
-        cfg = self._bu_cfg(interleaved=True)
-        model = _make_model_no_encoder(cfg)
-        feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        out = _forward(model, feats, S=16)
-        assert "loss_total" in out
         out["loss_total"].backward()
 
     def test_decoder_loss_is_sole_objective(self):

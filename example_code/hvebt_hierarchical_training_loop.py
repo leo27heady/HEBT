@@ -142,8 +142,12 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         mcmc_step_size=args.mcmc_step_size,
         mcmc_step_size_learnable=True,
         denoising_init=args.denoising_init,
+        adaptive_mcmc=args.adaptive_mcmc,
+        adaptive_mcmc_max_steps=args.adaptive_mcmc_max_steps,
+        adaptive_mcmc_tol=args.adaptive_mcmc_tol,
+        adaptive_mcmc_patience=args.adaptive_mcmc_patience,
+        adaptive_mcmc_step_penalty=args.adaptive_mcmc_step_penalty,
         disable_cross_attn=args.disable_cross_attn,
-        interleaved_mcmc=args.interleaved_mcmc,
         detach_kv=not args.no_detach_kv,
         bottom_up_loss=args.bottom_up_loss,
         progressive=args.progressive,
@@ -182,10 +186,6 @@ def train(args):
     print(f"[hvebt-h] device={device}  stages={args.stages}  decoder={args.decoder}")
     if args.disable_cross_attn:
         print("[hvebt-h] *** ABLATION MODE: cross-attention DISABLED ***")
-    if args.interleaved_mcmc:
-        print("[hvebt-h] MCMC schedule: INTERLEAVED (1 step per stage, cycle K times)")
-    else:
-        print("[hvebt-h] MCMC schedule: SEQUENTIAL (all K steps per stage before passing KV)")
     if args.no_detach_kv:
         print("[hvebt-h] KV detach: OFF (gradients flow through cross-attn KV)")
     if args.progressive:
@@ -193,6 +193,11 @@ def train(args):
     if args.bottom_up_loss:
         print("[hvebt-h] BOTTOM-UP LOSS: decoder pixel loss drives all stages. "
               "Upper stages are learned latents (no own feature loss).")
+    if args.adaptive_mcmc:
+        print(f"[hvebt-h] ADAPTIVE MCMC: converge until tol={args.adaptive_mcmc_tol}, "
+              f"max={args.adaptive_mcmc_max_steps}, patience={args.adaptive_mcmc_patience}"
+              + (f", step_penalty={args.adaptive_mcmc_step_penalty}"
+                 if args.adaptive_mcmc_step_penalty > 0 else ""))
     if args.temporal_window:
         stage_cfgs = build_stage_configs(args)
         tw_info = ", ".join(
@@ -317,9 +322,12 @@ def train(args):
                     fr = s['final_recon'].item()
                     base = s['baseline_copy_last'].item()
                     vs_base = (base - fr) / max(base, 1e-8)
+                    steps_info = ""
+                    if 'mcmc_steps_used' in s:
+                        steps_info = f" k={s['mcmc_steps_used']}"
                     pieces.append(
                         f"[{name}] r{fr:.3f}/b{base:.3f} ({vs_base*100:+.0f}%) "
-                        f"Eg{s['energy_gap'].item():+.2e} g{stage_norms[i]:.2f}"
+                        f"Eg{s['energy_gap'].item():+.2e} g{stage_norms[i]:.2f}{steps_info}"
                     )
                 if args.decoder:
                     pieces.append(f"dg{dec_norm:.2f}")
@@ -373,13 +381,21 @@ def parse_args():
     ap.add_argument("--mcmc_step_size", type=float, default=1000.0)
     ap.add_argument("--denoising_init", type=str, default="zeros",
                     choices=["zeros", "random_noise", "real_current"])
+    ap.add_argument("--adaptive_mcmc", action="store_true",
+                    help="Run MCMC until convergence instead of fixed steps. "
+                         "Overrides --mcmc_steps as max_steps fallback.")
+    ap.add_argument("--adaptive_mcmc_max_steps", type=int, default=50,
+                    help="Hard upper bound on adaptive MCMC iterations.")
+    ap.add_argument("--adaptive_mcmc_tol", type=float, default=1e-3,
+                    help="Relative energy-change threshold for convergence.")
+    ap.add_argument("--adaptive_mcmc_patience", type=int, default=3,
+                    help="Consecutive energy increases before halving step size.")
+    ap.add_argument("--adaptive_mcmc_step_penalty", type=float, default=0.0,
+                    help="Penalty weight for num_steps/max_steps (encourages fewer steps).")
     # ablation
     ap.add_argument("--disable_cross_attn", action="store_true",
                     help="Ablation: disable parent KV conditioning between stages. "
                          "Each stage runs independent MCMC without top-down signal.")
-    ap.add_argument("--interleaved_mcmc", action="store_true",
-                    help="Interleaved MCMC: 1 step per stage, cycle K times. "
-                         "Default is sequential (all K steps per stage before passing KV).")
     ap.add_argument("--no_detach_kv", action="store_true",
                     help="Allow gradients to flow through cross-attn KV "
                          "(default: KV is detached).")

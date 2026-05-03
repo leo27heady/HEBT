@@ -61,13 +61,19 @@ class HierarchicalHVEBTConfig:
     denoising_init: str = "zeros"          # "zeros" | "random_noise" | "real_current"
     truncate_mcmc: bool = False
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
+    # Adaptive MCMC ----------------------------------------------------------- #
+    adaptive_mcmc: bool = False            # If True, run MCMC until convergence instead of
+                                           # fixed K steps. Overrides mcmc_num_steps as max_steps.
+    adaptive_mcmc_max_steps: int = 50      # Hard upper bound on MCMC iterations.
+    adaptive_mcmc_tol: float = 1e-3        # Relative energy-change threshold for convergence:
+                                           # |E_new - E_old| / (|E_old| + eps) < tol => stop.
+    adaptive_mcmc_patience: int = 3        # How many consecutive energy increases (overshoots)
+                                           # before halving the step size for this sample.
+    adaptive_mcmc_alpha_decay: float = 0.5 # Factor to decay alpha on overshoot patience exceeded.
+    adaptive_mcmc_step_penalty: float = 0.0  # If > 0, adds penalty * (num_steps / max_steps) to
+                                           # the loss to encourage the model to converge faster.
     # Ablation ---------------------------------------------------------------- #
     disable_cross_attn: bool = False       # If True, no parent KV conditioning between stages
-    # MCMC schedule ----------------------------------------------------------- #
-    interleaved_mcmc: bool = False         # If False, each stage runs ALL K steps to convergence
-                                           # before passing its fully-relaxed prediction as KV to
-                                           # the next (finer) stage. Default (False) = interleaved:
-                                           # 1 MCMC step per stage top→bottom, repeat K times.
     detach_kv: bool = True                 # If True (default), parent KV is detached so upper
                                            # stage gets no gradient from lower stage's loss.
                                            # If False, gradients flow through cross-attn KV.
@@ -261,6 +267,110 @@ class HierarchicalHVEBT(nn.Module):
                 preds.append(pred)
         return preds, energies
 
+    def _mcmc_adaptive_for_stage(
+        self,
+        stage: HVEBTStage,
+        alpha_param: torch.Tensor,
+        real_ctx: torch.Tensor,
+        init_pred: torch.Tensor,
+        parent_ctx: Optional[torch.Tensor],
+        learning: bool,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], int]:
+        """
+        Adaptive MCMC: run until energy converges or max_steps is reached.
+
+        Strategy:
+          1. Convergence phase (no grad graph): iterate until relative energy
+             change < tolerance, or energy consistently overshoots (increases).
+          2. Final step (with grad graph): one last step from the converged
+             point to build the computation graph needed for training.
+
+        Returns (preds, energies, num_steps) where:
+          - preds has 2 elements: [first_step_pred, final_pred] for metrics
+          - energies has 2 elements: [initial_energy, final_energy]
+          - num_steps is total iterations used (convergence + final)
+        """
+        max_steps = self.cfg.adaptive_mcmc_max_steps
+        tol = self.cfg.adaptive_mcmc_tol
+        patience = self.cfg.adaptive_mcmc_patience
+        alpha_decay = self.cfg.adaptive_mcmc_alpha_decay
+
+        alpha = torch.clamp(alpha_param, min=1e-4)
+        pred = init_pred
+        prev_energy_val: Optional[float] = None
+        overshoot_count = 0
+        converge_steps = 0
+        first_pred: Optional[torch.Tensor] = None
+        first_energy: Optional[torch.Tensor] = None
+
+        # Phase 1: converge without building the full grad graph.
+        with torch.set_grad_enabled(True):
+            for step in range(max_steps - 1):
+                pred = pred.detach().requires_grad_(True)
+                energy = stage(real_ctx, pred, parent_context=parent_ctx)
+                energy_val = energy.sum().item()
+
+                # Save first step for metrics
+                if step == 0:
+                    first_energy = energy
+
+                # Convergence check (after first step)
+                if prev_energy_val is not None:
+                    rel_change = abs(energy_val - prev_energy_val) / (
+                        abs(prev_energy_val) + 1e-8
+                    )
+                    if rel_change < tol:
+                        converge_steps = step
+                        break
+                    # Overshoot: energy increased
+                    if energy_val > prev_energy_val:
+                        overshoot_count += 1
+                        if overshoot_count >= patience:
+                            alpha = alpha * alpha_decay
+                            overshoot_count = 0
+                    else:
+                        overshoot_count = 0
+
+                prev_energy_val = energy_val
+
+                grad = torch.autograd.grad(
+                    [energy.sum()], [pred], create_graph=False
+                )[0]
+                if torch.isnan(grad).any() or torch.isinf(grad).any():
+                    converge_steps = step
+                    break
+                pred = (pred - alpha * grad).detach()
+
+                # Save first step prediction for metrics
+                if step == 0:
+                    first_pred = pred.clone()
+            else:
+                converge_steps = max_steps - 1
+
+        # Phase 2: final step WITH grad graph for training.
+        pred = pred.detach().requires_grad_(True)
+        energy = stage(real_ctx, pred, parent_context=parent_ctx)
+
+        create_graph = learning  # always build graph on final step
+        grad = torch.autograd.grad(
+            [energy.sum()], [pred], create_graph=create_graph
+        )[0]
+        if torch.isnan(grad).any() or torch.isinf(grad).any():
+            final_pred = pred  # stay put
+        else:
+            final_pred = pred - alpha * grad
+
+        # Build return lists: [first_step, final] for consistent metrics
+        if first_pred is None:
+            first_pred = final_pred  # only 1 step was taken
+        if first_energy is None:
+            first_energy = energy
+
+        preds = [first_pred, final_pred]
+        energies = [first_energy, energy]
+        num_steps = converge_steps + 1  # convergence steps + 1 final step
+        return preds, energies, num_steps
+
     # ------------------------------------------------------------------ #
     # full forward / loss
     # ------------------------------------------------------------------ #
@@ -293,10 +403,7 @@ class HierarchicalHVEBT(nn.Module):
         learning: bool = True,
     ) -> Dict[str, object]:
 
-        if self.cfg.interleaved_mcmc:
-            per_stage, total_loss = self._mcmc_interleaved(feats_dict, learning)
-        else:
-            per_stage, total_loss = self._mcmc_sequential(feats_dict, learning)
+        per_stage, total_loss = self._mcmc_sequential(feats_dict, learning)
 
         out: Dict[str, object] = {
             "loss_energy": total_loss,
@@ -381,10 +488,17 @@ class HierarchicalHVEBT(nn.Module):
             if stage.use_cross_attn and prev_pred is not None:
                 parent_ctx = prev_pred.detach() if self.cfg.detach_kv else prev_pred
 
-            preds, energies = self._mcmc_for_stage(
-                stage, self.alphas[i], real_ctx, init_pred,
-                parent_ctx=parent_ctx, learning=learning,
-            )
+            if self.cfg.adaptive_mcmc:
+                preds, energies, num_steps = self._mcmc_adaptive_for_stage(
+                    stage, self.alphas[i], real_ctx, init_pred,
+                    parent_ctx=parent_ctx, learning=learning,
+                )
+            else:
+                preds, energies = self._mcmc_for_stage(
+                    stage, self.alphas[i], real_ctx, init_pred,
+                    parent_ctx=parent_ctx, learning=learning,
+                )
+                num_steps = len(preds)
 
             # Loss computation
             K = len(preds)
@@ -395,13 +509,18 @@ class HierarchicalHVEBT(nn.Module):
                 compute_loss = (i == finest_active_idx) and (not bu_skip_all_loss)
 
             if compute_loss:
-                if self.cfg.truncate_mcmc:
+                if self.cfg.truncate_mcmc or self.cfg.adaptive_mcmc:
                     stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
                 else:
                     stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
                 total_loss = total_loss + stage_loss
             else:
                 stage_loss = preds[-1].new_zeros(())
+
+            # Step penalty: encourage model to converge in fewer steps
+            if self.cfg.adaptive_mcmc and self.cfg.adaptive_mcmc_step_penalty > 0:
+                step_ratio = num_steps / self.cfg.adaptive_mcmc_max_steps
+                total_loss = total_loss + self.cfg.adaptive_mcmc_step_penalty * step_ratio
 
             with torch.no_grad():
                 init_recon = F.smooth_l1_loss(preds[0].detach(), real_gt)
@@ -421,111 +540,8 @@ class HierarchicalHVEBT(nn.Module):
                 "final_pred": preds[-1].detach(),
                 "final_pred_live": preds[-1],  # keeps grad graph for bottom-up decoder
                 "real_gt": real_gt.detach(),
+                "mcmc_steps_used": num_steps,
             }
             prev_pred = preds[-1]
-
-        return per_stage, total_loss
-
-    def _mcmc_interleaved(
-        self,
-        feats_dict: Dict[str, torch.Tensor],
-        learning: bool,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor]:
-        """
-        Interleaved schedule: 1 MCMC step per stage top->bottom, repeat K times.
-        Respects progressive training (only active stages participate).
-        """
-        K = self.cfg.mcmc_num_steps
-        N = len(self.stages)
-        active = self.active_stage_indices()  # top-down order
-
-        bu = self.cfg.bottom_up_loss
-        finest_active_idx = active[-1] if active else -1
-        bu_skip_all_loss = bu and self.cfg.decoder_enabled and (0 in active)
-
-        real_ctxs: List[Optional[torch.Tensor]] = [None] * N
-        real_gts: List[Optional[torch.Tensor]] = [None] * N
-        cur_preds: List[Optional[torch.Tensor]] = [None] * N
-        for i in active:
-            sc = self.cfg.stages[i]
-            feats = feats_dict[sc.clip_stage_name]
-            real_ctxs[i] = feats[:, :-1]
-            real_gts[i] = feats[:, 1:]
-            cur_preds[i] = self._init_pred(real_gts[i])
-
-        all_preds: List[List[torch.Tensor]] = [[] for _ in range(N)]
-        all_energies: List[List[torch.Tensor]] = [[] for _ in range(N)]
-
-        total_loss = next(iter(feats_dict.values())).new_zeros(())
-
-        with torch.set_grad_enabled(True):
-            for k in range(K):
-                for i in active:
-                    stage = self.stages[i]
-                    alpha = torch.clamp(self.alphas[i], min=1e-4)
-                    pred = cur_preds[i].detach().requires_grad_(True)
-
-                    parent_ctx = None
-                    if stage.use_cross_attn:
-                        parent_idx = i + 1
-                        if cur_preds[parent_idx] is not None:
-                            parent_ctx = (cur_preds[parent_idx].detach()
-                                          if self.cfg.detach_kv
-                                          else cur_preds[parent_idx])
-
-                    energy = stage(real_ctxs[i], pred, parent_context=parent_ctx)
-                    all_energies[i].append(energy)
-
-                    create_graph = learning and (
-                        not self.cfg.truncate_mcmc or k == K - 1
-                    )
-                    grad = torch.autograd.grad(
-                        [energy.sum()], [pred], create_graph=create_graph
-                    )[0]
-                    if torch.isnan(grad).any() or torch.isinf(grad).any():
-                        raise RuntimeError(
-                            f"NaN/Inf MCMC grad in stage i={i}, step k={k}"
-                        )
-                    cur_preds[i] = pred - alpha * grad
-                    all_preds[i].append(cur_preds[i])
-
-        per_stage: List[Optional[Dict[str, torch.Tensor]]] = [None] * N
-        for i in active:
-            preds = all_preds[i]
-            energies = all_energies[i]
-            real_gt = real_gts[i]
-
-            compute_loss = True
-            if bu:
-                compute_loss = (i == finest_active_idx) and (not bu_skip_all_loss)
-
-            if compute_loss:
-                if self.cfg.truncate_mcmc:
-                    stage_loss = F.smooth_l1_loss(preds[-1], real_gt)
-                else:
-                    stage_loss = sum(F.smooth_l1_loss(p, real_gt) for p in preds) / K
-                total_loss = total_loss + stage_loss
-            else:
-                stage_loss = preds[-1].new_zeros(())
-
-            with torch.no_grad():
-                init_recon = F.smooth_l1_loss(preds[0].detach(), real_gt)
-                final_recon = F.smooth_l1_loss(preds[-1].detach(), real_gt)
-                init_e = energies[0].mean()
-                final_e = energies[-1].mean()
-                baseline = F.smooth_l1_loss(real_ctxs[i], real_gt)
-            per_stage[i] = {
-                "loss": stage_loss.detach(),
-                "init_recon": init_recon,
-                "final_recon": final_recon,
-                "init_energy": init_e,
-                "final_energy": final_e,
-                "energy_gap": init_e - final_e,
-                "alpha": self.alphas[i].detach(),
-                "baseline_copy_last": baseline,
-                "final_pred": preds[-1].detach(),
-                "final_pred_live": preds[-1],
-                "real_gt": real_gt.detach(),
-            }
 
         return per_stage, total_loss
