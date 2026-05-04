@@ -136,6 +136,14 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         args.no_detach_kv = True
         args.truncate_mcmc = True
 
+    # train_encoder is incompatible with preprocessed features
+    if args.train_encoder and args.preprocessed_dir:
+        raise ValueError(
+            "--train_encoder is incompatible with --preprocessed_dir. "
+            "When training the encoder, raw video must be passed through the "
+            "encoder every step (features change)."
+        )
+
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
         mcmc_num_steps=args.mcmc_steps,
@@ -156,6 +164,7 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         decoder_out_size=args.image_size,
         decoder_loss_weight=args.decoder_loss_weight,
         weights_path=weights,
+        train_encoder=args.train_encoder,
     )
     return HierarchicalHVEBT(cfg).to(device)
 
@@ -223,6 +232,9 @@ def train(args):
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     print(f"[hvebt-h] trainable params: {n_trainable/1e6:.2f}M")
+    if args.train_encoder:
+        n_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+        print(f"[hvebt-h] encoder trainable: {n_enc/1e6:.2f}M (included in total)")
 
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -409,6 +421,10 @@ def parse_args():
                          "Gradient flows upward through non-detached KV. "
                          "Upper stages become learned latents. "
                          "Implies --decoder, --no_detach_kv, truncate_mcmc=True.")
+    # encoder
+    ap.add_argument("--train_encoder", action="store_true",
+                    help="Unfreeze the CLIP encoder and train it jointly. "
+                         "Incompatible with --preprocessed_dir.")
     # decoder
     ap.add_argument("--decoder", action="store_true")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0)

@@ -61,6 +61,9 @@ class HierarchicalHVEBTConfig:
     denoising_init: str = "zeros"          # "zeros" | "random_noise" | "real_current"
     truncate_mcmc: bool = False
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
+    train_encoder: bool = False            # If True, CLIP encoder is unfrozen and trained
+                                           # jointly with the EBT stages. Incompatible with
+                                           # preprocessed features (features change each step).
     # Adaptive MCMC ----------------------------------------------------------- #
     adaptive_mcmc: bool = False            # If True, run MCMC until convergence instead of
                                            # fixed K steps. Overrides mcmc_num_steps as max_steps.
@@ -123,6 +126,7 @@ class HierarchicalHVEBT(nn.Module):
             self.encoder = MobileClipMultiStageEncoder(
                 weights_path=cfg.weights_path,
                 return_stages=stage_names,
+                trainable=cfg.train_encoder,
             )
         else:
             self.encoder = None  # preprocessed features mode
@@ -202,7 +206,6 @@ class HierarchicalHVEBT(nn.Module):
     # encoding
     # ------------------------------------------------------------------ #
 
-    @torch.no_grad()
     def encode(self, video: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args: video (B, T+1, 3, Hi, Wi) in [0, 1].

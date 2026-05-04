@@ -41,6 +41,7 @@ class MobileClipMultiStageEncoder(nn.Module):
         model_name: str = "MobileCLIP2-S0",
         return_stages: Optional[Iterable[str]] = None,
         normalize_features: bool = True,
+        trainable: bool = False,
     ):
         super().__init__()
         import open_clip  # lazy
@@ -54,6 +55,7 @@ class MobileClipMultiStageEncoder(nn.Module):
             if s not in self.ALL_STAGES:
                 raise ValueError(f"Unknown stage '{s}'. Valid: {self.ALL_STAGES}")
         self.normalize_features = bool(normalize_features)
+        self._trainable = trainable
 
         self.register_buffer(
             "clip_mean", torch.tensor(_CLIP_MEAN).view(1, 3, 1, 1), persistent=False
@@ -62,13 +64,16 @@ class MobileClipMultiStageEncoder(nn.Module):
             "clip_std", torch.tensor(_CLIP_STD).view(1, 3, 1, 1), persistent=False
         )
 
-        # Freeze everything.
-        for p in self.parameters():
-            p.requires_grad = False
+        if not trainable:
+            # Freeze everything.
+            for p in self.parameters():
+                p.requires_grad = False
         self.eval()
 
-    # Keep encoder permanently in eval mode (disables dropout + BN running-stats update).
+    # Keep encoder in eval mode (disables dropout + BN running-stats update)
+    # unless trainable (where we still want eval BN but allow grad flow).
     def train(self, mode: bool = True):  # type: ignore[override]
+        # Always use eval-mode BN stats; only set requires_grad via _trainable.
         return super().train(False)
 
     def _apply_norm(self, x: torch.Tensor) -> torch.Tensor:
@@ -91,7 +96,6 @@ class MobileClipMultiStageEncoder(nn.Module):
             return (x - mu) / torch.sqrt(var + 1e-5)
         raise ValueError(f"Unsupported feature shape: {x.shape}")
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -100,7 +104,7 @@ class MobileClipMultiStageEncoder(nn.Module):
             dict mapping stage name -> feature tensor.
         """
         if x.dim() != 4 or x.shape[1] != 3:
-            raise ValueError(f"Expected (B,3,H,W), got {tuple(x.shape)}")
+            raise ValueError(f"Expected (B,3,H,W), got {tuple(x.shape)})")
         x = self._apply_norm(x)
 
         trunk = self.visual.trunk
@@ -143,6 +147,13 @@ class MobileClipMultiStageEncoder(nn.Module):
         Returns:
             dict mapping stage -> (B, T, C, Hs, Ws) or (B, T, C) for 'pooled'.
         """
+        # If frozen, run without grad for efficiency
+        if not self._trainable:
+            with torch.no_grad():
+                return self._encode_video_impl(x)
+        return self._encode_video_impl(x)
+
+    def _encode_video_impl(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         if x.dim() != 5 or x.shape[2] != 3:
             raise ValueError(f"Expected (B,T,3,H,W), got {tuple(x.shape)}")
         B, T = x.shape[:2]
