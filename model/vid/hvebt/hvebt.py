@@ -34,6 +34,7 @@ from model.vid.hvebt.cross_attention import (
     build_cross_attn_mask,
 )
 from model.vid.hvebt.positional import RoPE3DCache, apply_rope3d, build_rope3d
+from model.vid.hvebt.vq import VQModule
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +57,12 @@ class HVEBTStageConfig:
     init_std: float = 0.02
     temporal_window: Optional[int] = None  # Self-attn temporal window. None/0 = full causal,
                                             # 1 = self-frame only, W = last W frames.
+    # ----- VQ mode (Plan V2) ------------------------------------------------ #
+    vq_codebook_size: int = 0            # 0 disables VQ for this stage; >0 enables it
+    vq_codebook_path: str = ""           # Path to .pt with (K, C) codebook (KMeans output)
+    vq_ema_decay: float = 0.0            # 0 = frozen codebook; >0 = EMA codebook update
+    vq_track_usage: bool = True          # Maintain selection-usage EMA (cheap)
+    vq_logit_clamp: float = 0.0          # 0 = no clamp; else clamp logits to [-c, c]
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +228,20 @@ class HVEBTStage(nn.Module):
             self.parent_HW = None
         # channel-wise concat of (real_t, pred_{t+1}) -> D
         self.input_proj = nn.Linear(2 * cfg.clip_channels, cfg.embed_dim, bias=True)
+
+        # VQ codebook (only when vq_codebook_size > 0). The HVEBTStage itself
+        # is unaware of VQ semantics in `forward()`; the codebook is invoked
+        # by the hierarchical wrapper (logits → features) and by loss/metrics.
+        self.vq: Optional[VQModule] = None
+        if cfg.vq_codebook_size > 0:
+            self.vq = VQModule(
+                codebook_size=cfg.vq_codebook_size,
+                dim=cfg.clip_channels,
+                ema_decay=cfg.vq_ema_decay,
+                track_usage=cfg.vq_track_usage,
+            )
+            if cfg.vq_codebook_path:
+                self.vq.load_from_kmeans(cfg.vq_codebook_path)
         self.blocks = nn.ModuleList([
             Block(cfg, cross_attn_dim=(cfg.embed_dim if self.use_cross_attn else None))
             for _ in range(cfg.n_layers)
@@ -286,6 +307,48 @@ class HVEBTStage(nn.Module):
             mask = build_cross_attn_mask(T, Hc, Wc, Hp, Wp, device)
             self._cross_mask_cache[key] = mask
         return mask
+
+    # ------------------------------------------------------------------ #
+    # VQ helpers (no-op when self.vq is None)
+    # ------------------------------------------------------------------ #
+
+    def features_from_logits(self, logits: torch.Tensor, T: int) -> torch.Tensor:
+        """
+        VQ helper: convert (B, T*H*W, K) logits to (B, T, C, H, W) features
+        via softmax @ codebook. Live grad-graph is preserved.
+        """
+        if self.vq is None:
+            raise RuntimeError("features_from_logits called on a non-VQ stage")
+        B = logits.shape[0]
+        feats_flat = self.vq.decode(logits)                 # (B, T*H*W, C)
+        feats = feats_flat.reshape(B, T, self.cfg.H, self.cfg.W, self.cfg.clip_channels)
+        return feats.permute(0, 1, 4, 2, 3).contiguous()    # (B, T, C, H, W)
+
+    def features_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        VQ helper: embed integer code indices (B, T, H, W) into features
+        (B, T, C, H, W). Used to build a quantized real-context when
+        precomputed targets are present and CLIP features are not loaded.
+        """
+        if self.vq is None:
+            raise RuntimeError("features_from_indices called on a non-VQ stage")
+        B, T, H, W = indices.shape
+        if (H, W) != (self.cfg.H, self.cfg.W):
+            raise ValueError(f"indices spatial {(H, W)} != cfg {(self.cfg.H, self.cfg.W)}")
+        feats = self.vq.lookup(indices)                     # (B, T, H, W, C)
+        return feats.permute(0, 1, 4, 2, 3).contiguous()    # (B, T, C, H, W)
+
+    def quantize_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        VQ helper: nearest-codebook indices for (B, T, C, H, W) features.
+        Returns (B, T, H, W) long.
+        """
+        if self.vq is None:
+            raise RuntimeError("quantize_features called on a non-VQ stage")
+        B, T, C, H, W = features.shape
+        flat = features.permute(0, 1, 3, 4, 2).reshape(-1, C)
+        idx = self.vq.quantize(flat)
+        return idx.reshape(B, T, H, W)
 
     def forward(
         self,

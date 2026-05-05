@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.vid.preprocessed_clip_dataset import PreprocessedCLIPDataset  # noqa: E402
+from data.vid.preprocessed_vq_dataset import PreprocessedCLIPVQDataset  # noqa: E402
 from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset  # noqa: E402
 from model.vid.hvebt import (  # noqa: E402
     HierarchicalHVEBT,
@@ -144,6 +145,24 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
             "encoder every step (features change)."
         )
 
+    # VQ derived flags
+    if args.no_features:
+        args.vq_mode = True
+        args.vq_use_precomputed_targets = True
+    if args.vq_codebook_dir and not args.vq_mode:
+        args.vq_mode = True
+    if args.vq_use_precomputed_targets and not args.vq_dir:
+        raise ValueError("--vq_use_precomputed_targets / --no_features requires --vq_dir")
+    if args.vq_dir and not args.vq_codebook_dir:
+        # By convention codebooks live in vq_dir
+        args.vq_codebook_dir = args.vq_dir
+    if args.vq_mode and args.train_encoder and not args.allow_stale_targets \
+            and args.vq_use_precomputed_targets:
+        raise ValueError(
+            "VQ + precomputed targets + train_encoder needs --allow_stale_targets "
+            "(or implement on-the-fly target recompute)."
+        )
+
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
         mcmc_num_steps=args.mcmc_steps,
@@ -165,6 +184,19 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         decoder_loss_weight=args.decoder_loss_weight,
         weights_path=weights,
         train_encoder=args.train_encoder,
+        # ----- VQ -----
+        vq_mode=args.vq_mode,
+        vq_codebook_dir=args.vq_codebook_dir,
+        vq_use_precomputed_targets=args.vq_use_precomputed_targets,
+        vq_no_features=args.no_features,
+        vq_soft_targets=args.vq_soft_targets,
+        vq_soft_temperature=args.vq_soft_temperature,
+        vq_target_recompute_every=args.vq_target_recompute_every,
+        allow_stale_targets=args.allow_stale_targets,
+        vq_dead_code_threshold=args.vq_dead_code_threshold,
+        vq_dead_code_check_every=args.vq_dead_code_check_every,
+        vq_merge_sim_threshold=args.vq_merge_sim_threshold,
+        vq_merge_check_every=args.vq_merge_check_every,
     )
     return HierarchicalHVEBT(cfg).to(device)
 
@@ -215,8 +247,19 @@ def train(args):
         )
         print(f"[hvebt-h] Temporal windows: {tw_info}")
     use_preprocessed = args.preprocessed_dir is not None
+    use_vq_dataset = args.vq_use_precomputed_targets and args.vq_dir
 
-    if use_preprocessed:
+    if use_vq_dataset:
+        dataset = PreprocessedCLIPVQDataset(
+            features_dir=args.preprocessed_dir or args.vq_dir,
+            vq_dir=args.vq_dir,
+            stages=args.stages,
+            load_features=not args.no_features,
+            require_video=True,
+        )
+        print(f"[hvebt-h] Using VQ dataset (no_features={args.no_features}) "
+              f"features_dir={dataset.features_dir} vq_dir={dataset.vq_dir}")
+    elif use_preprocessed:
         dataset = PreprocessedCLIPDataset(args.preprocessed_dir, stages=args.stages)
         print(f"[hvebt-h] Using preprocessed features from: {args.preprocessed_dir}")
     else:
@@ -252,6 +295,13 @@ def train(args):
             f"s{i}_{name}_baseline_copy",
             f"s{i}_{name}_alpha", f"s{i}_{name}_grad_norm",
         ]
+        if args.vq_mode:
+            header_cols += [
+                f"s{i}_{name}_ce_loss",
+                f"s{i}_{name}_entropy_mean",
+                f"s{i}_{name}_top1_acc",
+                f"s{i}_{name}_cb_usage",
+            ]
     if args.decoder:
         header_cols += ["dec_grad_norm"]
     header_cols += ["secs"]
@@ -273,7 +323,18 @@ def train(args):
                 print(f"[hvebt-h] step {step}: activated stage {newly_activated} "
                       f"({stage_name}) — now {model.num_active_stages}/{len(args.stages)} active")
 
-            if use_preprocessed:
+            if use_vq_dataset:
+                video = batch["video"].to(device, non_blocking=True)
+                vq_targets = {s: batch[f"target_{s}"].to(device, non_blocking=True)
+                              for s in args.stages}
+                feats_dict = None
+                if not args.no_features:
+                    feats_dict = {s: batch[s].to(device, non_blocking=True)
+                                  for s in args.stages}
+                out = model.forward_loss(
+                    video, features=feats_dict, vq_targets=vq_targets, learning=True,
+                )
+            elif use_preprocessed:
                 # batch is dict {stage_name: (B, T, C, H, W), "video": (B, T, 3, H, W)}
                 video = batch["video"].to(device, non_blocking=True)
                 feats_dict = {k: v.to(device, non_blocking=True)
@@ -313,8 +374,16 @@ def train(args):
                         f"{s['baseline_copy_last'].item():.6f}",
                         f"{s['alpha'].item():.4f}", f"{stage_norms[i]:.6f}",
                     ]
+                    if args.vq_mode:
+                        row += [
+                            f"{s.get('ce_loss', s['loss']).item():.6f}",
+                            f"{s['entropy_mean'].item():.6f}" if 'entropy_mean' in s else "",
+                            f"{s['top1_accuracy'].item():.6f}" if 'top1_accuracy' in s else "",
+                            f"{s['codebook_usage'].item():.6f}" if 'codebook_usage' in s else "",
+                        ]
                 else:
-                    row += [""] * 8  # inactive stage
+                    n_blanks = 8 + (4 if args.vq_mode else 0)
+                    row += [""] * n_blanks  # inactive stage
             if args.decoder:
                 row += [f"{dec_norm:.6f}"]
             row += [f"{dt:.3f}"]
@@ -341,6 +410,12 @@ def train(args):
                         f"[{name}] r{fr:.3f}/b{base:.3f} ({vs_base*100:+.0f}%) "
                         f"Eg{s['energy_gap'].item():+.2e} g{stage_norms[i]:.2f}{steps_info}"
                     )
+                    if args.vq_mode and 'entropy_mean' in s:
+                        pieces.append(
+                            f"H{s['entropy_mean'].item():.2f} "
+                            f"acc{s['top1_accuracy'].item()*100:.0f}% "
+                            f"cb{s['codebook_usage'].item()*100:.0f}%"
+                        )
                 if args.decoder:
                     pieces.append(f"dg{dec_norm:.2f}")
                 pieces.append(f"dt={dt:.2f}s")
@@ -429,6 +504,34 @@ def parse_args():
     ap.add_argument("--decoder", action="store_true")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0)
     ap.add_argument("--decoder_save_every", type=int, default=20)
+    # ----- VQ ----- #
+    ap.add_argument("--vq_mode", action="store_true",
+                    help="Enable VQ codebook classification mode (per-stage softmax over codebook).")
+    ap.add_argument("--vq_dir", type=str, default="",
+                    help="Directory with codebook_<stage>.pt and targets_<stage>/ "
+                         "(output of scripts/build_vq_codebook.py).")
+    ap.add_argument("--vq_codebook_dir", type=str, default="",
+                    help="Directory with codebook_<stage>.pt files (defaults to --vq_dir).")
+    ap.add_argument("--vq_use_precomputed_targets", action="store_true",
+                    help="Read per-stage target indices from --vq_dir (skips on-the-fly quantization).")
+    ap.add_argument("--no_features", action="store_true",
+                    help="CLIP-free training: do NOT load CLIP features; build real_ctx by "
+                         "embedding precomputed target indices through the codebook. "
+                         "Implies --vq_mode --vq_use_precomputed_targets.")
+    ap.add_argument("--allow_stale_targets", action="store_true",
+                    help="Permit train_encoder + precomputed targets without recomputation.")
+    ap.add_argument("--vq_soft_targets", action="store_true",
+                    help="Use cosine-similarity soft cross-entropy targets.")
+    ap.add_argument("--vq_soft_temperature", type=float, default=0.1)
+    ap.add_argument("--vq_target_recompute_every", type=int, default=0,
+                    help="Re-quantize targets every N steps (only when CLIP features present).")
+    # VQ maintenance
+    ap.add_argument("--vq_dead_code_threshold", type=float, default=1e-4)
+    ap.add_argument("--vq_dead_code_check_every", type=int, default=0,
+                    help="0 disables dead-code reset.")
+    ap.add_argument("--vq_merge_sim_threshold", type=float, default=0.0,
+                    help="0 disables merging.")
+    ap.add_argument("--vq_merge_check_every", type=int, default=0)
     # optimization
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)

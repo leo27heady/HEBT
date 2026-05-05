@@ -11,6 +11,7 @@ from model.vid.hvebt.hierarchical import (
     default_3stage_configs,
 )
 from model.vid.hvebt.hvebt import HVEBT, HVEBTConfig, HVEBTStage, HVEBTStageConfig
+from model.vid.hvebt.vq import VQModule
 
 __all__ = [
     "MobileClipMultiStageEncoder",
@@ -26,4 +27,5 @@ __all__ = [
     "build_cross_attn_mask",
     "PixelDecoder",
     "save_recon_grid",
+    "VQModule",
 ]
