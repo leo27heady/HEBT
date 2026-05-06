@@ -77,7 +77,7 @@ def _stream_token_sample(
     total = 0
     for f in files:
         feat = torch.load(f, weights_only=True)  # (T, C, H, W)
-        if feat.ndim == 3:  # (T, C) pooled
+        if feat.ndim == 2:  # (T, C) pooled
             feat = feat.unsqueeze(-1).unsqueeze(-1)
         T, C, H, W = feat.shape
         flat = feat.permute(0, 2, 3, 1).reshape(-1, C).contiguous()  # (T*H*W, C)
@@ -138,7 +138,7 @@ def _precompute_targets(
     t0 = time.time()
     for i, f in enumerate(files):
         feat = torch.load(f, weights_only=True)  # (T, C, H, W) or (T, C)
-        if feat.ndim == 3:
+        if feat.ndim == 2:  # (T, C) pooled
             feat = feat.unsqueeze(-1).unsqueeze(-1)
         T, C_f, H, W = feat.shape
         if C_f != C:

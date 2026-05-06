@@ -117,6 +117,7 @@ def _make_model_no_encoder(cfg: HierarchicalHVEBTConfig) -> HierarchicalHVEBT:
             in_HW=(base_sc.H, base_sc.W),
             out_size=cfg.decoder_out_size,
         )
+    model.register_buffer("_global_step_buf", torch.zeros((), dtype=torch.long), persistent=False)
     return model
 
 

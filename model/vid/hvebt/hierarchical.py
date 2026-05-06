@@ -747,8 +747,14 @@ class HierarchicalHVEBT(nn.Module):
             out["decoded_rgb"] = decoded.detach()
             out["target_rgb"] = target_rgb.detach()
             if self.cfg.bottom_up_loss:
-                # Decoder pixel loss is the sole objective.
-                out["loss_total"] = decoder_loss
+                # Bottom-up: decoder pixel loss is the primary objective and its
+                # gradient flows through live MCMC preds → cross-attn KV → all
+                # stages. In VQ mode, per-stage CE is also kept (see VQ-mode
+                # invariant in _mcmc_sequential) because pixel L1 alone cannot
+                # train the codebook classification. In continuous mode,
+                # total_loss is 0 here (per-stage feature losses are suppressed)
+                # so this reduces to "decoder is sole loss".
+                out["loss_total"] = total_loss + self.cfg.decoder_loss_weight * decoder_loss
             else:
                 out["loss_total"] = total_loss + self.cfg.decoder_loss_weight * decoder_loss
         else:
@@ -875,9 +881,14 @@ class HierarchicalHVEBT(nn.Module):
                 target_flat = target_idx.reshape(-1)
 
                 # ---- Loss --------------------------------------------------
+                # VQ-MODE INVARIANT: per-stage CE supervision is REQUIRED for the
+                # codebook classification to train at all. Decoder pixel L1 alone
+                # cannot drive a categorical distribution through softmax @ frozen
+                # codebook (the gradient is far too weak / 1/K-suppressed). So in
+                # VQ mode we ALWAYS compute CE on every active stage, regardless
+                # of bottom_up_loss / decoder. The decoder loss (when enabled)
+                # is added ON TOP via _forward_loss_impl.
                 compute_loss = True
-                if bu:
-                    compute_loss = (i == finest_active_idx) and (not bu_skip_all_loss)
 
                 if compute_loss:
                     if self.cfg.vq_soft_targets:

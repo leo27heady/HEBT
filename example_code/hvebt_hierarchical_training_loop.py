@@ -123,6 +123,8 @@ def build_stage_configs(args) -> List[HVEBTStageConfig]:
             clip_stage_name=name, clip_channels=c, H=h, W=w,
             embed_dim=d, n_heads=args.n_heads, n_layers=args.n_layers,
             temporal_window=tw,
+            vq_ema_decay=args.vq_ema_decay,
+            vq_logit_clamp=args.vq_logit_clamp,
         ))
     return cfgs
 
@@ -162,6 +164,15 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
             "VQ + precomputed targets + train_encoder needs --allow_stale_targets "
             "(or implement on-the-fly target recompute)."
         )
+
+    # VQ-mode default override: continuous-mode mcmc_step_size (1000) is
+    # catastrophic in logit space — one step pushes softmax to a saturated
+    # one-hot and gradients vanish. If the user did not override, drop to a
+    # safe small value. (Confirmed empirically in scripts/diagnose_vq.py.)
+    if args.vq_mode and args.mcmc_step_size >= 100.0:
+        print(f"[hvebt-h] vq_mode: lowering mcmc_step_size {args.mcmc_step_size} -> 10.0 "
+              f"(VQ logit-space step; pass --mcmc_step_size to override)")
+        args.mcmc_step_size = 10.0
 
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
@@ -526,6 +537,12 @@ def parse_args():
     ap.add_argument("--vq_target_recompute_every", type=int, default=0,
                     help="Re-quantize targets every N steps (only when CLIP features present).")
     # VQ maintenance
+    ap.add_argument("--vq_ema_decay", type=float, default=0.0,
+                    help="EMA codebook update decay. 0=frozen codebook. >0 (e.g. 0.99) "
+                         "enables online codebook tracking. Required with --train_encoder.")
+    ap.add_argument("--vq_logit_clamp", type=float, default=30.0,
+                    help="Clamp VQ logits to [-c, c] after each MCMC step. 0 disables. "
+                         "Default 30 keeps softmax in a well-conditioned regime.")
     ap.add_argument("--vq_dead_code_threshold", type=float, default=1e-4)
     ap.add_argument("--vq_dead_code_check_every", type=int, default=0,
                     help="0 disables dead-code reset.")
