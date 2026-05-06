@@ -363,26 +363,30 @@ class VQHVEBTStage(nn.Module):
             # Detach so autograd sees pred_logits as a leaf at this step.
             pred_logits = pred_logits.detach().requires_grad_(True)
 
-            # Decode logits → embedding → reshape to (B, T, C, H, W).
-            z_pred_flat = self.quantizer.decode_logits(pred_logits)  # (B, N, C)
-            z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
+            # torch.enable_grad() ensures autograd is active for the MCMC step even
+            # when run_mcmc is called inside a torch.no_grad() context (e.g. predict_next).
+            # Without this, energy.grad_fn would be None and autograd.grad would raise.
+            with torch.enable_grad():
+                # Decode logits → embedding → reshape to (B, T, C, H, W).
+                z_pred_flat = self.quantizer.decode_logits(pred_logits)  # (B, N, C)
+                z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
-            # Compute energy.
-            energy = self.forward_energy(real_ctx, z_pred, parent_context)  # (B, N)
-            energy_trace.append(energy.detach().sum().item())
+                # Compute energy.
+                energy = self.forward_energy(real_ctx, z_pred, parent_context)  # (B, N)
+                energy_trace.append(energy.detach().sum().item())
 
-            # create_graph=True lets grad-of-grad flow through MCMC into transformer
-            # weights during the backward pass for the training loss.
-            # With truncate_mcmc=True, only the LAST step gets create_graph=True
-            # (saves memory at the cost of a coarser approximation).
-            create_graph = learning and (
-                not self.cfg.truncate_mcmc or step == num_steps - 1
-            )
-            grad = torch.autograd.grad(
-                [energy.sum()], [pred_logits],
-                create_graph=create_graph,
-                retain_graph=create_graph,
-            )[0]
+                # create_graph=True lets grad-of-grad flow through MCMC into transformer
+                # weights during the backward pass for the training loss.
+                # With truncate_mcmc=True, only the LAST step gets create_graph=True
+                # (saves memory at the cost of a coarser approximation).
+                create_graph = learning and (
+                    not self.cfg.truncate_mcmc or step == num_steps - 1
+                )
+                grad = torch.autograd.grad(
+                    [energy.sum()], [pred_logits],
+                    create_graph=create_graph,
+                    retain_graph=create_graph,
+                )[0]
 
             # Gradient descent step in logit space.
             # When create_graph=True at this step, pred_logits_new = pred_logits - alpha * grad

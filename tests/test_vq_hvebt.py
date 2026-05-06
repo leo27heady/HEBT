@@ -108,7 +108,7 @@ def _make_stage_cfg(
         codebook=VQCodebookConfig(
             num_codes=K,
             code_dim=clip_channels,
-            init_mode="random",
+            init_mode="data_first_batch",
         ),
         pred_loss="mse",
         pred_loss_weight=1.0,
