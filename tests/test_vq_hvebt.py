@@ -54,6 +54,8 @@ pytest tests/test_vq_hvebt.py -v -k "test_straight_through"
 """
 from __future__ import annotations
 
+import os
+import sys
 import math
 from typing import Dict, Optional
 from unittest.mock import MagicMock, patch
@@ -66,6 +68,11 @@ import torch.nn.functional as F
 # --------------------------------------------------------------------------- #
 #  Imports under test
 # --------------------------------------------------------------------------- #
+
+# Make project importable when run as a script from repo root
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from model.vid.vq_hvebt.config import (
     VQCodebookConfig,
