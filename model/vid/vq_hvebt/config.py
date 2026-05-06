@@ -1,0 +1,170 @@
+"""
+Configuration dataclasses for VQ-HVEBT.
+
+VQ-HVEBT combines a trainable MobileCLIP encoder with per-stage online
+vector quantizers (VQ-VAE style) and EBT predictors that model future
+quantized latent states via MCMC.
+
+Hierarchy (three stages, coarsest first in prediction order):
+    s3:  512 channels, 8x8 spatial   (coarsest / apex)
+    s2:  256 channels, 16x16 spatial
+    s1:  128 channels, 32x32 spatial  (finest / base)
+
+CLIP spatial sizes assume 256x256 input frames.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+# --------------------------------------------------------------------------- #
+#  Codebook sub-config
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class VQCodebookConfig:
+    """Configuration for one VQ codebook.
+
+    num_codes : size K — number of distinct code vectors (vocabulary size).
+    code_dim  : dimension C of each code vector; must match clip_channels of
+                the parent VQStageConfig.
+    init_mode : how to initialize the codebook.
+                "random"          — standard nn.Embedding Gaussian init.
+                "data_first_batch"— replace entries with random-sampled encoder
+                                    outputs on the first forward pass. Call
+                                    VectorQuantizer.initialize_from_data(z_e)
+                                    manually after the first encoding.
+    commitment_beta : weight β for commitment loss (encoder pays β × MSE to
+                      stay near codebook; default 0.25 from VQ-VAE paper).
+    """
+    num_codes: int = 512
+    code_dim: int = 256
+    init_mode: str = "data_first_batch"   # "random" | "data_first_batch"
+    commitment_beta: float = 0.25
+
+
+# --------------------------------------------------------------------------- #
+#  Per-stage config
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class VQStageConfig:
+    """Configuration for one VQ-HVEBT stage (one spatial resolution).
+
+    Fields
+    ------
+    clip_stage_name : which MobileCLIP output to consume ("s1", "s2", "s3").
+    clip_channels   : C_clip of that stage.
+    H, W            : spatial grid size at this stage.
+    transformer_dim : internal dimension D of the predictor transformer.
+    n_heads         : number of attention heads (must divide transformer_dim).
+    n_layers        : number of transformer blocks.
+    ffn_mult        : hidden-to-D multiplier for feed-forward layers.
+    dropout         : attention and FF dropout rate.
+    attn_bias       : whether QKV projections use bias.
+    init_std        : weight initialisation std.
+    temporal_window : None = full causal self-attention across the T dimension.
+                      1 = self-frame only. k > 1 = last k frames.
+    codebook        : VQCodebookConfig for this stage's quantizer.
+    mcmc_steps      : number of gradient-descent MCMC steps.
+    mcmc_step_size  : initial step size α for logit-space MCMC.
+    mcmc_step_learnable : whether α is an nn.Parameter (recommended True).
+    truncate_mcmc   : if True, only the last MCMC step keeps the computation
+                      graph (saves memory; sufficient for most training).
+    pred_loss       : "mse" or "smooth_l1" for the prediction loss term.
+    pred_loss_weight: λ_pred in the total loss formula.
+    cb_loss_weight  : λ_cb for the codebook loss term.
+    commit_loss_weight: λ_commit for the commitment loss term (usually == β).
+    """
+    clip_stage_name: str = "s1"
+    clip_channels: int = 128
+    H: int = 32
+    W: int = 32
+    transformer_dim: int = 256
+    n_heads: int = 4
+    n_layers: int = 4
+    ffn_mult: float = 4.0
+    dropout: float = 0.0
+    attn_bias: bool = False
+    init_std: float = 0.02
+    temporal_window: Optional[int] = None
+    codebook: VQCodebookConfig = field(default_factory=VQCodebookConfig)
+    mcmc_steps: int = 3
+    mcmc_step_size: float = 0.1
+    mcmc_step_learnable: bool = True
+    truncate_mcmc: bool = False
+    pred_loss: str = "mse"              # "mse" | "smooth_l1"
+    pred_loss_weight: float = 1.0
+    cb_loss_weight: float = 1.0
+    commit_loss_weight: float = 0.25
+
+    def __post_init__(self):
+        # Auto-fill code_dim from clip_channels so caller doesn't have to repeat it.
+        if self.codebook.code_dim != self.clip_channels:
+            self.codebook = VQCodebookConfig(
+                num_codes=self.codebook.num_codes,
+                code_dim=self.clip_channels,
+                init_mode=self.codebook.init_mode,
+                commitment_beta=self.codebook.commitment_beta,
+            )
+
+
+# --------------------------------------------------------------------------- #
+#  Top-level model config
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class VQHVEBTConfig:
+    """Top-level configuration for the VQ-HVEBT model.
+
+    stages           : list of VQStageConfig, ordered coarsest → finest.
+                       The default is a three-stage hierarchy [s3, s2, s1].
+    train_encoder    : if False the CLIP encoder is frozen (gradient blocked).
+                       Default True (both encoder and codebook train jointly).
+    encoder_lr_scale : scale factor applied to encoder param LR relative to
+                       the rest of the model (set < 1 to slow down encoder).
+    weights_path     : path to MobileCLIP2-S0 pretrained weights.
+    use_decoder      : if True attach a pixel decoder on the finest stage.
+    decoder_loss_weight : λ_dec in total loss.
+    decoder_out_size : output spatial size for the pixel decoder (e.g. 256).
+    detach_parent_kv : if True the parent context fed to a finer stage is
+                       detached (default True; prevents gradient leakage).
+    """
+    stages: List[VQStageConfig] = field(default_factory=lambda: _default_stages())
+    train_encoder: bool = True
+    encoder_lr_scale: float = 0.1
+    weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
+    use_decoder: bool = False
+    decoder_loss_weight: float = 1.0
+    decoder_out_size: int = 256
+    detach_parent_kv: bool = True
+
+
+def _default_stages() -> List[VQStageConfig]:
+    """Three-stage hierarchy: s3 (coarsest) → s2 → s1 (finest)."""
+    s3 = VQStageConfig(
+        clip_stage_name="s3",
+        clip_channels=512,
+        H=8, W=8,
+        transformer_dim=256, n_heads=4, n_layers=4,
+        codebook=VQCodebookConfig(num_codes=512, code_dim=512),
+    )
+    s2 = VQStageConfig(
+        clip_stage_name="s2",
+        clip_channels=256,
+        H=16, W=16,
+        transformer_dim=256, n_heads=4, n_layers=4,
+        codebook=VQCodebookConfig(num_codes=512, code_dim=256),
+    )
+    s1 = VQStageConfig(
+        clip_stage_name="s1",
+        clip_channels=128,
+        H=32, W=32,
+        transformer_dim=256, n_heads=4, n_layers=4,
+        codebook=VQCodebookConfig(num_codes=512, code_dim=128),
+    )
+    return [s3, s2, s1]
