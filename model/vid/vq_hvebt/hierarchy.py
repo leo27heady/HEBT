@@ -135,10 +135,7 @@ class VQHVEBTModel(nn.Module):
 
         for idx, stage_cfg in enumerate(cfg.stages):
             name = stage_cfg.clip_stage_name
-            self.quantizers[name] = VectorQuantizer(
-                stage_cfg.codebook,
-                detach_codebook_in_decode=cfg.detach_pred_context,
-            )
+            self.quantizers[name] = VectorQuantizer(stage_cfg.codebook)
 
             # Parent config: the previous entry in stages list (one coarser).
             parent_cfg: Optional[VQStageConfig] = cfg.stages[idx - 1] if idx > 0 else None
@@ -551,13 +548,11 @@ class VQHVEBTModel(nn.Module):
     def parameter_groups(self, base_lr: float):
         """Build optimizer parameter groups with encoder at reduced LR.
 
-        Three groups:
+        Two groups:
           1. Predictor params (full LR): transformers, energy heads, step_size.
-          2. Codebook params (reduced LR): codebook embeddings — need low LR
-             because AdamW's scale-invariance moves entries by O(LR) per step
-             regardless of gradient magnitude, which can exceed inter-code
-             distance and destabilize VQ assignments.
-          3. Encoder params (tiny LR): pretrained CLIP — change slowly.
+          2. Encoder params (reduced LR): pretrained CLIP — change slowly.
+
+        Note: Codebook is EMA-updated (no gradient), so no codebook params here.
 
         Args:
             base_lr: learning rate for predictors.
@@ -568,29 +563,23 @@ class VQHVEBTModel(nn.Module):
         enc_params = list(self.encoder.parameters())
         enc_ids = {id(p) for p in enc_params}
 
-        cb_params = []
-        for q in self.quantizers.values():
-            cb_params.extend(list(q.parameters()))
-        cb_ids = {id(p) for p in cb_params}
-
         pred_params = [
             p for p in self.parameters()
-            if id(p) not in enc_ids and id(p) not in cb_ids
+            if id(p) not in enc_ids
         ]
 
         groups = [
             {"params": pred_params, "lr": base_lr},
-            {"params": cb_params, "lr": base_lr * self.cfg.codebook_lr_scale},
             {"params": enc_params, "lr": base_lr * self.cfg.encoder_lr_scale},
         ]
         return groups
 
     def encoder_params(self):
-        """Return encoder parameters (for separate SGD optimizer)."""
+        """Return encoder parameters."""
         return list(self.encoder.parameters())
 
     def non_encoder_params(self):
-        """Return all parameters except encoder (for AdamW optimizer)."""
+        """Return all learnable parameters except encoder."""
         enc_ids = {id(p) for p in self.encoder.parameters()}
         return [p for p in self.parameters() if id(p) not in enc_ids]
 

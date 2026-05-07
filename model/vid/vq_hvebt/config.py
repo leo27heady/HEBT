@@ -31,18 +31,22 @@ class VQCodebookConfig:
     code_dim  : dimension C of each code vector; must match clip_channels of
                 the parent VQStageConfig.
     init_mode : how to initialize the codebook.
-                "random"          — standard nn.Embedding Gaussian init.
+                "random"          — standard Gaussian init.
                 "data_first_batch"— replace entries with random-sampled encoder
                                     outputs on the first forward pass. Call
                                     VectorQuantizer.initialize_from_data(z_e)
                                     manually after the first encoding.
-    commitment_beta : weight β for commitment loss (encoder pays β × MSE to
-                      stay near codebook; default 0.25 from VQ-VAE paper).
+    ema_decay : EMA decay rate for codebook updates. Higher = more stable
+                codebook (slower adaptation). Typical: 0.99–0.999.
+    commitment_beta : UNUSED (kept for backward compat). No commitment loss
+                      in EMA mode.
     """
     num_codes: int = 512
     code_dim: int = 256
     init_mode: str = "data_first_batch"   # "random" | "data_first_batch"
-    commitment_beta: float = 0.25
+    ema_decay: float = 0.99
+    commitment_beta: float = 0.0  # unused in EMA mode
+    dead_code_reset: bool = True  # replace dead codes with encoder samples
 
 
 # --------------------------------------------------------------------------- #
@@ -92,8 +96,8 @@ class VQStageConfig:
     init_std: float = 0.02
     temporal_window: Optional[int] = None
     codebook: VQCodebookConfig = field(default_factory=VQCodebookConfig)
-    mcmc_steps: int = 5
-    mcmc_step_size: float = 5.0
+    mcmc_steps: int = 20
+    mcmc_step_size: float = 10.0
     mcmc_step_learnable: bool = True
     mcmc_grad_clamp: float = 10.0
     truncate_mcmc: bool = True
@@ -102,8 +106,8 @@ class VQStageConfig:
                                     # when indices are stable via detach_pred_context)
     pred_loss: str = "mse"              # "mse" | "smooth_l1"
     pred_loss_weight: float = 1.0
-    cb_loss_weight: float = 1.0
-    commit_loss_weight: float = 0.25
+    cb_loss_weight: float = 0.0     # unused (EMA codebook, no gradient loss)
+    commit_loss_weight: float = 0.0  # unused (no commitment loss)
 
     def __post_init__(self):
         # Auto-fill code_dim from clip_channels so caller doesn't have to repeat it.
@@ -112,6 +116,7 @@ class VQStageConfig:
                 num_codes=self.codebook.num_codes,
                 code_dim=self.clip_channels,
                 init_mode=self.codebook.init_mode,
+                ema_decay=self.codebook.ema_decay,
                 commitment_beta=self.codebook.commitment_beta,
             )
 
@@ -137,12 +142,14 @@ class VQHVEBTConfig:
     decoder_out_size : output spatial size for the pixel decoder (e.g. 256).
     detach_parent_kv : if True the parent context fed to a finer stage is
                        detached (default True; prevents gradient leakage).
+    detach_pred_context : if True the quantized context fed to the predictor
+                       is detached from the encoder graph. Encoder trains only
+                       via straight-through from the prediction loss on the
+                       predicted future tokens.
     """
     stages: List[VQStageConfig] = field(default_factory=lambda: _default_stages())
     train_encoder: bool = True
     encoder_lr_scale: float = 0.1
-    codebook_lr_scale: float = 0.1    # codebook LR = base_lr * this. Low value
-                                       # prevents AdamW from overshooting inter-code distances.
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
     use_decoder: bool = False
     decoder_loss_weight: float = 1.0
@@ -150,9 +157,9 @@ class VQHVEBTConfig:
     detach_parent_kv: bool = True
     contrastive_loss_weight: float = 0.0
     encoder_warmup_steps: int = 0
-    detach_pred_context: bool = True   # Detach predictor context from encoder graph.
-                                       # Prevents pred_loss from destabilizing encoder.
-                                       # Encoder trains only via commitment_loss (stabilizing).
+    detach_pred_context: bool = False   # With EMA codebook there is no commitment
+                                        # loss gradient bomb, so we can let prediction
+                                        # loss flow into the encoder via context too.
 
 
 def _default_stages() -> List[VQStageConfig]:
@@ -162,20 +169,20 @@ def _default_stages() -> List[VQStageConfig]:
         clip_channels=512,
         H=8, W=8,
         transformer_dim=256, n_heads=4, n_layers=4,
-        codebook=VQCodebookConfig(num_codes=512, code_dim=512),
+        codebook=VQCodebookConfig(num_codes=512, code_dim=512, ema_decay=0.99),
     )
     s2 = VQStageConfig(
         clip_stage_name="s2",
         clip_channels=256,
         H=16, W=16,
         transformer_dim=256, n_heads=4, n_layers=4,
-        codebook=VQCodebookConfig(num_codes=512, code_dim=256),
+        codebook=VQCodebookConfig(num_codes=512, code_dim=256, ema_decay=0.99),
     )
     s1 = VQStageConfig(
         clip_stage_name="s1",
         clip_channels=128,
         H=32, W=32,
         transformer_dim=256, n_heads=4, n_layers=4,
-        codebook=VQCodebookConfig(num_codes=512, code_dim=128),
+        codebook=VQCodebookConfig(num_codes=512, code_dim=128, ema_decay=0.99),
     )
     return [s3, s2, s1]

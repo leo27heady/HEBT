@@ -70,7 +70,7 @@ class VQClipBackbone(nn.Module):
         self._encoder = MobileClipMultiStageEncoder(
             weights_path=weights_path,
             return_stages=self.return_stages,
-            normalize_features=True,
+            normalize_features=False,
             trainable=trainable,
         )
 

@@ -161,11 +161,12 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
                 num_codes=args.num_codes,
                 code_dim=C,
                 init_mode="data_first_batch",
-                commitment_beta=args.commitment_beta,
+                ema_decay=args.ema_decay,
+                dead_code_reset=args.dead_code_reset,
             ),
             pred_loss_weight=1.0,
-            cb_loss_weight=1.0,
-            commit_loss_weight=args.commitment_beta,
+            cb_loss_weight=0.0,
+            commit_loss_weight=0.0,
         ))
 
     cfg = VQHVEBTConfig(
@@ -181,37 +182,18 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
     return model
 
 
-def build_optimizer(model: VQHVEBTModel, base_lr: float) -> list:
-    """Build optimizers: AdamW for predictor+codebook, SGD for encoder.
+def build_optimizer(model: VQHVEBTModel, base_lr: float) -> torch.optim.Optimizer:
+    """Build a single AdamW optimizer with encoder at reduced LR.
 
-    Using SGD for the encoder prevents Adam's scale-invariance from amplifying
-    tiny commitment-loss gradients into large feature shifts (which would
-    destabilize VQ assignments). With SGD, the encoder step is proportional
-    to gradient magnitude — small commitment gradient = small feature shift.
+    With EMA codebook there is no codebook gradient, no commitment loss,
+    and no 10⁹-scale gradient explosion. A single AdamW with per-group
+    LR is sufficient. No separate SGD needed.
     """
-    enc_params = model.encoder_params()
-    non_enc_params = model.non_encoder_params()
-
-    # Separate codebook from predictor (lower LR for codebook)
-    cb_ids = set()
-    for q in model.quantizers.values():
-        cb_ids.update(id(p) for p in q.parameters())
-    cb_params = [p for p in non_enc_params if id(p) in cb_ids]
-    pred_params = [p for p in non_enc_params if id(p) not in cb_ids]
-
-    opt_main = torch.optim.AdamW(
-        [
-            {"params": pred_params, "lr": base_lr},
-            {"params": cb_params, "lr": base_lr * 0.1},
-        ],
-        betas=(0.9, 0.999), weight_decay=1e-4,
+    return torch.optim.AdamW(
+        model.parameter_groups(base_lr),
+        betas=(0.9, 0.999),
+        weight_decay=1e-4,
     )
-    opt_enc = torch.optim.SGD(
-        enc_params,
-        lr=base_lr * model.cfg.encoder_lr_scale,
-        momentum=0.0,  # No momentum: prevents overshoot past codebook entries
-    )
-    return [opt_main, opt_enc]
 
 
 def save_pred_images(pred_rgb: torch.Tensor, gt_batch: torch.Tensor, step: int, save_dir: Path) -> None:
@@ -258,9 +240,8 @@ def train(args: argparse.Namespace) -> None:
             )
 
     optimizers = build_optimizer(model, args.lr)
-    # Parameter lists for per-group gradient clipping.
-    enc_params = model.encoder_params()
-    non_enc_params = model.non_encoder_params()
+    # All params for grad clipping.
+    all_params = list(model.parameters())
 
     # ---- logging setup ---------------------------------------------------- #
     log_dir = Path(args.log_dir) if args.log_dir else None
@@ -295,16 +276,11 @@ def train(args: argparse.Namespace) -> None:
 
         model.train()
         for step in range(1, args.steps + 1):
-            for o in optimizers:
-                o.zero_grad()
+            optimizers.zero_grad()
             out = model.forward_loss(fixed_batch)
             out.total_loss.backward()
-            # Per-group clipping: prevents predictor's large gradient from
-            # being mixed with encoder's small gradient in a single clip op.
-            nn.utils.clip_grad_norm_(non_enc_params, max_norm=1.0)
-            nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
-            for o in optimizers:
-                o.step()
+            nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            optimizers.step()
 
             if step % args.log_every == 0 or step == 1:
                 m = out.metrics
@@ -367,14 +343,11 @@ def train(args: argparse.Namespace) -> None:
                     print("[VQ-HVEBT] Codebooks initialized from first data batch.")
 
             t0 = time.perf_counter()
-            for o in optimizers:
-                o.zero_grad()
+            optimizers.zero_grad()
             out = model.forward_loss(batch)
             out.total_loss.backward()
-            nn.utils.clip_grad_norm_(non_enc_params, max_norm=1.0)
-            nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
-            for o in optimizers:
-                o.step()
+            nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            optimizers.step()
             dt = time.perf_counter() - t0
 
             if step % args.log_every == 0 or step == 1:
@@ -417,12 +390,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_decoder", action="store_true",
                    help="Attach pixel decoder on the finest stage")
     p.add_argument("--num_codes", type=int, default=512)
-    p.add_argument("--commitment_beta", type=float, default=0.25)
+    p.add_argument("--ema_decay", type=float, default=0.99,
+                   help="EMA decay for codebook updates (0.99-0.999)")
+    p.add_argument("--dead_code_reset", action="store_true", default=True,
+                   help="Reset dead codebook entries with encoder samples (default: enabled)")
+    p.add_argument("--no_dead_code_reset", dest="dead_code_reset", action="store_false",
+                   help="Disable dead code reset")
     p.add_argument("--transformer_dim", type=int, default=256)
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--n_layers", type=int, default=4)
-    p.add_argument("--mcmc_steps", type=int, default=5)
-    p.add_argument("--mcmc_step_size", type=float, default=100.0)
+    p.add_argument("--mcmc_steps", type=int, default=20)
+    p.add_argument("--mcmc_step_size", type=float, default=10.0)
     p.add_argument("--soft_target_tau", type=float, default=0.0,
                    help="Soft target temperature (>0: smooth distance-based targets, 0: hard one-hot)")
     p.add_argument("--batch_size", type=int, default=4)
@@ -430,7 +408,7 @@ def parse_args() -> argparse.Namespace:
                    help="Number of context frames; model predicts T future frames")
     p.add_argument("--image_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--encoder_lr_scale", type=float, default=0.001)
+    p.add_argument("--encoder_lr_scale", type=float, default=0.1)
     p.add_argument("--freeze_encoder", action="store_true",
                    help="Freeze CLIP encoder (useful for debugging predictor in isolation)")
     p.add_argument("--encoder_warmup_steps", type=int, default=0,
