@@ -129,8 +129,12 @@ class VectorQuantizer(nn.Module):
         # Repeat to fill K slots.
         repeats = (self.K + M - 1) // M
         sampled = sampled.repeat(repeats, 1)[:self.K]  # (K, C)
-        # Add small jitter so duplicated rows differ slightly.
-        jitter = torch.randn_like(sampled) * 0.01
+        # Add jitter proportional to feature spread so codes are well-separated.
+        # Too small jitter (0.01) creates near-identical codes with narrow Voronoi
+        # regions that flip assignment with tiny encoder/codebook changes.
+        feat_std = z_e.std().item()
+        jitter_scale = max(0.1 * feat_std, 0.02)
+        jitter = torch.randn_like(sampled) * jitter_scale
         self.codebook.weight.data.copy_(sampled + jitter)
         self._initialized = True
 

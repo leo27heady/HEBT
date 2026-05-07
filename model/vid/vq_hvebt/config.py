@@ -92,10 +92,14 @@ class VQStageConfig:
     init_std: float = 0.02
     temporal_window: Optional[int] = None
     codebook: VQCodebookConfig = field(default_factory=VQCodebookConfig)
-    mcmc_steps: int = 3
-    mcmc_step_size: float = 0.1
+    mcmc_steps: int = 5
+    mcmc_step_size: float = 5.0
     mcmc_step_learnable: bool = True
-    truncate_mcmc: bool = False
+    mcmc_grad_clamp: float = 10.0
+    truncate_mcmc: bool = True
+    soft_target_tau: float = 0.0    # >0: use soft distance-based targets (smooth)
+                                    # 0: use hard one-hot targets (default, works
+                                    # when indices are stable via detach_pred_context)
     pred_loss: str = "mse"              # "mse" | "smooth_l1"
     pred_loss_weight: float = 1.0
     cb_loss_weight: float = 1.0
@@ -137,11 +141,18 @@ class VQHVEBTConfig:
     stages: List[VQStageConfig] = field(default_factory=lambda: _default_stages())
     train_encoder: bool = True
     encoder_lr_scale: float = 0.1
+    codebook_lr_scale: float = 0.1    # codebook LR = base_lr * this. Low value
+                                       # prevents AdamW from overshooting inter-code distances.
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
     use_decoder: bool = False
     decoder_loss_weight: float = 1.0
     decoder_out_size: int = 256
     detach_parent_kv: bool = True
+    contrastive_loss_weight: float = 0.0
+    encoder_warmup_steps: int = 0
+    detach_pred_context: bool = True   # Detach predictor context from encoder graph.
+                                       # Prevents pred_loss from destabilizing encoder.
+                                       # Encoder trains only via commitment_loss (stabilizing).
 
 
 def _default_stages() -> List[VQStageConfig]:

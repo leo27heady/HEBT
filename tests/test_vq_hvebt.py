@@ -444,31 +444,32 @@ class TestVQHVEBTStage:
             stage.forward_energy(real_ctx, pred_embed_wrong)
 
     def test_run_mcmc_output_shapes(self):
-        """run_mcmc must return (logits, embed, trace) with correct shapes."""
+        """run_mcmc must return (all_step_logits, embed_5d, trace) with correct shapes."""
         B, T, C, H, W, K = 2, 3, 16, 4, 4, 8
         stage, q, cfg = _make_stage_and_quantizer(B=B, T=T, C=C, H=H, W=W, K=K)
         real_ctx = torch.randn(B, T, C, H, W)
-        final_logits, final_embed, trace = stage.run_mcmc(
+        all_step_logits, final_embed, trace = stage.run_mcmc(
             real_ctx, init_logits=None, learning=False
         )
-        assert final_logits.shape == (B, T * H * W, K), f"logits shape {final_logits.shape}"
+        assert len(all_step_logits) == cfg.mcmc_steps
+        assert all_step_logits[-1].shape == (B, T * H * W, K), f"logits shape {all_step_logits[-1].shape}"
         assert final_embed.shape == (B, T, C, H, W), f"embed shape {final_embed.shape}"
         assert len(trace) == cfg.mcmc_steps
 
     def test_run_mcmc_with_learning_gradients_to_transformer(self):
-        """With learning=True, pred_loss must produce gradients at transformer params."""
+        """With learning=True, CE loss on logits must produce gradients at transformer params."""
         B, T, C, H, W, K = 2, 3, 16, 4, 4, 8
         stage, q, cfg = _make_stage_and_quantizer(B=B, T=T, C=C, H=H, W=W, K=K)
         real_ctx = torch.randn(B, T, C, H, W)
-        _, final_embed, _ = stage.run_mcmc(real_ctx, learning=True)
+        all_step_logits, final_embed, _ = stage.run_mcmc(real_ctx, learning=True)
 
-        # Create prediction loss and backprop.
-        target = torch.randn_like(final_embed).detach()
+        # CE loss on all steps (NLP EBT multi-step pattern).
         N = T * H * W
-        loss = F.mse_loss(
-            final_embed.permute(0, 1, 3, 4, 2).reshape(B, N, C),
-            target.permute(0, 1, 3, 4, 2).reshape(B, N, C),
-        )
+        target_indices = torch.randint(0, K, (B, N))
+        loss = torch.tensor(0.0)
+        for step_logits in all_step_logits:
+            loss = loss + F.cross_entropy(step_logits.reshape(-1, K), target_indices.reshape(-1))
+        loss = loss / len(all_step_logits)
         loss.backward()
 
         # Check that at least one block has grad.
@@ -485,8 +486,9 @@ class TestVQHVEBTStage:
         B, T, C, H, W = 2, 3, 16, 4, 4
         stage, q, cfg = _make_stage_and_quantizer(B=B, T=T, C=C, H=H, W=W)
         real_ctx = torch.randn(B, T, C, H, W)
-        _, final_embed, _ = stage.run_mcmc(real_ctx, learning=False)
+        all_step_logits, final_embed, _ = stage.run_mcmc(real_ctx, learning=False)
         assert torch.isfinite(final_embed).all()
+        assert torch.isfinite(all_step_logits[-1]).all()
 
     def test_cross_attention_stage_shapes(self):
         """Stage with cross-attention must produce correct shapes with parent context."""
@@ -725,14 +727,15 @@ class TestVQHVEBTModel:
         assert preds["s1"].shape == (2, C, H, W), f"predict_next shape {preds['s1'].shape}"
 
     def test_parameter_groups_have_correct_lr(self):
-        """parameter_groups must return two groups with lr < base_lr for encoder."""
+        """parameter_groups must return three groups: predictor, codebook, encoder."""
         model = _make_model_with_fake_encoder(num_stages=1)
         base_lr = 3e-4
         groups = model.parameter_groups(base_lr)
-        assert len(groups) == 2
+        assert len(groups) == 3
         lrs = sorted([g["lr"] for g in groups])
-        assert lrs[0] < lrs[1], "Encoder group must have lower LR"
-        assert abs(lrs[1] - base_lr) < 1e-10
+        # Encoder LR < codebook LR <= predictor LR
+        assert lrs[0] < lrs[2], "Encoder group must have lower LR than predictor"
+        assert abs(lrs[2] - base_lr) < 1e-10
 
 
 # --------------------------------------------------------------------------- #

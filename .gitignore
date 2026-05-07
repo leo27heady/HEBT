@@ -156,4 +156,6 @@ work.sh
 **/.nfs000*
 inference_results/**
 data/vid/shape_cache/**
+data/vid/clip_features/**
+data/vid/vq/**
 clip/*

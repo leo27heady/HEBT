@@ -10,10 +10,12 @@ Loss taxonomy per stage k
 -------------------------
 
 1. Prediction loss (trains the EBT predictor):
-       L_pred = ||z_pred - sg(z_q_future)||²
-   where z_pred is the MCMC output (decoded from logits via softmax @ E)
-   and z_q_future is the quantized CLIP feature of the true next frame.
-   The target MUST be detached by the caller.
+       L_pred = CE(pred_logits, target_indices)
+   where pred_logits are the final MCMC logits (B, N, K) and target_indices
+   are the code indices of the quantized future frame (B, N).
+   This is the NLP EBT analog: cross-entropy directly on logits gives a
+   clean gradient signal with no softmax dilution.
+   (Legacy MSE variant on decoded embeddings also available.)
 
 2. Codebook loss (trains the codebook):
        L_cb = ||sg(z_e) - z_q||²
@@ -73,6 +75,81 @@ def prediction_loss(
         return F.smooth_l1_loss(z_pred, z_q_future_detached)
     else:
         raise ValueError(f"Unknown prediction loss kind: {kind!r}. Use 'mse' or 'smooth_l1'.")
+
+
+def ce_prediction_loss(
+    pred_logits: torch.Tensor,
+    target_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Cross-entropy loss on MCMC logits vs target code indices.
+
+    This is the NLP EBT analog: the training loss operates DIRECTLY on the
+    logits (the MCMC optimization variable), giving a clean gradient signal
+    with no softmax dilution.
+
+    Args:
+        pred_logits: (B, N, K) raw logits over K codebook entries — live graph
+            from MCMC's final step.
+        target_indices: (B, N) long tensor of ground-truth code indices from
+            the quantizer (e.g. qout.indices[:, 1:].reshape(B, N)).
+
+    Returns:
+        Scalar loss (mean over all tokens in the batch).
+    """
+    B, N, K = pred_logits.shape
+    # F.cross_entropy expects (*, C) logits and (*,) targets.
+    return F.cross_entropy(
+        pred_logits.reshape(-1, K),
+        target_indices.reshape(-1),
+    )
+
+
+def soft_ce_prediction_loss(
+    pred_logits: torch.Tensor,
+    z_e_future: torch.Tensor,
+    codebook_weight: torch.Tensor,
+    tau: float = 1.0,
+) -> torch.Tensor:
+    """Soft cross-entropy loss using distance-based target distribution.
+
+    Instead of hard one-hot targets (which flip discontinuously when VQ
+    assignments change), this uses a smooth softmax distribution over
+    codes based on L2 distance.  Small encoder/codebook changes produce
+    small target changes — eliminating the "moving target" discontinuity.
+
+    Args:
+        pred_logits: (B, N, K) raw logits from MCMC final step.
+        z_e_future: (B, N, C) encoder features of future frames (DETACHED).
+        codebook_weight: (K, C) codebook entries (DETACHED).
+        tau: temperature for soft targets.  Larger = softer. Typically 0.1–1.0.
+            Scaled internally by mean nearest-code distance for robustness.
+
+    Returns:
+        Scalar loss (mean over all tokens in the batch).
+    """
+    B, N, C = z_e_future.shape
+    K = codebook_weight.shape[0]
+
+    # Squared L2 distances: ||z_e - E_j||² for all j
+    # z_e: (B*N, C), E: (K, C) → dist: (B*N, K)
+    z_flat = z_e_future.reshape(B * N, C)
+    z_sq = (z_flat ** 2).sum(dim=1, keepdim=True)        # (B*N, 1)
+    e_sq = (codebook_weight ** 2).sum(dim=1, keepdim=True).T  # (1, K)
+    dot = z_flat @ codebook_weight.T                     # (B*N, K)
+    dist_sq = z_sq + e_sq - 2 * dot                      # (B*N, K)
+
+    # Adaptive temperature: scale tau by mean nearest-code distance.
+    # This makes the hyperparameter tau independent of feature magnitude.
+    min_dist = dist_sq.min(dim=-1)[0]                    # (B*N,)
+    adaptive_tau = tau * (min_dist.mean().clamp(min=1e-6))
+
+    # Soft target distribution (detached — no encoder gradient through targets).
+    soft_targets = F.softmax(-dist_sq / adaptive_tau, dim=-1)  # (B*N, K)
+
+    # Soft cross-entropy: -sum(target * log_softmax(pred))
+    log_probs = F.log_softmax(pred_logits.reshape(B * N, K), dim=-1)
+    loss = -(soft_targets * log_probs).sum(dim=-1).mean()
+    return loss
 
 
 def codebook_loss(

@@ -18,8 +18,8 @@ Both grids are flattened to tokens of shape (B, T*H*W, C), concatenated
 channel-wise to (B, T*H*W, 2C), then projected to transformer dim D.  The
 transformer computes a per-token scalar energy; summing gives total energy.
 
-MCMC (logit-space gradient descent)
--------------------------------------
+MCMC (logit-space gradient descent, NLP EBT style)
+----------------------------------------------------
 
 The optimization variable is ``pred_logits ∈ R^{B, T*H*W, K}`` — raw logits
 over the K codebook entries at each spatiotemporal token.
@@ -31,12 +31,18 @@ At each MCMC step:
     4. Gradient: g = ∂energy/∂pred_logits  (via autograd through softmax+matmul).
     5. Update:   pred_logits = pred_logits - α * g
 
-This is gradient descent in logit space. The step size α is small (≈ 0.1)
-because logit gradients are much larger than feature-space gradients.
+The training loss is **cross-entropy** directly on the final pred_logits
+against target code indices (not MSE on embeddings). This gives the same
+direct gradient from loss → logits as NLP EBT, avoiding the softmax dilution
+problem that plagues MSE-on-embedding loss.
 
-The computation graph is preserved (create_graph=True) during training so
-that the loss (applied to the final pred_embed) back-propagates into the
-stage's transformer parameters.
+Shannon entropy of the predicted distribution is naturally available via
+softmax(pred_logits).
+
+The computation graph through MCMC is controlled by `truncate_mcmc`:
+  - False (default): all steps keep create_graph=True, full gradient chain.
+  - True: only the last step keeps the graph (saves memory).
+Following NLP EBT, logits are DETACHED between steps by default.
 
 Cross-attention from parent stage (hierarchical conditioning)
 -------------------------------------------------------------
@@ -189,9 +195,10 @@ class VQHVEBTStage(nn.Module):
                 nn.init.normal_(m.weight, std=self.cfg.init_std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Small but nonzero energy head — zero init would give zero gradient
-        # at step 0 so MCMC would never move and training would stall.
-        nn.init.normal_(self.energy_head.weight, std=self.cfg.init_std * 0.1)
+        # Energy head: use same init_std as the rest of the network.
+        # With per-token gradient normalization in MCMC, the absolute scale of
+        # the energy function does not affect step size, so no need to reduce init.
+        nn.init.normal_(self.energy_head.weight, std=self.cfg.init_std)
         nn.init.zeros_(self.energy_head.bias)
 
     # ------------------------------------------------------------------ #
@@ -304,7 +311,7 @@ class VQHVEBTStage(nn.Module):
         return energy
 
     # ------------------------------------------------------------------ #
-    #  MCMC inference in logit space
+    #  MCMC inference in logit space (NLP EBT style)
     # ------------------------------------------------------------------ #
 
     def run_mcmc(
@@ -313,30 +320,34 @@ class VQHVEBTStage(nn.Module):
         init_logits: Optional[torch.Tensor] = None,      # (B, T*H*W, K) or None
         parent_context: Optional[torch.Tensor] = None,
         learning: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, List[float]]:
         """Run MCMC to find low-energy logits in code distribution space.
 
-        The optimization variable is ``pred_logits ∈ R^{B, T*H*W, K}``.
-        At each step:
-            z_pred = softmax(pred_logits) @ codebook.weight   [decode]
-            z_pred_3d = reshape to (B, T, C, H, W)
-            energy = forward_energy(real_ctx, z_pred_3d)      [score]
-            grad = ∂energy / ∂pred_logits                     [diff]
-            pred_logits ← pred_logits − α * grad              [update]
+        Following NLP EBT, the optimization variable is logits over the K
+        codebook entries. Logits are detached between steps (default behavior
+        matching NLP EBT). The energy function sees softmax(logits) @ E as
+        the predicted embedding.
+
+        **Multi-step supervision** (key NLP EBT pattern): returns logits at
+        EVERY MCMC step. The caller should compute CE loss at each step and
+        average — this gives N× stronger gradient signal to the energy function
+        compared to only supervising the final step.
 
         Args:
             real_ctx      : (B, T, C, H, W) quantized context (z_q_st).
             init_logits   : initial logits; if None, zeros are used (uniform
                             over codes = average codebook vector as starting embed).
             parent_context: (B, T, Cp, Hp, Wp) from coarser stage (detached).
-            learning      : if True, the computation graph is kept through MCMC
-                            steps so that loss backprop can train the transformer.
-                            If False (inference), no graph is created → faster.
+            learning      : if True, create_graph=True so that the energy
+                            gradient computation is differentiable (allows
+                            loss.backward() to train the transformer).
 
         Returns:
-            final_logits  : (B, T*H*W, K)  — final logit state.
-            final_embed   : (B, T, C, H, W) — decoded embedding from final logits.
-            energy_trace  : list of per-step summed energies (for diagnostics).
+            all_step_logits : List of (B, T*H*W, K) logits after each MCMC step.
+                              Each has a live graph (when learning=True) so CE
+                              loss at every step backprops into the energy function.
+            final_embed     : (B, T, C, H, W) — decoded embedding from final logits.
+            energy_trace    : list of per-step summed energies (for diagnostics).
         """
         B, T, C, H, W = real_ctx.shape
         N = T * H * W
@@ -357,15 +368,19 @@ class VQHVEBTStage(nn.Module):
         alpha = torch.clamp(self.alpha, min=1e-6)
 
         num_steps = self.cfg.mcmc_steps
-        energy_trace: List[torch.Tensor] = []
+        energy_trace: List[float] = []
+        all_step_logits: List[torch.Tensor] = []
 
         for step in range(num_steps):
-            # Detach so autograd sees pred_logits as a leaf at this step.
+            # Following NLP EBT: create_graph at all steps (truncate_mcmc=False)
+            # or only last step (truncate_mcmc=True).
+            create_graph = learning and (
+                not self.cfg.truncate_mcmc or step == num_steps - 1
+            )
+
+            # Detach logits between steps (like NLP EBT's default behavior).
             pred_logits = pred_logits.detach().requires_grad_(True)
 
-            # torch.enable_grad() ensures autograd is active for the MCMC step even
-            # when run_mcmc is called inside a torch.no_grad() context (e.g. predict_next).
-            # Without this, energy.grad_fn would be None and autograd.grad would raise.
             with torch.enable_grad():
                 # Decode logits → embedding → reshape to (B, T, C, H, W).
                 z_pred_flat = self.quantizer.decode_logits(pred_logits)  # (B, N, C)
@@ -375,36 +390,24 @@ class VQHVEBTStage(nn.Module):
                 energy = self.forward_energy(real_ctx, z_pred, parent_context)  # (B, N)
                 energy_trace.append(energy.detach().sum().item())
 
-                # create_graph=True lets grad-of-grad flow through MCMC into transformer
-                # weights during the backward pass for the training loss.
-                # With truncate_mcmc=True, only the LAST step gets create_graph=True
-                # (saves memory at the cost of a coarser approximation).
-                create_graph = learning and (
-                    not self.cfg.truncate_mcmc or step == num_steps - 1
-                )
                 grad = torch.autograd.grad(
                     [energy.sum()], [pred_logits],
                     create_graph=create_graph,
                     retain_graph=create_graph,
                 )[0]
 
+            # Clamp MCMC gradient to prevent instability (NLP EBT pattern).
+            if self.cfg.mcmc_grad_clamp > 0:
+                grad = torch.clamp(grad, min=-self.cfg.mcmc_grad_clamp, max=self.cfg.mcmc_grad_clamp)
+
             # Gradient descent step in logit space.
-            # When create_graph=True at this step, pred_logits_new = pred_logits - alpha * grad
-            # where grad depends on the transformer parameters via the energy function.
-            # So pred_logits (after this line) carries a gradient path to transformer params.
             pred_logits = pred_logits - alpha * grad
 
+            # Store logits AFTER update (matches NLP EBT: loss on post-step logits).
+            all_step_logits.append(pred_logits)
+
         # Decode final logits → final embedding.
-        #
-        # IMPORTANT: do NOT detach pred_logits here.
-        # After the last MCMC step with create_graph=True, `pred_logits` is a non-leaf
-        # tensor connected to the transformer params via:
-        #   pred_logits_k = pred_logits_{k-1} - α * ∂energy/∂pred_logits_{k-1}
-        # where energy was computed through forward_energy (the transformer).
-        # Detaching here would break this chain and prevent pred_loss from training
-        # the predictor transformer.
         z_pred_flat = self.quantizer.decode_logits(pred_logits)   # (B, N, C)
         z_pred_final = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
-        # Return logits detached for logging purposes, but keep z_pred_final live.
-        return pred_logits.detach(), z_pred_final, energy_trace
+        return all_step_logits, z_pred_final, energy_trace

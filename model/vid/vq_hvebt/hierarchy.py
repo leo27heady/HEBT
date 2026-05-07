@@ -19,12 +19,12 @@ Given a video clip of shape (B, T+1, 3, H, W):
      and collect per-stage VQ losses (cb_loss^k, commit_loss^k).
   3. Build EBT training pairs (shifted by 1):
          real_ctx^k   = z_q_st^k[:, :-1]   (frames 0..T-1, with grad)
-         target^k     = z_q^k[:, 1:]       (frames 1..T,   DETACHED)
+         target^k     = indices^k[:, 1:]    (frames 1..T,   code indices)
   4. Predict from coarsest stage to finest (top-down):
      For each stage k (ordered coarse→fine):
-       a. Run MCMC from random/zero init in logit space.
-       b. Get final predicted embedding z_pred^k.
-       c. Compute prediction loss: mse(z_pred^k, target^k).
+       a. Run MCMC from zero init in logit space (NLP EBT style).
+       b. Get final predicted logits (B, N, K) and decoded embedding z_pred^k.
+       c. Compute prediction loss: CE(pred_logits, target_indices).
        d. Pass (detached) z_pred^k as parent_context to the next finer stage.
   5. Optional: decode finest-stage prediction to RGB and compute pixel loss.
   6. Return total loss and a metric dict.
@@ -60,8 +60,10 @@ from model.vid.vq_hvebt.clip_backbone import VQClipBackbone
 from model.vid.vq_hvebt.config import VQHVEBTConfig, VQStageConfig
 from model.vid.vq_hvebt.losses import (
     aggregate_stage_losses,
+    ce_prediction_loss,
     decoder_loss_l1,
     prediction_loss,
+    soft_ce_prediction_loss,
 )
 from model.vid.vq_hvebt.quantizer import VectorQuantizer, QuantizerOutput
 from model.vid.vq_hvebt.stage_predictor import VQHVEBTStage
@@ -114,6 +116,7 @@ class VQHVEBTModel(nn.Module):
     def __init__(self, cfg: VQHVEBTConfig):
         super().__init__()
         self.cfg = cfg
+        self._step_counter = 0  # tracks training steps for encoder warmup
 
         # ---- CLIP encoder ---------------------------------------------------
         stage_names = [s.clip_stage_name for s in cfg.stages]
@@ -132,7 +135,10 @@ class VQHVEBTModel(nn.Module):
 
         for idx, stage_cfg in enumerate(cfg.stages):
             name = stage_cfg.clip_stage_name
-            self.quantizers[name] = VectorQuantizer(stage_cfg.codebook)
+            self.quantizers[name] = VectorQuantizer(
+                stage_cfg.codebook,
+                detach_codebook_in_decode=cfg.detach_pred_context,
+            )
 
             # Parent config: the previous entry in stages list (one coarser).
             parent_cfg: Optional[VQStageConfig] = cfg.stages[idx - 1] if idx > 0 else None
@@ -205,8 +211,15 @@ class VQHVEBTModel(nn.Module):
     def _encode_and_quantize(
         self,
         video: torch.Tensor,   # (B, T+1, 3, H, W)
+        detach_encoder: bool = False,
     ) -> Dict[str, Tuple[torch.Tensor, QuantizerOutput]]:
         """Run encoder and quantizer for all stages.
+
+        Args:
+            video: input video batch.
+            detach_encoder: if True, detach encoder outputs before quantization.
+                This freezes the encoder gradient (used during warmup to
+                stabilize target codes before letting the encoder train).
 
         Returns:
             dict mapping stage_name → (z_e_5d, quant_output) where:
@@ -221,6 +234,12 @@ class VQHVEBTModel(nn.Module):
         for stage_cfg in self.cfg.stages:
             name = stage_cfg.clip_stage_name
             z_e_5d = feats[name]                   # (B, T+1, C, Hs, Ws)
+
+            # During warmup, detach encoder output to prevent encoder gradient.
+            # This keeps target codes stable so predictor+codebook can train.
+            if detach_encoder:
+                z_e_5d = z_e_5d.detach()
+
             Bs, T1s, C, Hs, Ws = z_e_5d.shape
             N = T1s * Hs * Ws
 
@@ -268,8 +287,16 @@ class VQHVEBTModel(nn.Module):
         if T < 1:
             raise ValueError(f"Video must have at least 2 frames, got {T1}")
 
+        # Track training steps for encoder warmup.
+        if self.training:
+            self._step_counter += 1
+        in_warmup = (
+            self.cfg.encoder_warmup_steps > 0
+            and self._step_counter <= self.cfg.encoder_warmup_steps
+        )
+
         # ---- 1. Encode + quantize all stages --------------------------------
-        enc_quant = self._encode_and_quantize(video)
+        enc_quant = self._encode_and_quantize(video, detach_encoder=in_warmup)
         # enc_quant: {name: (z_e_5d, qout_5d)}
 
         # ---- 2. Collect per-stage results (top-down: coarse → fine) ---------
@@ -292,33 +319,104 @@ class VQHVEBTModel(nn.Module):
             # Slice: frames 0..T-1.
             real_ctx = qout.z_q_st[:, :T]        # (B, T, C, H, W)
 
-            # Target: quantized future frames 1..T, DETACHED and CLONED.
-            # - detach: stop encoder from moving the target to reduce loss.
-            # - clone: ensure in-place ops on z_q don't corrupt target.
-            target = qout.z_q[:, 1:].detach().clone()   # (B, T, C, H, W)
+            # Detach context from encoder to prevent pred_loss from destabilizing
+            # encoder training. When detached, encoder trains ONLY via commitment
+            # loss (which stabilizes VQ assignments by pushing z_e toward codes).
+            # The pred_loss gradient can still reach the codebook (through
+            # softmax @ E in the decode step) and the predictor.
+            if self.cfg.detach_pred_context:
+                real_ctx = real_ctx.detach()
+
+            # Target code indices: future frames 1..T.
+            # These are the ground-truth codes the predictor should output.
+            target_indices = qout.indices[:, 1:]  # (B, T, H*W) long
 
             # Parent context for cross-attention (already detached below).
             par_ctx = None
             if parent_pred is not None:
                 par_ctx = parent_pred   # already detached (see below)
 
-            # MCMC prediction.
+            # MCMC prediction in logit space (NLP EBT style).
             predictor: VQHVEBTStage = self.predictors[name]
-            _, pred_embed, energy_trace = predictor.run_mcmc(
+            all_step_logits, pred_embed, energy_trace = predictor.run_mcmc(
                 real_ctx=real_ctx,
                 init_logits=None,
                 parent_context=par_ctx,
                 learning=self.training,
             )
-            # pred_embed: (B, T, C, H, W)
+            # all_step_logits: list of (B, T*H*W, K) — logits after each MCMC step
+            # pred_embed:      (B, T, C, H, W) — decoded embedding from final logits
 
-            # Prediction loss.
-            # Flatten pred and target to (B, N, C) for loss calculation.
+            # Prediction loss: CE on logits (NLP EBT pattern).
+            # - truncate_mcmc=True (default): CE only on FINAL step logits.
+            #   This is the practical NLP EBT setting — the final logits after
+            #   full MCMC have moved far from uniform and represent a meaningful
+            #   prediction. Earlier steps are noise that dilutes the signal.
+            # - truncate_mcmc=False: CE on ALL steps (averaged).
+            #   More gradient signal but noisier; requires smaller step_size.
             Bs, Tc, C, Hs, Ws = pred_embed.shape
             N = Tc * Hs * Ws
-            pred_flat = pred_embed.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
-            tgt_flat = target.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
-            l_pred = prediction_loss(pred_flat, tgt_flat, kind=stage_cfg.pred_loss)
+            K = stage_cfg.codebook.num_codes
+            tgt_idx_flat = target_indices.reshape(Bs, N)   # (B, T*H*W)
+
+            # Soft vs hard targets:
+            # soft_target_tau > 0: use smooth distance-based distribution
+            #   (eliminates moving-target discontinuity when encoder is trainable)
+            # soft_target_tau == 0: hard one-hot CE (original, only stable
+            #   with frozen encoder)
+            use_soft = stage_cfg.soft_target_tau > 0
+
+            if use_soft:
+                # z_e of future frames for distance computation.
+                z_e_future = z_e_5d[:, 1:]  # (B, T, C, H, W)
+                z_e_future_flat = z_e_future.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
+                cb_weight = self.quantizers[name].codebook.weight  # (K, C)
+
+                # Detach both z_e and codebook — targets should not backprop
+                # to encoder or codebook (those train via commit/cb loss).
+                z_e_det = z_e_future_flat.detach()
+                cb_det = cb_weight.detach()
+
+            if stage_cfg.truncate_mcmc:
+                # Only final step (NLP EBT truncate_mcmc=True default).
+                if use_soft:
+                    l_pred = soft_ce_prediction_loss(
+                        all_step_logits[-1], z_e_det, cb_det,
+                        tau=stage_cfg.soft_target_tau,
+                    )
+                else:
+                    l_pred = ce_prediction_loss(all_step_logits[-1], tgt_idx_flat)
+            else:
+                # All steps averaged (NLP EBT truncate_mcmc=False).
+                l_pred = torch.tensor(0.0, device=pred_embed.device)
+                for step_logits in all_step_logits:
+                    if use_soft:
+                        l_pred = l_pred + soft_ce_prediction_loss(
+                            step_logits, z_e_det, cb_det,
+                            tau=stage_cfg.soft_target_tau,
+                        )
+                    else:
+                        l_pred = l_pred + ce_prediction_loss(step_logits, tgt_idx_flat)
+                l_pred = l_pred / len(all_step_logits)
+
+            # Contrastive energy loss: energy(true) should be < energy(predicted).
+            # This gives a DIRECT first-order signal to the energy function,
+            # telling it what low-energy states look like (without going through
+            # the second-order MCMC Hessian). Matches NLP EBT's contrastive_loss.
+            if self.cfg.contrastive_loss_weight > 0 and self.training:
+                # True embedding: the actual future quantized features.
+                true_embed = qout.z_q[:, 1:].detach()  # (B, T, C, H, W)
+                true_energy = predictor.forward_energy(real_ctx, true_embed, par_ctx)  # (B, N)
+                # Predicted embedding energy (from final MCMC state, detached).
+                pred_energy = predictor.forward_energy(
+                    real_ctx, pred_embed.detach(), par_ctx
+                )  # (B, N)
+                # Stack: column 0 = true energy, column 1 = predicted energy.
+                # Target: 0 (true should have lower energy → be selected by argmin).
+                energy_stack = torch.stack([true_energy.sum(-1), pred_energy.sum(-1)], dim=-1)  # (B, 2)
+                energy_targets = torch.zeros(Bs, dtype=torch.long, device=pred_embed.device)
+                contrastive_l = F.cross_entropy(-energy_stack, energy_targets)
+                l_pred = l_pred + self.cfg.contrastive_loss_weight * contrastive_l
 
             # Prepare detached parent embedding for next finer stage.
             if self.cfg.detach_parent_kv:
@@ -439,6 +537,7 @@ class VQHVEBTModel(nn.Module):
                 parent_context=parent_pred,
                 learning=False,
             )
+            # pred_embed is the final decoded embedding (5D).
             # Return only the last predicted frame.
             results[name] = pred_embed[:, -1]   # (B, C, Hs, Ws)
             parent_pred = pred_embed.detach()
@@ -452,21 +551,48 @@ class VQHVEBTModel(nn.Module):
     def parameter_groups(self, base_lr: float):
         """Build optimizer parameter groups with encoder at reduced LR.
 
+        Three groups:
+          1. Predictor params (full LR): transformers, energy heads, step_size.
+          2. Codebook params (reduced LR): codebook embeddings — need low LR
+             because AdamW's scale-invariance moves entries by O(LR) per step
+             regardless of gradient magnitude, which can exceed inter-code
+             distance and destabilize VQ assignments.
+          3. Encoder params (tiny LR): pretrained CLIP — change slowly.
+
         Args:
-            base_lr: learning rate for quantizers and predictors.
+            base_lr: learning rate for predictors.
 
         Returns:
             List of dicts suitable for torch.optim.AdamW or similar.
         """
         enc_params = list(self.encoder.parameters())
         enc_ids = {id(p) for p in enc_params}
-        other_params = [p for p in self.parameters() if id(p) not in enc_ids]
+
+        cb_params = []
+        for q in self.quantizers.values():
+            cb_params.extend(list(q.parameters()))
+        cb_ids = {id(p) for p in cb_params}
+
+        pred_params = [
+            p for p in self.parameters()
+            if id(p) not in enc_ids and id(p) not in cb_ids
+        ]
 
         groups = [
-            {"params": other_params, "lr": base_lr},
+            {"params": pred_params, "lr": base_lr},
+            {"params": cb_params, "lr": base_lr * self.cfg.codebook_lr_scale},
             {"params": enc_params, "lr": base_lr * self.cfg.encoder_lr_scale},
         ]
         return groups
+
+    def encoder_params(self):
+        """Return encoder parameters (for separate SGD optimizer)."""
+        return list(self.encoder.parameters())
+
+    def non_encoder_params(self):
+        """Return all parameters except encoder (for AdamW optimizer)."""
+        enc_ids = {id(p) for p in self.encoder.parameters()}
+        return [p for p in self.parameters() if id(p) not in enc_ids]
 
     # ------------------------------------------------------------------ #
     #  Metrics
