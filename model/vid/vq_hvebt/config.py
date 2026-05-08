@@ -100,10 +100,21 @@ class VQStageConfig:
     mcmc_step_size: float = 10.0
     mcmc_step_learnable: bool = True
     mcmc_grad_clamp: float = 10.0
+    mcmc_per_token_norm: bool = True    # F4: normalize MCMC gradient per token
+                                        # to unit norm. Makes step size invariant
+                                        # to energy function's absolute scale.
     truncate_mcmc: bool = True
     soft_target_tau: float = 0.0    # >0: use soft distance-based targets (smooth)
                                     # 0: use hard one-hot targets (default, works
                                     # when indices are stable via detach_pred_context)
+    pred_head: bool = True          # F2/F3: learned prediction head that produces
+                                    # initial logits for MCMC warm-start.
+                                    # Eliminates the zero-init → uniform problem.
+    energy_bound: float = 10.0      # F1: bound energy output via tanh scaling.
+                                    # energy_head output is scaled to [-bound, +bound].
+                                    # 0 = unbounded (legacy). Prevents MCMC blow-up.
+    energy_reg_weight: float = 0.01 # F1: regularizer λ * energy².mean() to keep
+                                    # energy magnitudes small. 0 = disabled.
     pred_loss: str = "mse"              # "mse" | "smooth_l1"
     pred_loss_weight: float = 1.0
     cb_loss_weight: float = 0.0     # unused (EMA codebook, no gradient loss)
@@ -149,8 +160,11 @@ class VQHVEBTConfig:
     """
     stages: List[VQStageConfig] = field(default_factory=lambda: _default_stages())
     train_encoder: bool = True
-    encoder_lr_scale: float = 0.1
+    encoder_lr_scale: float = 1.0       # encoder LR relative to predictor
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
+    use_custom_encoder: bool = True     # Option B: use small ConvEncoder instead of CLIP
+    encoder_base_channels: int = 64     # stem width for ConvEncoder (64 → ~2M params)
+    ema_target_decay: float = 0.999     # EMA decay for target encoder (BYOL/DINO style)
     use_decoder: bool = False
     decoder_loss_weight: float = 1.0
     decoder_out_size: int = 256

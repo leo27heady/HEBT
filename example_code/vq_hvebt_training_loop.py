@@ -156,7 +156,11 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
             n_layers=args.n_layers,
             mcmc_steps=args.mcmc_steps,
             mcmc_step_size=args.mcmc_step_size,
+            mcmc_per_token_norm=args.mcmc_per_token_norm,
             soft_target_tau=args.soft_target_tau,
+            pred_head=args.pred_head,
+            energy_bound=args.energy_bound,
+            energy_reg_weight=args.energy_reg_weight,
             codebook=VQCodebookConfig(
                 num_codes=args.num_codes,
                 code_dim=C,
@@ -174,6 +178,9 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         train_encoder=not args.freeze_encoder,
         encoder_lr_scale=args.encoder_lr_scale,
         weights_path=args.weights_path,
+        use_custom_encoder=args.use_custom_encoder,
+        encoder_base_channels=args.encoder_base_channels,
+        ema_target_decay=args.ema_target_decay,
         use_decoder=args.use_decoder,
         contrastive_loss_weight=args.contrastive_loss_weight,
         encoder_warmup_steps=args.encoder_warmup_steps,
@@ -285,6 +292,7 @@ def train(args: argparse.Namespace) -> None:
             nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
             nn.utils.clip_grad_norm_(pred_params, max_norm=1.0)
             optimizers.step()
+            model.update_ema_encoder()  # EMA target encoder tracks live encoder
 
             if step % args.log_every == 0 or step == 1:
                 m = out.metrics
@@ -353,6 +361,7 @@ def train(args: argparse.Namespace) -> None:
             nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
             nn.utils.clip_grad_norm_(pred_params, max_norm=1.0)
             optimizers.step()
+            model.update_ema_encoder()  # EMA target encoder tracks live encoder
             dt = time.perf_counter() - t0
 
             if step % args.log_every == 0 or step == 1:
@@ -394,6 +403,16 @@ def parse_args() -> argparse.Namespace:
                    help="Stages to train (coarsest first), e.g. --stages s3 s2 s1")
     p.add_argument("--use_decoder", action="store_true",
                    help="Attach pixel decoder on the finest stage")
+    # ---- Encoder architecture ----
+    p.add_argument("--use_custom_encoder", action="store_true", default=True,
+                   help="Use custom ConvEncoder instead of CLIP (Option B, default: enabled)")
+    p.add_argument("--use_clip_encoder", dest="use_custom_encoder", action="store_false",
+                   help="Use pretrained CLIP backbone instead of custom ConvEncoder")
+    p.add_argument("--encoder_base_channels", type=int, default=64,
+                   help="Stem width for custom ConvEncoder (64 → ~2M params)")
+    p.add_argument("--ema_target_decay", type=float, default=0.999,
+                   help="EMA decay for target encoder (BYOL/DINO style, 0.999 → 1000-step half-life)")
+    # ---- VQ codebook ----
     p.add_argument("--num_codes", type=int, default=512)
     p.add_argument("--ema_decay", type=float, default=0.99,
                    help="EMA decay for codebook updates (0.99-0.999)")
@@ -401,21 +420,38 @@ def parse_args() -> argparse.Namespace:
                    help="Reset dead codebook entries with encoder samples (default: enabled)")
     p.add_argument("--no_dead_code_reset", dest="dead_code_reset", action="store_false",
                    help="Disable dead code reset")
+    # ---- Transformer / predictor ----
     p.add_argument("--transformer_dim", type=int, default=256)
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--n_layers", type=int, default=4)
+    # ---- MCMC ----
     p.add_argument("--mcmc_steps", type=int, default=20)
-    p.add_argument("--mcmc_step_size", type=float, default=10.0)
+    p.add_argument("--mcmc_step_size", type=float, default=1.0,
+                   help="MCMC step size α (per-token after normalization)")
+    p.add_argument("--mcmc_per_token_norm", action="store_true", default=True,
+                   help="F4: Per-token gradient normalization in MCMC (default: enabled)")
+    p.add_argument("--no_mcmc_per_token_norm", dest="mcmc_per_token_norm", action="store_false")
     p.add_argument("--soft_target_tau", type=float, default=0.0,
                    help="Soft target temperature (>0: smooth distance-based targets, 0: hard one-hot)")
+    # ---- Prediction head (F2/F3) ----
+    p.add_argument("--pred_head", action="store_true", default=True,
+                   help="F2/F3: Learned prediction head for MCMC warm-start (default: enabled)")
+    p.add_argument("--no_pred_head", dest="pred_head", action="store_false")
+    # ---- Energy bounding (F1) ----
+    p.add_argument("--energy_bound", type=float, default=10.0,
+                   help="F1: Bound energy via tanh to [-bound, +bound]. 0=unbounded.")
+    p.add_argument("--energy_reg_weight", type=float, default=0.01,
+                   help="F1: Energy regularization weight (λ * energy².mean()). 0=disabled.")
+    # ---- Training ----
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--T", type=int, default=4,
                    help="Number of context frames; model predicts T future frames")
     p.add_argument("--image_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--encoder_lr_scale", type=float, default=0.1)
+    p.add_argument("--encoder_lr_scale", type=float, default=1.0,
+                   help="Encoder LR = lr * scale (1.0 for custom encoder, 0.01 for CLIP)")
     p.add_argument("--freeze_encoder", action="store_true",
-                   help="Freeze CLIP encoder (useful for debugging predictor in isolation)")
+                   help="Freeze encoder (useful for debugging predictor in isolation)")
     p.add_argument("--encoder_warmup_steps", type=int, default=0,
                    help="Freeze encoder gradient for first N steps (stabilizes target codes)")
     p.add_argument("--contrastive_loss_weight", type=float, default=0.0,

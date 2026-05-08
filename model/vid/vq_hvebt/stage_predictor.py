@@ -171,6 +171,22 @@ class VQHVEBTStage(nn.Module):
         self.norm_out = nn.LayerNorm(D)
         self.energy_head = nn.Linear(D, 1, bias=True)
 
+        # F1: Energy bounding — prevent unbounded energy (range [-234, +1037])
+        # from causing MCMC blow-up. When > 0, output = bound * tanh(raw/bound).
+        self.energy_bound = cfg.energy_bound
+
+        # F2/F3: Learned prediction head for MCMC warm-start.
+        # Produces initial logits from context features so MCMC doesn't start
+        # from all-zeros (which gives uniform softmax → flat energy landscape).
+        K = cfg.codebook.num_codes
+        self.pred_head: Optional[nn.Module] = None
+        if cfg.pred_head:
+            self.pred_head = nn.Sequential(
+                nn.Linear(D, D, bias=True),
+                nn.GELU(),
+                nn.Linear(D, K, bias=True),
+            )
+
         # Learnable MCMC step size per stage.
         self.alpha = nn.Parameter(
             torch.tensor(float(cfg.mcmc_step_size)),
@@ -195,11 +211,16 @@ class VQHVEBTStage(nn.Module):
                 nn.init.normal_(m.weight, std=self.cfg.init_std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Energy head: use same init_std as the rest of the network.
-        # With per-token gradient normalization in MCMC, the absolute scale of
-        # the energy function does not affect step size, so no need to reduce init.
-        nn.init.normal_(self.energy_head.weight, std=self.cfg.init_std)
+        # Energy head: small init so initial energy is near zero.
+        nn.init.normal_(self.energy_head.weight, std=self.cfg.init_std * 0.1)
         nn.init.zeros_(self.energy_head.bias)
+        # Prediction head: small init so initial logits are near zero (near-uniform).
+        if self.pred_head is not None:
+            for m in self.pred_head:
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=self.cfg.init_std)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------ #
     #  Cache helpers
@@ -308,11 +329,65 @@ class VQHVEBTStage(nn.Module):
 
         x = self.norm_out(x)                  # (B, N, D)
         energy = self.energy_head(x).squeeze(-1)  # (B, N)
+
+        # F1: Bound energy to [-bound, +bound] via tanh scaling.
+        # This prevents unbounded energy (range [-234, +1037]) from causing
+        # astronomical MCMC gradients and fp16 overflow.
+        if self.energy_bound > 0:
+            energy = self.energy_bound * torch.tanh(energy / self.energy_bound)
+
         return energy
 
     # ------------------------------------------------------------------ #
     #  MCMC inference in logit space (NLP EBT style)
     # ------------------------------------------------------------------ #
+
+    def _compute_init_logits(
+        self,
+        real_ctx: torch.Tensor,
+        parent_context: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute warm-start logits from the learned prediction head.
+
+        Uses the same transformer trunk as forward_energy but feeds it
+        (real_ctx, zero_embed) and applies the prediction head on the
+        intermediate representation to produce (B, N, K) logits.
+
+        This gives MCMC a meaningful starting point instead of all-zeros
+        (which produce uniform softmax → flat energy landscape).
+        """
+        B, T, C, H, W = real_ctx.shape
+        N = T * H * W
+        cfg = self.cfg
+        D = cfg.transformer_dim
+
+        # Use zero embedding as the "query" (we don't have a prediction yet).
+        zero_embed = torch.zeros_like(real_ctx)
+        r = real_ctx.permute(0, 1, 3, 4, 2).reshape(B, N, C)
+        p = zero_embed.permute(0, 1, 3, 4, 2).reshape(B, N, C)
+        tokens = torch.cat([r, p], dim=-1)
+        x = self.input_proj(tokens)
+
+        rope = self._get_rope(T, x.device, x.dtype)
+        mask = self._get_mask(T, x.device)
+
+        ctx_proj = None
+        rope_ctx = None
+        cross_mask = None
+        if self.use_cross_attn and parent_context is not None:
+            Bp, Tp, Cp, Hp, Wp = parent_context.shape
+            ctx = parent_context.permute(0, 1, 3, 4, 2).reshape(B, T * Hp * Wp, Cp)
+            ctx = self.parent_proj(ctx)
+            ctx_proj = self.parent_norm(ctx)
+            rope_ctx = self._get_parent_rope(T, x.device, x.dtype)
+            cross_mask = self._get_cross_mask(T, x.device)
+
+        for blk in self.blocks:
+            x = blk(x, rope, mask, context=ctx_proj, rope_ctx=rope_ctx, cross_mask=cross_mask)
+
+        x = self.norm_out(x)  # (B, N, D)
+        init_logits = self.pred_head(x)  # (B, N, K)
+        return init_logits
 
     def run_mcmc(
         self,
@@ -323,29 +398,27 @@ class VQHVEBTStage(nn.Module):
     ) -> Tuple[List[torch.Tensor], torch.Tensor, List[float]]:
         """Run MCMC to find low-energy logits in code distribution space.
 
-        Following NLP EBT, the optimization variable is logits over the K
-        codebook entries. Logits are detached between steps (default behavior
-        matching NLP EBT). The energy function sees softmax(logits) @ E as
-        the predicted embedding.
-
-        **Multi-step supervision** (key NLP EBT pattern): returns logits at
-        EVERY MCMC step. The caller should compute CE loss at each step and
-        average — this gives N× stronger gradient signal to the energy function
-        compared to only supervising the final step.
+        Changes from the original:
+        - F2/F3: If pred_head is enabled, compute warm-start logits from
+          the learned prediction head instead of zeros. The prediction head
+          also gets a direct CE loss (returned as the first entry in
+          all_step_logits).
+        - F4: Per-token gradient normalization. Each token's gradient is
+          normalized to unit norm before the step, making the effective
+          step size invariant to the energy function's absolute scale.
+          The step_size α then directly controls how far in logit-space
+          each token moves per step (in L2 norm).
 
         Args:
             real_ctx      : (B, T, C, H, W) quantized context (z_q_st).
-            init_logits   : initial logits; if None, zeros are used (uniform
-                            over codes = average codebook vector as starting embed).
+            init_logits   : initial logits; if None, uses prediction head or zeros.
             parent_context: (B, T, Cp, Hp, Wp) from coarser stage (detached).
-            learning      : if True, create_graph=True so that the energy
-                            gradient computation is differentiable (allows
-                            loss.backward() to train the transformer).
+            learning      : if True, create_graph=True for training.
 
         Returns:
             all_step_logits : List of (B, T*H*W, K) logits after each MCMC step.
-                              Each has a live graph (when learning=True) so CE
-                              loss at every step backprops into the energy function.
+                              If pred_head is enabled, the FIRST entry is the
+                              pred_head output (before any MCMC steps).
             final_embed     : (B, T, C, H, W) — decoded embedding from final logits.
             energy_trace    : list of per-step summed energies (for diagnostics).
         """
@@ -354,39 +427,42 @@ class VQHVEBTStage(nn.Module):
         K = self.cfg.codebook.num_codes
         device = real_ctx.device
 
-        # Initialise logits.
-        if init_logits is None:
-            pred_logits = torch.zeros(B, N, K, device=device, dtype=real_ctx.dtype)
-        else:
+        all_step_logits: List[torch.Tensor] = []
+
+        # ---- Initialise logits -------------------------------------------- #
+        if init_logits is not None:
             if init_logits.shape != (B, N, K):
                 raise ValueError(
                     f"init_logits shape {tuple(init_logits.shape)} != expected ({B},{N},{K})"
                 )
             pred_logits = init_logits.clone()
+        elif self.pred_head is not None:
+            # F2/F3: Warm-start from learned prediction head.
+            pred_logits = self._compute_init_logits(real_ctx, parent_context)
+            # Include pred_head logits in loss (direct CE supervision on the head).
+            all_step_logits.append(pred_logits)
+        else:
+            pred_logits = torch.zeros(B, N, K, device=device, dtype=real_ctx.dtype)
 
         # Clamp step size to be numerically safe.
         alpha = torch.clamp(self.alpha, min=1e-6)
 
         num_steps = self.cfg.mcmc_steps
         energy_trace: List[float] = []
-        all_step_logits: List[torch.Tensor] = []
+        use_per_token_norm = self.cfg.mcmc_per_token_norm
 
         for step in range(num_steps):
-            # Following NLP EBT: create_graph at all steps (truncate_mcmc=False)
-            # or only last step (truncate_mcmc=True).
             create_graph = learning and (
                 not self.cfg.truncate_mcmc or step == num_steps - 1
             )
 
-            # Detach logits between steps (like NLP EBT's default behavior).
+            # Detach logits between steps (NLP EBT default).
             pred_logits = pred_logits.detach().requires_grad_(True)
 
             with torch.enable_grad():
-                # Decode logits → embedding → reshape to (B, T, C, H, W).
                 z_pred_flat = self.quantizer.decode_logits(pred_logits)  # (B, N, C)
                 z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
-                # Compute energy.
                 energy = self.forward_energy(real_ctx, z_pred, parent_context)  # (B, N)
                 energy_trace.append(energy.detach().sum().item())
 
@@ -396,14 +472,18 @@ class VQHVEBTStage(nn.Module):
                     retain_graph=create_graph,
                 )[0]
 
-            # Clamp MCMC gradient to prevent instability (NLP EBT pattern).
-            if self.cfg.mcmc_grad_clamp > 0:
+            # F4: Per-token gradient normalization.
+            # Normalize each token's K-dim gradient to unit L2 norm.
+            # This makes the effective step size independent of the energy
+            # function's absolute scale (which can vary by 1000×).
+            if use_per_token_norm:
+                grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                grad = grad / grad_norm
+            elif self.cfg.mcmc_grad_clamp > 0:
+                # Legacy: global clamp (only when per-token norm is off).
                 grad = torch.clamp(grad, min=-self.cfg.mcmc_grad_clamp, max=self.cfg.mcmc_grad_clamp)
 
-            # Gradient descent step in logit space.
             pred_logits = pred_logits - alpha * grad
-
-            # Store logits AFTER update (matches NLP EBT: loss on post-step logits).
             all_step_logits.append(pred_logits)
 
         # Decode final logits → final embedding.

@@ -57,7 +57,11 @@ def build_model(device, freeze_encoder=False):
         n_heads=4,
         n_layers=4,
         mcmc_steps=20,
-        mcmc_step_size=10.0,
+        mcmc_step_size=1.0,
+        mcmc_per_token_norm=True,
+        pred_head=True,
+        energy_bound=10.0,
+        energy_reg_weight=0.01,
         codebook=VQCodebookConfig(
             num_codes=512,
             code_dim=512,
@@ -72,8 +76,11 @@ def build_model(device, freeze_encoder=False):
     cfg = VQHVEBTConfig(
         stages=[stage_cfg],
         train_encoder=not freeze_encoder,
-        encoder_lr_scale=0.1,
+        encoder_lr_scale=1.0,
         weights_path="clip/MobileCLIP2-S0/mobileclip2_s0.pt",
+        use_custom_encoder=True,
+        encoder_base_channels=64,
+        ema_target_decay=0.999,
         use_decoder=False,
         contrastive_loss_weight=0.0,
         encoder_warmup_steps=0,
@@ -580,6 +587,7 @@ def test_scale_mismatch(model, batch, device):
         z_before = feats_before["s3"].clone()
 
     opt.step()
+    model.update_ema_encoder()
 
     # Record post-step encoder features
     with torch.no_grad():
@@ -617,6 +625,19 @@ def test_scale_mismatch(model, batch, device):
     flip_rate = (idx_before != idx_after).float().mean().item()
     print(f"    VQ assignment flip rate: {flip_rate:.4f} ({flip_rate*100:.1f}%)")
     print(f"    -> High flip rate = moving targets = unstable training!")
+
+    # Also check EMA target stability
+    if hasattr(model.encoder, 'encode_video_ema'):
+        with torch.no_grad():
+            ema_feats_before = model.encoder.encode_video_ema(batch)
+            ema_z_before = ema_feats_before["s3"]
+            ema_feats_after = model.encoder.encode_video_ema(batch)
+            ema_z_after = ema_feats_after["s3"]
+
+        ema_diff = (ema_z_after - ema_z_before)
+        print(f"\n    EMA target feature change after 1 step:")
+        print(f"      relative change: {ema_diff.norm().item() / ema_z_before.norm().item():.6f}")
+        print(f"      -> Should be ~0.001 (EMA decay=0.999, only 0.1% change per step)")
 
 
 # ============================================================================

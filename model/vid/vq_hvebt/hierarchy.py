@@ -2,49 +2,49 @@
 VQ-HVEBT: top-level hierarchical model.
 
 This module owns:
-  - The trainable CLIP encoder (VQClipBackbone).
-  - One VectorQuantizer per stage.
+  - The encoder (either pretrained CLIP or custom ConvEncoder).
+  - An EMA copy of the encoder that produces stable target codes (BYOL/DINO).
+  - One VectorQuantizer per stage (EMA-updated, no gradient).
   - One VQHVEBTStage (EBT predictor) per stage.
   - An optional PixelDecoder on the finest stage.
 
-It orchestrates the complete forward pass for training and inference.
-
-Forward pass overview
----------------------
+Forward pass overview (Option B — custom encoder + EMA targets)
+---------------------------------------------------------------
 
 Given a video clip of shape (B, T+1, 3, H, W):
-  1. Encode ALL T+1 frames through CLIP → per-stage feature tensors.
-  2. For each stage k, quantize all frames:
-         z_e^k, z_q^k, z_q_st^k, indices^k
-     and collect per-stage VQ losses (cb_loss^k, commit_loss^k).
-  3. Build EBT training pairs (shifted by 1):
-         real_ctx^k   = z_q_st^k[:, :-1]   (frames 0..T-1, with grad)
-         target^k     = indices^k[:, 1:]    (frames 1..T,   code indices)
+  1. Encode ALL T+1 frames through the LIVE encoder → per-stage features.
+  2. Encode ALL T+1 frames through the frozen EMA encoder → per-stage features
+     for computing TARGET code indices only (stable, no gradient).
+  3. For each stage k:
+     a. Quantize LIVE features → z_q_st (straight-through for context).
+     b. Quantize EMA features → target_indices (stable codes for CE loss).
+     c. EMA codebook is updated from LIVE features.
   4. Predict from coarsest stage to finest (top-down):
      For each stage k (ordered coarse→fine):
-       a. Run MCMC from zero init in logit space (NLP EBT style).
-       b. Get final predicted logits (B, N, K) and decoded embedding z_pred^k.
-       c. Compute prediction loss: CE(pred_logits, target_indices).
-       d. Pass (detached) z_pred^k as parent_context to the next finer stage.
+       a. Run MCMC from pred_head warm-start in logit space.
+       b. Per-token gradient normalization makes MCMC scale-invariant (F4).
+       c. Energy is bounded via tanh (F1).
+       d. Compute CE loss: pred_logits vs EMA target_indices.
+       e. Pass (detached) z_pred^k as parent_context to next finer stage.
   5. Optional: decode finest-stage prediction to RGB and compute pixel loss.
   6. Return total loss and a metric dict.
 
 Gradient flow summary
 ---------------------
 
-  encoder ←── commitment_loss^k  (for each stage)
-  encoder ←── straight-through from downstream loss via z_q_st
-  codebook ←── codebook_loss^k  (for each stage, z_e is detached)
-  codebook ←── prediction_loss (via softmax @ E, unless detach_codebook_in_decode)
-  predictor ←── prediction_loss (via MCMC unroll with create_graph=True)
-  decoder ←── decoder_loss (only if use_decoder=True; does NOT flow to predictor)
+  live_encoder ←── prediction_loss (via straight-through z_q_st context)
+  live_encoder ←── prediction_loss (via straight-through z_q_st when detach_pred_context=False)
+  ema_encoder  : no gradient (updated by EMA after optimizer.step())
+  codebook     : no gradient (updated by EMA from live encoder features)
+  predictor    ←── prediction_loss (via MCMC unroll with create_graph=True)
+  pred_head    ←── prediction_loss (direct CE on pred_head logits)
+  decoder      ←── decoder_loss (does NOT flow to predictor)
 
-Target leakage prevention
---------------------------
-  target^k = z_q^k[:, 1:].detach().clone()
-  Both `.detach()` AND `.clone()` are required:
-    - `.detach()` stops gradients crossing the target branch.
-    - `.clone()` makes a fresh tensor so in-place ops on z_q don't corrupt it.
+Target stability
+-----------------
+  target_indices come from EMA encoder → EMA quantizer lookup.
+  The EMA encoder changes slowly (decay 0.999 → 1000-step half-life),
+  so targets drift smoothly rather than flipping 98.8% per step.
 """
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ import torch.nn.functional as F
 from model.vid.hvebt.decoder import PixelDecoder
 from model.vid.vq_hvebt.clip_backbone import VQClipBackbone
 from model.vid.vq_hvebt.config import VQHVEBTConfig, VQStageConfig
+from model.vid.vq_hvebt.conv_encoder import ConvEncoderWrapper
 from model.vid.vq_hvebt.losses import (
     aggregate_stage_losses,
     ce_prediction_loss,
@@ -118,18 +119,30 @@ class VQHVEBTModel(nn.Module):
         self.cfg = cfg
         self._step_counter = 0  # tracks training steps for encoder warmup
 
-        # ---- CLIP encoder ---------------------------------------------------
+        # ---- Encoder (CLIP or custom ConvEncoder) ---------------------------
         stage_names = [s.clip_stage_name for s in cfg.stages]
-        self.encoder = VQClipBackbone(
-            weights_path=cfg.weights_path,
-            return_stages=stage_names,
-            trainable=cfg.train_encoder,
-            lr_scale=cfg.encoder_lr_scale,
-        )
+
+        if cfg.use_custom_encoder:
+            # Option B: Custom ConvEncoder + EMA target encoder.
+            self.encoder = ConvEncoderWrapper(
+                return_stages=stage_names,
+                base_channels=cfg.encoder_base_channels,
+                lr_scale=cfg.encoder_lr_scale,
+                ema_decay=cfg.ema_target_decay,
+            )
+            self._use_custom_encoder = True
+        else:
+            # Legacy: pretrained CLIP backbone.
+            self.encoder = VQClipBackbone(
+                weights_path=cfg.weights_path,
+                return_stages=stage_names,
+                trainable=cfg.train_encoder,
+                lr_scale=cfg.encoder_lr_scale,
+            )
+            self._use_custom_encoder = False
 
         # ---- Per-stage quantizers and predictors ----------------------------
         # stages in cfg are ordered coarsest → finest.
-        # self.quantizers and self.predictors are in the same order.
         self.quantizers = nn.ModuleDict()
         self.predictors = nn.ModuleDict()
 
@@ -210,19 +223,14 @@ class VQHVEBTModel(nn.Module):
         video: torch.Tensor,   # (B, T+1, 3, H, W)
         detach_encoder: bool = False,
     ) -> Dict[str, Tuple[torch.Tensor, QuantizerOutput]]:
-        """Run encoder and quantizer for all stages.
+        """Run encoder and quantizer for all stages (LIVE encoder).
 
         Args:
             video: input video batch.
             detach_encoder: if True, detach encoder outputs before quantization.
-                This freezes the encoder gradient (used during warmup to
-                stabilize target codes before letting the encoder train).
 
         Returns:
-            dict mapping stage_name → (z_e_5d, quant_output) where:
-                z_e_5d : (B, T+1, C, H, W)
-                quant_output.z_q_st : (B, T+1, C, H, W)  straight-through
-                quant_output.z_q    : (B, T+1, C, H, W)  hard quantized
+            dict mapping stage_name → (z_e_5d, quant_output).
         """
         B, T1, _, H, W = video.shape
         feats = self.encoder.encode_video(video)  # {name: (B, T+1, C, H, W)}
@@ -230,21 +238,17 @@ class VQHVEBTModel(nn.Module):
         results: Dict[str, Tuple[torch.Tensor, QuantizerOutput]] = {}
         for stage_cfg in self.cfg.stages:
             name = stage_cfg.clip_stage_name
-            z_e_5d = feats[name]                   # (B, T+1, C, Hs, Ws)
+            z_e_5d = feats[name]
 
-            # During warmup, detach encoder output to prevent encoder gradient.
-            # This keeps target codes stable so predictor+codebook can train.
             if detach_encoder:
                 z_e_5d = z_e_5d.detach()
 
             Bs, T1s, C, Hs, Ws = z_e_5d.shape
             N = T1s * Hs * Ws
 
-            # Flatten spatiotemporal dims for the quantizer.
-            z_e_flat = z_e_5d.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)  # (B, N, C)
-            qout = self.quantizers[name].encode(z_e_flat)                 # QuantizerOutput
+            z_e_flat = z_e_5d.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
+            qout = self.quantizers[name].encode(z_e_flat)
 
-            # Reshape outputs back to 5D.
             def unflatten(t: torch.Tensor) -> torch.Tensor:
                 return t.reshape(Bs, T1s, Hs, Ws, C).permute(0, 1, 4, 2, 3).contiguous()
 
@@ -259,6 +263,47 @@ class VQHVEBTModel(nn.Module):
 
         return results
 
+    def _encode_and_quantize_ema(
+        self,
+        video: torch.Tensor,   # (B, T+1, 3, H, W)
+    ) -> Dict[str, torch.Tensor]:
+        """Run EMA encoder and quantize to get STABLE target indices.
+
+        Uses the frozen EMA encoder so targets don't flip every step.
+        Only returns indices (no straight-through needed for targets).
+
+        Args:
+            video: input video batch.
+
+        Returns:
+            dict mapping stage_name → (B, T+1, H*W) long target indices.
+        """
+        if not self._use_custom_encoder:
+            # CLIP mode: no EMA encoder, return None to fall back to live indices.
+            return {}
+
+        with torch.no_grad():
+            feats = self.encoder.encode_video_ema(video)  # {name: (B, T+1, C, H, W)}
+
+        target_indices: Dict[str, torch.Tensor] = {}
+        for stage_cfg in self.cfg.stages:
+            name = stage_cfg.clip_stage_name
+            z_e_5d = feats[name]
+            Bs, T1s, C, Hs, Ws = z_e_5d.shape
+            N = T1s * Hs * Ws
+
+            z_e_flat = z_e_5d.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
+            # Nearest-neighbor lookup only (no EMA update — that's done by live encoder).
+            E = self.quantizers[name].codebook_weight.detach()
+            z_sq = (z_e_flat.reshape(-1, C) ** 2).sum(dim=1, keepdim=True)
+            e_sq = (E ** 2).sum(dim=1, keepdim=True).T
+            dot = z_e_flat.reshape(-1, C) @ E.T
+            dist = z_sq + e_sq - 2 * dot
+            indices_flat = dist.argmin(dim=1)
+            target_indices[name] = indices_flat.reshape(Bs, T1s, Hs * Ws)
+
+        return target_indices
+
     # ------------------------------------------------------------------ #
     #  Full forward pass (training)
     # ------------------------------------------------------------------ #
@@ -270,21 +315,17 @@ class VQHVEBTModel(nn.Module):
         """Compute training loss for a video batch.
 
         Args:
-            video: (B, T+1, 3, H, W) normalised RGB. The model predicts
-                   frame T+1 given frames 0..T-1 at every temporal position,
-                   i.e. it sees T context frames and predicts T future frames
-                   via the shifted-by-1 pair (frames 0..T-1 → 1..T).
+            video: (B, T+1, 3, H, W) normalised RGB.
 
         Returns:
             VQHVEBTOutput with total_loss, per-stage breakdowns, and metrics.
         """
         B, T1, _, H, W = video.shape
-        T = T1 - 1   # number of context / target pairs
+        T = T1 - 1
 
         if T < 1:
             raise ValueError(f"Video must have at least 2 frames, got {T1}")
 
-        # Track training steps for encoder warmup.
         if self.training:
             self._step_counter += 1
         in_warmup = (
@@ -292,9 +333,12 @@ class VQHVEBTModel(nn.Module):
             and self._step_counter <= self.cfg.encoder_warmup_steps
         )
 
-        # ---- 1. Encode + quantize all stages --------------------------------
+        # ---- 1. Encode + quantize all stages (LIVE encoder) -----------------
         enc_quant = self._encode_and_quantize(video, detach_encoder=in_warmup)
-        # enc_quant: {name: (z_e_5d, qout_5d)}
+
+        # ---- 1b. Get STABLE target indices from EMA encoder -----------------
+        ema_target_map = self._encode_and_quantize_ema(video)
+        # ema_target_map: {name: (B, T+1, H*W)} or {} if CLIP mode
 
         # ---- 2. Collect per-stage results (top-down: coarse → fine) ---------
         stage_results: Dict[str, StageForwardResult] = {}
@@ -305,35 +349,28 @@ class VQHVEBTModel(nn.Module):
         cb_weight_map: Dict[str, float] = {}
         commit_weight_map: Dict[str, float] = {}
 
-        # Parent predicted embedding (coarser stage output → finer stage input).
-        parent_pred: Optional[torch.Tensor] = None  # (B, T, Cp, Hp, Wp) or None
+        parent_pred: Optional[torch.Tensor] = None
 
         for idx, stage_cfg in enumerate(self.cfg.stages):
             name = stage_cfg.clip_stage_name
             z_e_5d, qout = enc_quant[name]
 
-            # Context uses straight-through (encoder gets grad via commitment + ST).
-            # Slice: frames 0..T-1.
-            real_ctx = qout.z_q_st[:, :T]        # (B, T, C, H, W)
+            real_ctx = qout.z_q_st[:, :T]
 
-            # Detach context from encoder to prevent pred_loss from destabilizing
-            # encoder training. When detached, encoder trains ONLY via commitment
-            # loss (which stabilizes VQ assignments by pushing z_e toward codes).
-            # The pred_loss gradient can still reach the codebook (through
-            # softmax @ E in the decode step) and the predictor.
             if self.cfg.detach_pred_context:
                 real_ctx = real_ctx.detach()
 
-            # Target code indices: future frames 1..T.
-            # These are the ground-truth codes the predictor should output.
-            target_indices = qout.indices[:, 1:]  # (B, T, H*W) long
+            # Target code indices: use EMA encoder if available (stable targets).
+            if name in ema_target_map:
+                target_indices = ema_target_map[name][:, 1:]  # (B, T, H*W)
+            else:
+                target_indices = qout.indices[:, 1:]  # (B, T, H*W)
 
-            # Parent context for cross-attention (already detached below).
             par_ctx = None
             if parent_pred is not None:
-                par_ctx = parent_pred   # already detached (see below)
+                par_ctx = parent_pred
 
-            # MCMC prediction in logit space (NLP EBT style).
+            # MCMC prediction with pred_head warm-start.
             predictor: VQHVEBTStage = self.predictors[name]
             all_step_logits, pred_embed, energy_trace = predictor.run_mcmc(
                 real_ctx=real_ctx,
@@ -341,87 +378,62 @@ class VQHVEBTModel(nn.Module):
                 parent_context=par_ctx,
                 learning=self.training,
             )
-            # all_step_logits: list of (B, T*H*W, K) — logits after each MCMC step
-            # pred_embed:      (B, T, C, H, W) — decoded embedding from final logits
 
-            # Prediction loss: CE on logits (NLP EBT pattern).
-            # - truncate_mcmc=True (default): CE only on FINAL step logits.
-            #   This is the practical NLP EBT setting — the final logits after
-            #   full MCMC have moved far from uniform and represent a meaningful
-            #   prediction. Earlier steps are noise that dilutes the signal.
-            # - truncate_mcmc=False: CE on ALL steps (averaged).
-            #   More gradient signal but noisier; requires smaller step_size.
             Bs, Tc, C, Hs, Ws = pred_embed.shape
             N = Tc * Hs * Ws
             K = stage_cfg.codebook.num_codes
-            tgt_idx_flat = target_indices.reshape(Bs, N)   # (B, T*H*W)
+            tgt_idx_flat = target_indices.reshape(Bs, N)
 
-            # Soft vs hard targets:
-            # soft_target_tau > 0: use smooth distance-based distribution
-            #   (eliminates moving-target discontinuity when encoder is trainable)
-            # soft_target_tau == 0: hard one-hot CE (original, only stable
-            #   with frozen encoder)
             use_soft = stage_cfg.soft_target_tau > 0
 
             if use_soft:
-                # z_e of future frames for distance computation.
-                z_e_future = z_e_5d[:, 1:]  # (B, T, C, H, W)
+                z_e_future = z_e_5d[:, 1:]
                 z_e_future_flat = z_e_future.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
-                cb_weight = self.quantizers[name].codebook.weight  # (K, C)
-
-                # Detach both z_e and codebook — targets should not backprop
-                # to encoder or codebook (those train via commit/cb loss).
+                cb_weight = self.quantizers[name].codebook.weight
                 z_e_det = z_e_future_flat.detach()
                 cb_det = cb_weight.detach()
 
-            if stage_cfg.truncate_mcmc:
-                # Only final step (NLP EBT truncate_mcmc=True default).
+            # Compute CE loss. With pred_head, all_step_logits[0] is the
+            # pred_head output; the rest are post-MCMC-step logits.
+            # We compute CE on ALL entries (pred_head + MCMC steps) and average.
+            l_pred = torch.tensor(0.0, device=pred_embed.device)
+            for step_logits in all_step_logits:
                 if use_soft:
-                    l_pred = soft_ce_prediction_loss(
-                        all_step_logits[-1], z_e_det, cb_det,
+                    l_pred = l_pred + soft_ce_prediction_loss(
+                        step_logits, z_e_det, cb_det,
                         tau=stage_cfg.soft_target_tau,
                     )
                 else:
-                    l_pred = ce_prediction_loss(all_step_logits[-1], tgt_idx_flat)
-            else:
-                # All steps averaged (NLP EBT truncate_mcmc=False).
-                l_pred = torch.tensor(0.0, device=pred_embed.device)
-                for step_logits in all_step_logits:
-                    if use_soft:
-                        l_pred = l_pred + soft_ce_prediction_loss(
-                            step_logits, z_e_det, cb_det,
-                            tau=stage_cfg.soft_target_tau,
-                        )
-                    else:
-                        l_pred = l_pred + ce_prediction_loss(step_logits, tgt_idx_flat)
-                l_pred = l_pred / len(all_step_logits)
+                    l_pred = l_pred + ce_prediction_loss(step_logits, tgt_idx_flat)
+            l_pred = l_pred / max(len(all_step_logits), 1)
 
-            # Contrastive energy loss: energy(true) should be < energy(predicted).
-            # This gives a DIRECT first-order signal to the energy function,
-            # telling it what low-energy states look like (without going through
-            # the second-order MCMC Hessian). Matches NLP EBT's contrastive_loss.
+            # F1: Energy regularization — penalize large energy magnitudes.
+            if stage_cfg.energy_reg_weight > 0 and energy_trace:
+                # Use the last MCMC step's energy for regularization.
+                # Re-compute to get it in the graph.
+                z_pred_last_flat = self.quantizers[name].decode_logits(all_step_logits[-1])
+                z_pred_last = z_pred_last_flat.reshape(Bs, Tc, Hs, Ws, C).permute(0, 1, 4, 2, 3).contiguous()
+                energy_for_reg = predictor.forward_energy(real_ctx, z_pred_last.detach(), par_ctx)
+                energy_reg = stage_cfg.energy_reg_weight * energy_for_reg.pow(2).mean()
+                l_pred = l_pred + energy_reg
+
+            # Contrastive energy loss.
             if self.cfg.contrastive_loss_weight > 0 and self.training:
-                # True embedding: the actual future quantized features.
-                true_embed = qout.z_q[:, 1:].detach()  # (B, T, C, H, W)
-                true_energy = predictor.forward_energy(real_ctx, true_embed, par_ctx)  # (B, N)
-                # Predicted embedding energy (from final MCMC state, detached).
+                true_embed = qout.z_q[:, 1:].detach()
+                true_energy = predictor.forward_energy(real_ctx, true_embed, par_ctx)
                 pred_energy = predictor.forward_energy(
                     real_ctx, pred_embed.detach(), par_ctx
-                )  # (B, N)
-                # Stack: column 0 = true energy, column 1 = predicted energy.
-                # Target: 0 (true should have lower energy → be selected by argmin).
-                energy_stack = torch.stack([true_energy.sum(-1), pred_energy.sum(-1)], dim=-1)  # (B, 2)
+                )
+                energy_stack = torch.stack([true_energy.sum(-1), pred_energy.sum(-1)], dim=-1)
                 energy_targets = torch.zeros(Bs, dtype=torch.long, device=pred_embed.device)
                 contrastive_l = F.cross_entropy(-energy_stack, energy_targets)
                 l_pred = l_pred + self.cfg.contrastive_loss_weight * contrastive_l
 
-            # Prepare detached parent embedding for next finer stage.
             if self.cfg.detach_parent_kv:
                 parent_pred = pred_embed.detach()
             else:
-                parent_pred = pred_embed  # live (experimental; risks instability)
+                parent_pred = pred_embed
 
-            # Collect.
             sr = StageForwardResult(
                 stage_name=name,
                 z_e=z_e_5d,
@@ -548,11 +560,12 @@ class VQHVEBTModel(nn.Module):
     def parameter_groups(self, base_lr: float):
         """Build optimizer parameter groups with encoder at reduced LR.
 
-        Two groups:
-          1. Predictor params (full LR): transformers, energy heads, step_size.
-          2. Encoder params (reduced LR): pretrained CLIP — change slowly.
+        Groups:
+          1. Predictor params (full LR): transformers, energy heads, pred_head, step_size.
+          2. Encoder params (encoder LR): live encoder — learned from scratch or fine-tuned.
 
         Note: Codebook is EMA-updated (no gradient), so no codebook params here.
+              EMA encoder is frozen (no gradient).
 
         Args:
             base_lr: learning rate for predictors.
@@ -560,12 +573,16 @@ class VQHVEBTModel(nn.Module):
         Returns:
             List of dicts suitable for torch.optim.AdamW or similar.
         """
-        enc_params = list(self.encoder.parameters())
+        if self._use_custom_encoder:
+            enc_params = list(self.encoder.live.parameters())
+        else:
+            enc_params = list(self.encoder.parameters())
+
         enc_ids = {id(p) for p in enc_params}
 
         pred_params = [
             p for p in self.parameters()
-            if id(p) not in enc_ids
+            if id(p) not in enc_ids and p.requires_grad
         ]
 
         groups = [
@@ -575,13 +592,23 @@ class VQHVEBTModel(nn.Module):
         return groups
 
     def encoder_params(self):
-        """Return encoder parameters."""
+        """Return live encoder parameters."""
+        if self._use_custom_encoder:
+            return list(self.encoder.live.parameters())
         return list(self.encoder.parameters())
 
     def non_encoder_params(self):
         """Return all learnable parameters except encoder."""
-        enc_ids = {id(p) for p in self.encoder.parameters()}
-        return [p for p in self.parameters() if id(p) not in enc_ids]
+        enc_ids = {id(p) for p in self.encoder_params()}
+        return [p for p in self.parameters() if id(p) not in enc_ids and p.requires_grad]
+
+    def update_ema_encoder(self) -> None:
+        """Update the EMA target encoder from the live encoder.
+
+        Call this AFTER each optimizer step. Only relevant for custom encoder mode.
+        """
+        if self._use_custom_encoder:
+            self.encoder.update_ema()
 
     # ------------------------------------------------------------------ #
     #  Metrics
