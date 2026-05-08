@@ -87,19 +87,28 @@ class MultiStageConvEncoder(nn.Module):
         stage3 : 128 → 256 ch, 32 → 16   → s2 output
         stage4 : 256 → 512 ch, 16 → 8    → s3 output
 
+    All stage outputs are L2-normalized per spatial token to ``target_norm``.
+    This ensures consistent feature magnitude for the VQ quantizer and
+    bounds the per-step feature shift (tokens can only rotate on a
+    hypersphere, max shift = 2 * target_norm).
+
     Parameters
     ----------
     return_stages : which stages to return (subset of {"s1", "s2", "s3"}).
     base_channels : channel width of the stem.
+    target_norm   : L2-normalize each spatial token to this norm.
+                    0 = no normalization (not recommended for VQ).
     """
 
     def __init__(
         self,
         return_stages: Iterable[str] = ("s1", "s2", "s3"),
         base_channels: int = 64,
+        target_norm: float = 1.0,
     ):
         super().__init__()
         self.return_stages = tuple(return_stages)
+        self.target_norm = target_norm
         for s in self.return_stages:
             if s not in _STAGE_SPEC:
                 raise ValueError(f"Unknown stage '{s}'. Valid: {list(_STAGE_SPEC)}")
@@ -151,7 +160,26 @@ class MultiStageConvEncoder(nn.Module):
         if "s3" in self.return_stages:
             out["s3"] = h
 
+        # L2-normalize each spatial token to target_norm.
+        # This ensures consistent magnitude for VQ quantization and
+        # bounds the max per-step feature change to 2 * target_norm.
+        if self.target_norm > 0:
+            for name in list(out.keys()):
+                out[name] = self._l2_normalize(out[name])
+
         return out
+
+    def _l2_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """L2-normalize over channels at each spatial position.
+
+        Args:
+            x: (B, C, H, W)
+
+        Returns:
+            (B, C, H, W) with ||x[:, :, h, w]||_2 == target_norm.
+        """
+        norm = x.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        return x / norm * self.target_norm
 
 
 # --------------------------------------------------------------------------- #
@@ -240,7 +268,7 @@ class ConvEncoderWrapper(nn.Module):
         self.return_stages = tuple(return_stages)
         self.lr_scale = lr_scale
 
-        self.live = MultiStageConvEncoder(return_stages, base_channels)
+        self.live = MultiStageConvEncoder(return_stages, base_channels, target_norm=1.0)
         self.ema = EMAEncoder(self.live, decay=ema_decay)
 
     def encode_video(self, video: torch.Tensor) -> Dict[str, torch.Tensor]:

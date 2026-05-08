@@ -393,11 +393,22 @@ class VQHVEBTModel(nn.Module):
                 z_e_det = z_e_future_flat.detach()
                 cb_det = cb_weight.detach()
 
-            # Compute CE loss. With pred_head, all_step_logits[0] is the
-            # pred_head output; the rest are post-MCMC-step logits.
-            # We compute CE on ALL entries (pred_head + MCMC steps) and average.
+            # Compute CE loss only on logits with live computation graphs.
+            # With truncate_mcmc=True: only pred_head (first) and last MCMC
+            # step have graphs. Intermediate steps are detached — computing
+            # CE on them dilutes the gradient by ~10× without benefit.
+            if stage_cfg.truncate_mcmc:
+                has_pred_head = predictor.pred_head is not None and len(all_step_logits) > 1
+                ce_logits = []
+                if has_pred_head:
+                    ce_logits.append(all_step_logits[0])   # pred_head output
+                ce_logits.append(all_step_logits[-1])      # last MCMC step
+            else:
+                # All steps have create_graph=True → all contribute gradient.
+                ce_logits = all_step_logits
+
             l_pred = torch.tensor(0.0, device=pred_embed.device)
-            for step_logits in all_step_logits:
+            for step_logits in ce_logits:
                 if use_soft:
                     l_pred = l_pred + soft_ce_prediction_loss(
                         step_logits, z_e_det, cb_det,
@@ -405,7 +416,7 @@ class VQHVEBTModel(nn.Module):
                     )
                 else:
                     l_pred = l_pred + ce_prediction_loss(step_logits, tgt_idx_flat)
-            l_pred = l_pred / max(len(all_step_logits), 1)
+            l_pred = l_pred / max(len(ce_logits), 1)
 
             # F1: Energy regularization — penalize large energy magnitudes.
             if stage_cfg.energy_reg_weight > 0 and energy_trace:

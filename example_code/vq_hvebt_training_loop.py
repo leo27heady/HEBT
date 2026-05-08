@@ -452,8 +452,8 @@ def parse_args() -> argparse.Namespace:
                    help="Encoder LR = lr * scale (1.0 for custom encoder, 0.01 for CLIP)")
     p.add_argument("--freeze_encoder", action="store_true",
                    help="Freeze encoder (useful for debugging predictor in isolation)")
-    p.add_argument("--encoder_warmup_steps", type=int, default=0,
-                   help="Freeze encoder gradient for first N steps (stabilizes target codes)")
+    p.add_argument("--encoder_warmup_steps", type=int, default=200,
+                   help="Freeze encoder gradient for first N steps (stabilizes codebook + predictor)")
     p.add_argument("--contrastive_loss_weight", type=float, default=0.0,
                    help="Weight for contrastive energy loss (E(true) < E(predicted))")
     p.add_argument("--dataset_size", type=int, default=1000,

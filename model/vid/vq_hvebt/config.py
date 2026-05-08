@@ -170,7 +170,9 @@ class VQHVEBTConfig:
     decoder_out_size: int = 256
     detach_parent_kv: bool = True
     contrastive_loss_weight: float = 0.0
-    encoder_warmup_steps: int = 0
+    encoder_warmup_steps: int = 200     # Freeze encoder for first N steps so
+                                        # codebook + predictor converge to a stable
+                                        # baseline before encoder features start shifting.
     detach_pred_context: bool = False   # With EMA codebook there is no commitment
                                         # loss gradient bomb, so we can let prediction
                                         # loss flow into the encoder via context too.
