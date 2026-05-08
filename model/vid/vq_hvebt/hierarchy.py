@@ -48,6 +48,7 @@ Target stability
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -88,6 +89,8 @@ class StageForwardResult:
     pred_embed: torch.Tensor    # (B, T, C, H, W) MCMC output for frames 1..T
     pred_loss: torch.Tensor     # scalar
     energy_trace: List[float]   # MCMC energy at each step
+    final_logits: Optional[torch.Tensor] = None   # (B, T*H*W, K) final MCMC logits
+    final_energy: Optional[torch.Tensor] = None   # (B, T*H*W) per-token energy
 
 
 @dataclass
@@ -328,13 +331,30 @@ class VQHVEBTModel(nn.Module):
 
         if self.training:
             self._step_counter += 1
-        in_warmup = (
-            self.cfg.encoder_warmup_steps > 0
-            and self._step_counter <= self.cfg.encoder_warmup_steps
-        )
+
+        # Encoder warmup: linearly ramp encoder features from detached to live
+        # over the warmup window. At step 0 features are fully detached (no encoder
+        # gradient). At step == encoder_warmup_steps they are fully live.
+        # This avoids the hard unfreeze discontinuity that causes loss spikes.
+        warmup_steps = self.cfg.encoder_warmup_steps
+        if warmup_steps > 0 and self._step_counter <= warmup_steps:
+            warmup_alpha = self._step_counter / warmup_steps  # 0→1 linearly
+        else:
+            warmup_alpha = 1.0  # fully live
 
         # ---- 1. Encode + quantize all stages (LIVE encoder) -----------------
-        enc_quant = self._encode_and_quantize(video, detach_encoder=in_warmup)
+        if warmup_alpha == 0.0:
+            enc_quant = self._encode_and_quantize(video, detach_encoder=True)
+        elif warmup_alpha < 1.0:
+            enc_quant = self._encode_and_quantize(video, detach_encoder=False)
+            # Blend: z = detached + alpha * (live - detached) = (1-alpha)*detached + alpha*live
+            # This gives a smooth gradient scale-up from 0 to full.
+            for name in enc_quant:
+                z_e_5d, qout = enc_quant[name]
+                z_e_blended = z_e_5d.detach() + warmup_alpha * (z_e_5d - z_e_5d.detach())
+                enc_quant[name] = (z_e_blended, qout)
+        else:
+            enc_quant = self._encode_and_quantize(video, detach_encoder=False)
 
         # ---- 1b. Get STABLE target indices from EMA encoder -----------------
         ema_target_map = self._encode_and_quantize_ema(video)
@@ -445,6 +465,11 @@ class VQHVEBTModel(nn.Module):
             else:
                 parent_pred = pred_embed
 
+            # Compute per-token energy for diagnostics (energy maps).
+            with torch.no_grad():
+                final_energy = predictor.forward_energy(real_ctx, pred_embed.detach(), par_ctx)
+                # final_energy: (B, T*H*W) per-token energy
+
             sr = StageForwardResult(
                 stage_name=name,
                 z_e=z_e_5d,
@@ -456,6 +481,8 @@ class VQHVEBTModel(nn.Module):
                 pred_embed=pred_embed,
                 pred_loss=l_pred,
                 energy_trace=energy_trace,
+                final_logits=all_step_logits[-1].detach(),
+                final_energy=final_energy.detach(),
             )
             stage_results[name] = sr
 
@@ -641,6 +668,23 @@ class VQHVEBTModel(nn.Module):
                 idx = sr.indices.reshape(-1)
                 metrics[f"{name}/codebook_usage"] = q.codebook_usage(idx).item()
                 metrics[f"{name}/codebook_perplexity"] = q.perplexity(idx).item()
+
+                # Average entropy of predicted distribution (bits).
+                # Low entropy = confident predictions; high = uncertain.
+                if sr.final_logits is not None:
+                    probs = F.softmax(sr.final_logits, dim=-1)  # (B, N, K)
+                    log_probs = F.log_softmax(sr.final_logits, dim=-1)
+                    entropy = -(probs * log_probs).sum(dim=-1)  # (B, N) nats
+                    entropy_bits = entropy / math.log(2)
+                    metrics[f"{name}/entropy_avg"] = entropy_bits.mean().item()
+                    metrics[f"{name}/entropy_min"] = entropy_bits.min().item()
+                    metrics[f"{name}/entropy_max"] = entropy_bits.max().item()
+
+                # Energy statistics.
+                if sr.final_energy is not None:
+                    metrics[f"{name}/energy_mean"] = sr.final_energy.mean().item()
+                    metrics[f"{name}/energy_std"] = sr.final_energy.std().item()
+
             # Energy trace: report first and last step energy.
             if sr.energy_trace:
                 metrics[f"{name}/energy_step0"] = sr.energy_trace[0]

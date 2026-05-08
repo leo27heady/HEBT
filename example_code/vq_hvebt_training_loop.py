@@ -142,6 +142,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         "s1": (128, 32, 32),
         "s2": (256, 16, 16),
         "s3": (512,  8,  8),
+        "s_pool": (512, 1, 1),
     }
 
     stage_cfgs: List[VQStageConfig] = []
@@ -203,12 +204,14 @@ def build_optimizer(model: VQHVEBTModel, base_lr: float) -> torch.optim.Optimize
     )
 
 
-def save_pred_images(pred_rgb: torch.Tensor, gt_batch: torch.Tensor, step: int, save_dir: Path) -> None:
-    """Save predicted and ground-truth frames as image grids.
+def save_pred_images(pred_rgb: torch.Tensor, gt_batch: torch.Tensor,
+                     stage_results: dict, step: int, save_dir: Path) -> None:
+    """Save predicted/GT frames and per-stage energy maps.
 
     Args:
         pred_rgb: (B, T, 3, H_out, W_out) predicted frames in [0, 1].
         gt_batch: (B, T+1, 3, H, W) full batch (context+future) in [0, 1].
+        stage_results: dict of StageForwardResult from model output.
         step: Current training step number.
         save_dir: Directory to write images into.
     """
@@ -227,6 +230,30 @@ def save_pred_images(pred_rgb: torch.Tensor, gt_batch: torch.Tensor, step: int, 
     # Stack pred and GT vertically: top=pred, bottom=GT for each frame
     grid = torch.cat([pred_frames, gt_frames], dim=0)  # (2*T, 3, H, W)
     save_image(grid, save_dir / f"step_{step:06d}.png", nrow=T)
+
+    # Save per-stage energy maps.
+    for name, sr in stage_results.items():
+        if sr.final_energy is None:
+            continue
+        H_s, W_s = sr.pred_embed.shape[3], sr.pred_embed.shape[4]
+        if H_s < 2 or W_s < 2:
+            continue  # skip s_pool (1x1 has no spatial map)
+        # sr.final_energy: (B, T*H*W) → reshape to (T, 1, H, W) for first sample
+        energy_map = sr.final_energy[0].reshape(T, H_s, W_s).unsqueeze(1)  # (T, 1, H, W)
+        # Normalize to [0, 1] for visualization
+        e_min = energy_map.min()
+        e_max = energy_map.max()
+        if e_max > e_min:
+            energy_map = (energy_map - e_min) / (e_max - e_min)
+        else:
+            energy_map = energy_map * 0
+        # Upscale to match pred frame size for easy comparison
+        energy_map = nn.functional.interpolate(
+            energy_map, size=pred_frames.shape[-2:], mode="nearest"
+        )
+        # Save as grayscale (repeat to 3ch for save_image)
+        energy_rgb = energy_map.repeat(1, 3, 1, 1)  # (T, 3, H, W)
+        save_image(energy_rgb, save_dir / f"step_{step:06d}_energy_{name}.png", nrow=T)
 
 
 def train(args: argparse.Namespace) -> None:
@@ -296,16 +323,25 @@ def train(args: argparse.Namespace) -> None:
 
             if step % args.log_every == 0 or step == 1:
                 m = out.metrics
-                pred_l = next(v for k, v in m.items() if "loss_pred" in k)
-                cb_l = next(v for k, v in m.items() if "loss_cb" in k)
-                commit_l = next(v for k, v in m.items() if "loss_commit" in k)
-                usage = next(v for k, v in m.items() if "codebook_usage" in k)
-                perpl = next(v for k, v in m.items() if "codebook_perplexity" in k)
-                print(
-                    f"  step {step:>5}  total={out.total_loss.item():.4f}"
-                    f"  pred={pred_l:.4f}  cb={cb_l:.4f}  commit={commit_l:.4f}"
-                    f"  usage={usage:.3f}  perplexity={perpl:.1f}"
-                )
+                # --- General summary line ---
+                parts = [f"  step {step:>5}  total={out.total_loss.item():.4f}"]
+                if "decoder/loss" in m:
+                    parts.append(f"  dec={m['decoder/loss']:.4f}")
+                print("".join(parts))
+                # --- Per-stage details ---
+                for sname in args.stages:
+                    pred_l = m.get(f"{sname}/loss_pred", 0)
+                    usage = m.get(f"{sname}/codebook_usage", 0)
+                    perpl = m.get(f"{sname}/codebook_perplexity", 0)
+                    ent = m.get(f"{sname}/entropy_avg", 0)
+                    e_mean = m.get(f"{sname}/energy_mean", 0)
+                    e_std = m.get(f"{sname}/energy_std", 0)
+                    print(
+                        f"    {sname:>6}: pred={pred_l:.4f}"
+                        f"  usage={usage:.3f}  perpl={perpl:.1f}"
+                        f"  entropy={ent:.2f}b"
+                        f"  energy={e_mean:.2f}\u00b1{e_std:.2f}"
+                    )
                 # CSV logging
                 if csv_file:
                     row = {"step": step, "total_loss": out.total_loss.item(), **m}
@@ -315,10 +351,11 @@ def train(args: argparse.Namespace) -> None:
                     csv_writer.writerow(row)
                     csv_file.flush()
 
-            # Image saving
+            # Image saving (overfit loop)
             if args.save_images_every > 0 and step % args.save_images_every == 0:
                 if out.pred_rgb is not None:
-                    save_pred_images(out.pred_rgb.detach(), fixed_batch.detach(), step, img_dir)
+                    save_pred_images(out.pred_rgb.detach(), fixed_batch.detach(),
+                                     out.stage_results, step, img_dir)
 
         if csv_file:
             csv_file.close()
@@ -366,10 +403,25 @@ def train(args: argparse.Namespace) -> None:
 
             if step % args.log_every == 0 or step == 1:
                 m = out.metrics
-                parts = [f"step {step:>6}  total={out.total_loss.item():.4f}  dt={dt*1000:.0f}ms"]
-                for key, val in sorted(m.items()):
-                    parts.append(f"{key}={val:.4f}")
-                print("  ".join(parts))
+                # --- General summary line ---
+                parts = [f"  step {step:>6}  total={out.total_loss.item():.4f}  dt={dt*1000:.0f}ms"]
+                if "decoder/loss" in m:
+                    parts.append(f"  dec={m['decoder/loss']:.4f}")
+                print("".join(parts))
+                # --- Per-stage details ---
+                for sname in args.stages:
+                    pred_l = m.get(f"{sname}/loss_pred", 0)
+                    usage = m.get(f"{sname}/codebook_usage", 0)
+                    perpl = m.get(f"{sname}/codebook_perplexity", 0)
+                    ent = m.get(f"{sname}/entropy_avg", 0)
+                    e_mean = m.get(f"{sname}/energy_mean", 0)
+                    e_std = m.get(f"{sname}/energy_std", 0)
+                    print(
+                        f"    {sname:>6}: pred={pred_l:.4f}"
+                        f"  usage={usage:.3f}  perpl={perpl:.1f}"
+                        f"  entropy={ent:.2f}b"
+                        f"  energy={e_mean:.2f}\u00b1{e_std:.2f}"
+                    )
 
                 # CSV logging
                 if csv_file:
@@ -383,7 +435,8 @@ def train(args: argparse.Namespace) -> None:
             # Image saving
             if args.save_images_every > 0 and step % args.save_images_every == 0:
                 if out.pred_rgb is not None:
-                    save_pred_images(out.pred_rgb.detach(), batch.detach(), step, img_dir)
+                    save_pred_images(out.pred_rgb.detach(), batch.detach(),
+                                     out.stage_results, step, img_dir)
 
     if csv_file:
         csv_file.close()
@@ -399,8 +452,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VQ-HVEBT training loop")
     p.add_argument("--weights_path", default="clip/MobileCLIP2-S0/mobileclip2_s0.pt")
     p.add_argument("--stages", nargs="+", default=["s1"],
-                   choices=["s1", "s2", "s3"],
-                   help="Stages to train (coarsest first), e.g. --stages s3 s2 s1")
+                   choices=["s1", "s2", "s3", "s_pool"],
+                   help="Stages to train (coarsest first), e.g. --stages s_pool s3 s2 s1")
     p.add_argument("--use_decoder", action="store_true",
                    help="Attach pixel decoder on the finest stage")
     # ---- Encoder architecture ----

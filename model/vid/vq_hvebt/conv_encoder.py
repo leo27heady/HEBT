@@ -65,6 +65,32 @@ class ConvBlock(nn.Module):
         return self.act(out + identity)
 
 
+class PoolBlock(nn.Module):
+    """Global-average-pool + linear projection, producing (B, C, 1, 1).
+
+    Designed to be the coarsest stage in the hierarchy: one vector per frame.
+    L2 normalization is applied externally by MultiStageConvEncoder (same as
+    spatial stages) so this block stays purely linear.
+
+    Parameters
+    ----------
+    in_channels : number of input channels (must match the preceding conv stage).
+    """
+
+    def __init__(self, in_channels: int = 512):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)                   # → (B, C, 1, 1)
+        self.proj = nn.Linear(in_channels, in_channels)       # learned projection
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        x = self.pool(x)                          # (B, C, 1, 1)
+        C = x.size(1)
+        x = x.view(x.size(0), C)                 # (B, C)
+        x = self.proj(x)                          # (B, C)
+        return x.view(x.size(0), C, 1, 1)        # (B, C, 1, 1)
+
+
 # --------------------------------------------------------------------------- #
 #  Multi-stage encoder
 # --------------------------------------------------------------------------- #
@@ -74,6 +100,7 @@ _STAGE_SPEC: Dict[str, Tuple[int, int]] = {
     "s1": (128, 32),
     "s2": (256, 16),
     "s3": (512,  8),
+    "s_pool": (512, 1),   # global-average-pooled version of s3
 }
 
 
@@ -124,6 +151,9 @@ class MultiStageConvEncoder(nn.Module):
         self.stage3 = ConvBlock(C * 2, C * 4, stride=2)
         # stage4: 4C → 8C, 16 → 8   (s3 output: 512 ch, 8×8)
         self.stage4 = ConvBlock(C * 4, C * 8, stride=2)
+        # s_pool: global-avg-pool + projection → (B, 8C, 1, 1)
+        if "s_pool" in self.return_stages:
+            self.pool_stage = PoolBlock(in_channels=C * 8)
 
         self._init_weights()
 
@@ -134,6 +164,10 @@ class MultiStageConvEncoder(nn.Module):
             elif isinstance(m, nn.GroupNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="linear")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Encode a batch of images.
@@ -159,6 +193,10 @@ class MultiStageConvEncoder(nn.Module):
         h = self.stage4(h)    # (B, 512, 8, 8)
         if "s3" in self.return_stages:
             out["s3"] = h
+
+        # s_pool: global-avg-pool + projection → (B, 512, 1, 1)
+        if "s_pool" in self.return_stages:
+            out["s_pool"] = self.pool_stage(h)  # (B, 512, 1, 1)
 
         # L2-normalize each spatial token to target_norm.
         # This ensures consistent magnitude for VQ quantization and
