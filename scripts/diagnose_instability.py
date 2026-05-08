@@ -56,22 +56,23 @@ def build_model(device, freeze_encoder=False):
         transformer_dim=256,
         n_heads=4,
         n_layers=4,
-        mcmc_steps=5,
-        mcmc_step_size=100.0,
+        mcmc_steps=20,
+        mcmc_step_size=10.0,
         codebook=VQCodebookConfig(
             num_codes=512,
             code_dim=512,
             init_mode="data_first_batch",
-            commitment_beta=0.25,
+            ema_decay=0.99,
+            dead_code_reset=True,
         ),
         pred_loss_weight=1.0,
-        cb_loss_weight=1.0,
-        commit_loss_weight=0.25,
+        cb_loss_weight=0.0,
+        commit_loss_weight=0.0,
     )
     cfg = VQHVEBTConfig(
         stages=[stage_cfg],
         train_encoder=not freeze_encoder,
-        encoder_lr_scale=0.001,
+        encoder_lr_scale=0.1,
         weights_path="clip/MobileCLIP2-S0/mobileclip2_s0.pt",
         use_decoder=False,
         contrastive_loss_weight=0.0,
@@ -564,24 +565,21 @@ def test_scale_mismatch(model, batch, device):
     print(f"  Step 0 loss: {out1.total_loss.item():.4f}")
 
     # Simulate one optimizer step
-    # Use the same LR setup as training loop
+    # Use the same LR setup as training loop (per-group clipping)
     enc_params = model.encoder_params()
-    non_enc_params = model.non_encoder_params()
-
-    opt_main = torch.optim.AdamW(non_enc_params, lr=3e-4)
-    opt_enc = torch.optim.SGD(enc_params, lr=3e-4 * 0.001, momentum=0.0)
+    pred_params = model.non_encoder_params()
+    opt = torch.optim.AdamW(model.parameter_groups(3e-4), weight_decay=1e-4)
 
     out1.total_loss.backward()
-    nn.utils.clip_grad_norm_(non_enc_params, max_norm=1.0)
     nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
+    nn.utils.clip_grad_norm_(pred_params, max_norm=1.0)
 
     # Record pre-step encoder features
     with torch.no_grad():
         feats_before = model.encoder.encode_video(batch)
         z_before = feats_before["s3"].clone()
 
-    opt_main.step()
-    opt_enc.step()
+    opt.step()
 
     # Record post-step encoder features
     with torch.no_grad():

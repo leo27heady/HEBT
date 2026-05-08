@@ -240,8 +240,11 @@ def train(args: argparse.Namespace) -> None:
             )
 
     optimizers = build_optimizer(model, args.lr)
-    # All params for grad clipping.
-    all_params = list(model.parameters())
+    # Per-group param lists for separate grad clipping.
+    # Encoder grads are huge (raw CLIP backbone) and would starve predictor
+    # if clipped jointly.
+    enc_params = model.encoder_params()
+    pred_params = model.non_encoder_params()
 
     # ---- logging setup ---------------------------------------------------- #
     log_dir = Path(args.log_dir) if args.log_dir else None
@@ -279,7 +282,8 @@ def train(args: argparse.Namespace) -> None:
             optimizers.zero_grad()
             out = model.forward_loss(fixed_batch)
             out.total_loss.backward()
-            nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
+            nn.utils.clip_grad_norm_(pred_params, max_norm=1.0)
             optimizers.step()
 
             if step % args.log_every == 0 or step == 1:
@@ -346,7 +350,8 @@ def train(args: argparse.Namespace) -> None:
             optimizers.zero_grad()
             out = model.forward_loss(batch)
             out.total_loss.backward()
-            nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            nn.utils.clip_grad_norm_(enc_params, max_norm=1.0)
+            nn.utils.clip_grad_norm_(pred_params, max_norm=1.0)
             optimizers.step()
             dt = time.perf_counter() - t0
 

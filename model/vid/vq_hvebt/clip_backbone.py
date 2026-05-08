@@ -53,6 +53,12 @@ class VQClipBackbone(nn.Module):
     lr_scale : float
         Relative LR multiplier for optimizer parameter groups. This is
         metadata only; callers must read it when building the optimizer.
+    target_norm : float
+        Target L2 norm for feature vectors. Raw CLIP features have L2 norms
+        of ~10^6 which overflow attention. We L2-normalize each spatial token
+        and scale to this target. The backward through L2-norm divides
+        gradients by ||x|| (~10^6), providing natural gradient suppression
+        for the pretrained encoder — unlike LayerNorm which amplifies them.
     """
 
     def __init__(
@@ -61,16 +67,18 @@ class VQClipBackbone(nn.Module):
         return_stages: Iterable[str] = ("s1", "s2", "s3"),
         trainable: bool = True,
         lr_scale: float = 0.1,
+        target_norm: float = 1.0,
     ):
         super().__init__()
         self.return_stages = tuple(return_stages)
         self.lr_scale = lr_scale
         self._trainable = trainable
+        self.target_norm = target_norm
 
         self._encoder = MobileClipMultiStageEncoder(
             weights_path=weights_path,
             return_stages=self.return_stages,
-            normalize_features=False,
+            normalize_features=False,  # We apply L2-norm ourselves (see below)
             trainable=trainable,
         )
 
@@ -87,7 +95,26 @@ class VQClipBackbone(nn.Module):
         Returns:
             dict mapping stage name → (B, C, Hs, Ws) feature map.
         """
-        return self._encoder(x)
+        feats = self._encoder(x)
+        # L2-normalize each spatial token to target_norm.
+        # This keeps features at a manageable scale for the transformer
+        # while having a benign backward (divides grads by ||x|| ≈ 10^6).
+        for k in list(feats.keys()):
+            feats[k] = self._l2_normalize(feats[k])
+        return feats
+
+    def _l2_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """L2-normalize feature vectors to self.target_norm.
+
+        For (B, C, H, W): normalizes over C dim at each spatial position.
+        """
+        if x.dim() == 4:
+            norm = x.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            return x / norm * self.target_norm
+        elif x.dim() == 2:
+            norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            return x / norm * self.target_norm
+        return x
 
     # ------------------------------------------------------------------ #
     #  Video encoding (T frames per clip)
@@ -109,6 +136,10 @@ class VQClipBackbone(nn.Module):
         # Fold T into B: (B*T, 3, H, W)
         flat = video.reshape(B * T, 3, H, W)
         feats_flat = self._encoder(flat)   # {stage: (B*T, C, Hs, Ws)}
+
+        # L2-normalize each spatial token to target_norm.
+        for k in list(feats_flat.keys()):
+            feats_flat[k] = self._l2_normalize(feats_flat[k])
 
         # Unfold back: (B, T, C, Hs, Ws)
         result: Dict[str, torch.Tensor] = {}
