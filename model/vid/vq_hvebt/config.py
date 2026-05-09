@@ -196,12 +196,20 @@ class VQHVEBTConfig:
 
 
 def _default_stages() -> List[VQStageConfig]:
-    """Three-stage hierarchy: s3 (coarsest) → s2 → s1 (finest)."""
+    """Three-stage hierarchy: s3 (coarsest) → s2 → s1 (finest).
+
+    Windowing defaults follow exponential scaling:
+      s3: temporal_window=4 (2²), spatial_window=None (8≤8 → full)
+      s2: temporal_window=2 (2¹), spatial_window=8
+      s1: temporal_window=1 (2⁰), spatial_window=8
+    """
     s3 = VQStageConfig(
         clip_stage_name="s3",
         clip_channels=512,
         H=8, W=8,
         transformer_dim=256, n_heads=4, n_layers=4,
+        temporal_window=4,
+        spatial_window=None,   # 8×8 grid → full spatial is fine
         codebook=VQCodebookConfig(num_codes=512, code_dim=512, ema_decay=0.99),
     )
     s2 = VQStageConfig(
@@ -209,6 +217,8 @@ def _default_stages() -> List[VQStageConfig]:
         clip_channels=256,
         H=16, W=16,
         transformer_dim=256, n_heads=4, n_layers=4,
+        temporal_window=2,
+        spatial_window=8,
         codebook=VQCodebookConfig(num_codes=512, code_dim=256, ema_decay=0.99),
     )
     s1 = VQStageConfig(
@@ -216,6 +226,8 @@ def _default_stages() -> List[VQStageConfig]:
         clip_channels=128,
         H=32, W=32,
         transformer_dim=256, n_heads=4, n_layers=4,
+        temporal_window=1,
+        spatial_window=8,
         codebook=VQCodebookConfig(num_codes=512, code_dim=128, ema_decay=0.99),
     )
     return [s3, s2, s1]

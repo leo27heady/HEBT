@@ -147,8 +147,32 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
     }
 
     stage_cfgs: List[VQStageConfig] = []
-    for stage_name in args.stages:
+    num_stages = len(args.stages)
+    for idx, stage_name in enumerate(args.stages):
         C, H, W = STAGE_INFO[stage_name]
+
+        # Per-stage windowing: auto_windowing assigns exponential temporal
+        # windows (finest=1, each coarser stage doubles) and spatial_window=8
+        # for stages with H>8. Explicit --temporal_window/--spatial_window
+        # override auto values for all stages.
+        if args.temporal_window is not None:
+            tw = args.temporal_window
+        elif args.auto_windowing and num_stages > 1:
+            # Stages are coarsest-first: idx=0 is coarsest, idx=num_stages-1 is finest.
+            # depth_from_finest: finest=0, next=1, coarsest=num_stages-1.
+            depth_from_finest = num_stages - 1 - idx
+            # Formula: w_t = min(2^depth, T). Finest gets 1, coarsest gets 2^(N-1).
+            tw = min(2 ** depth_from_finest, args.T)
+        else:
+            tw = None
+
+        if args.spatial_window is not None:
+            sw = args.spatial_window
+        elif args.auto_windowing and num_stages > 1 and H > 8:
+            sw = 8
+        else:
+            sw = None
+
         stage_cfgs.append(VQStageConfig(
             clip_stage_name=stage_name,
             clip_channels=C,
@@ -163,8 +187,8 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
             pred_head=args.pred_head,
             energy_bound=args.energy_bound,
             energy_reg_weight=args.energy_reg_weight,
-            temporal_window=args.temporal_window,
-            spatial_window=args.spatial_window,
+            temporal_window=tw,
+            spatial_window=sw,
             adaptive_mcmc=args.adaptive_mcmc,
             adaptive_mcmc_max_steps=args.adaptive_mcmc_max_steps,
             adaptive_mcmc_tol=args.adaptive_mcmc_tol,
@@ -596,10 +620,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adaptive_mcmc_step_penalty", type=float, default=0.0,
                    help="Weight for step-count regularizer (0=disabled)")
     # ---- Attention windowing (Improvement 1) ----
+    p.add_argument("--auto_windowing", action="store_true",
+                   help="Enable hierarchical per-stage windowing (exponential scaling: "
+                        "finest stage=temporal_window=1, each coarser stage doubles). "
+                        "spatial_window=8 for stages with H>8.")
     p.add_argument("--temporal_window", type=int, default=None,
-                   help="Temporal window for self-attention (None=full causal)")
+                   help="Override: apply same temporal window to ALL stages (None=use auto or full)")
     p.add_argument("--spatial_window", type=int, default=None,
-                   help="Spatial window for self-attention (None=full spatial)")
+                   help="Override: apply same spatial window to ALL stages (None=use auto or full)")
     # ---- Prediction head (F2/F3) ----
     p.add_argument("--pred_head", action="store_true", default=True,
                    help="F2/F3: Learned prediction head for MCMC warm-start (default: enabled)")
