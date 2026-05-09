@@ -95,6 +95,9 @@ class VQStageConfig:
     attn_bias: bool = False
     init_std: float = 0.02
     temporal_window: Optional[int] = None
+    spatial_window: Optional[int] = None  # None = full spatial attention.
+                                          # Integer w: each token attends within
+                                          # a w×w neighborhood centered on itself.
     codebook: VQCodebookConfig = field(default_factory=VQCodebookConfig)
     mcmc_steps: int = 20
     mcmc_step_size: float = 10.0
@@ -104,6 +107,13 @@ class VQStageConfig:
                                         # to unit norm. Makes step size invariant
                                         # to energy function's absolute scale.
     truncate_mcmc: bool = True
+    # Adaptive MCMC convergence (set adaptive_mcmc=True to enable).
+    adaptive_mcmc: bool = False             # False = fixed mcmc_steps.
+    adaptive_mcmc_max_steps: int = 50       # hard upper bound on iterations.
+    adaptive_mcmc_tol: float = 1e-3         # relative energy-change threshold.
+    adaptive_mcmc_patience: int = 3         # consecutive overshoots before halving α.
+    adaptive_mcmc_alpha_decay: float = 0.5  # α multiplier on overshoot.
+    adaptive_mcmc_step_penalty: float = 0.0 # weight for step-count regularizer.
     soft_target_tau: float = 0.0    # >0: use soft distance-based targets (smooth)
                                     # 0: use hard one-hot targets (default, works
                                     # when indices are stable via detach_pred_context)
@@ -169,6 +179,13 @@ class VQHVEBTConfig:
     decoder_loss_weight: float = 1.0
     decoder_out_size: int = 256
     detach_parent_kv: bool = True
+    bottom_up_grad_scale: float = 0.1   # Scale factor for gradient flowing from
+                                        # child through parent KV. Only active when
+                                        # detach_parent_kv=False. Prevents top stages
+                                        # from being overwhelmed by cascaded errors.
+    decoder_detach: bool = True         # If False, decoder loss gradient flows into
+                                        # the predictor (and up through hierarchy if
+                                        # detach_parent_kv=False).
     contrastive_loss_weight: float = 0.0
     encoder_warmup_steps: int = 200     # Freeze encoder for first N steps so
                                         # codebook + predictor converge to a stable

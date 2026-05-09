@@ -71,25 +71,64 @@ class HVEBTStageConfig:
 
 
 def build_block_causal_mask(
-    T: int, HW: int, device: torch.device, temporal_window: Optional[int] = None,
+    T: int,
+    HW_or_H: int,
+    device: torch.device,
+    temporal_window: Optional[int] = None,
+    *,
+    W: Optional[int] = None,
+    spatial_window: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Returns additive attention mask of shape (T*HW, T*HW): 0 where allowed, -inf where not.
 
+    Signature supports two calling conventions for backward compatibility:
+      - build_block_causal_mask(T, HW, device, ...)     — legacy (H*W as single int)
+      - build_block_causal_mask(T, H, device, ..., W=W)  — new (H and W separate)
+
+    When W is provided, HW_or_H is interpreted as H. Otherwise as H*W.
+
     By default (temporal_window=None or 0), token at frame tq can attend to
     tokens at frames tk <= tq (full causal).
 
-    With temporal_window=W (W >= 1): token at frame tq attends only to frames
-    max(0, tq-W+1) <= tk <= tq. So window=1 means self-frame only,
+    With temporal_window=k (k >= 1): token at frame tq attends only to frames
+    max(0, tq-k+1) <= tk <= tq. So window=1 means self-frame only,
     window=T means full causal.
+
+    With spatial_window=w (w >= 1, requires W to be set): token at (y,x) attends
+    only to tokens (y',x') where |y-y'| < w//2 and |x-x'| < w//2.
     """
-    idx = torch.arange(T * HW, device=device) // HW  # frame index per token
-    tq = idx[:, None]  # (N, 1)
-    tk = idx[None, :]  # (1, N)
+    if W is not None:
+        H = HW_or_H
+        HW = H * W
+    else:
+        HW = HW_or_H
+        H = HW  # can't separate H/W — spatial_window not usable
+        W_val = 1
+        if spatial_window is not None:
+            raise ValueError("spatial_window requires W to be specified (use keyword arg W=...)")
+
+    N = T * HW
+    idx = torch.arange(N, device=device)
+    t_idx = idx // HW
+
+    tq = t_idx[:, None]  # (N, 1)
+    tk = t_idx[None, :]  # (1, N)
     allowed = tq >= tk  # causal
+
     if temporal_window is not None and temporal_window >= 1:
         allowed = allowed & (tq - tk < temporal_window)
-    mask = torch.zeros(T * HW, T * HW, device=device, dtype=torch.float32)
+
+    if spatial_window is not None and spatial_window >= 1 and W is not None:
+        yx = idx % HW
+        y = yx // W
+        x = yx % W
+        yq, yk = y[:, None], y[None, :]
+        xq, xk = x[:, None], x[None, :]
+        half_w = spatial_window // 2
+        allowed = allowed & ((yq - yk).abs() < half_w) & ((xq - xk).abs() < half_w)
+
+    mask = torch.zeros(N, N, device=device, dtype=torch.float32)
     mask.masked_fill_(~allowed, float("-inf"))
     return mask
 

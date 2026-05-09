@@ -72,6 +72,31 @@ from model.vid.vq_hvebt.stage_predictor import VQHVEBTStage
 
 
 # --------------------------------------------------------------------------- #
+#  Gradient scaling for bottom-up flow
+# --------------------------------------------------------------------------- #
+
+
+class _GradScale(torch.autograd.Function):
+    """Scale gradient by a constant during backward pass (identity forward)."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.scale, None
+
+
+def grad_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Scale gradient magnitude without affecting forward pass."""
+    if scale == 1.0:
+        return x
+    return _GradScale.apply(x, scale)
+
+
+# --------------------------------------------------------------------------- #
 #  Output containers
 # --------------------------------------------------------------------------- #
 
@@ -91,6 +116,7 @@ class StageForwardResult:
     energy_trace: List[float]   # MCMC energy at each step
     final_logits: Optional[torch.Tensor] = None   # (B, T*H*W, K) final MCMC logits
     final_energy: Optional[torch.Tensor] = None   # (B, T*H*W) per-token energy
+    mcmc_steps_taken: Optional[int] = None         # adaptive MCMC: actual steps
 
 
 @dataclass
@@ -392,12 +418,23 @@ class VQHVEBTModel(nn.Module):
 
             # MCMC prediction with pred_head warm-start.
             predictor: VQHVEBTStage = self.predictors[name]
-            all_step_logits, pred_embed, energy_trace = predictor.run_mcmc(
-                real_ctx=real_ctx,
-                init_logits=None,
-                parent_context=par_ctx,
-                learning=self.training,
-            )
+            mcmc_steps_taken: Optional[int] = None
+            if stage_cfg.adaptive_mcmc:
+                all_step_logits, pred_embed, energy_trace, mcmc_steps_taken = (
+                    predictor.run_mcmc_adaptive(
+                        real_ctx=real_ctx,
+                        init_logits=None,
+                        parent_context=par_ctx,
+                        learning=self.training,
+                    )
+                )
+            else:
+                all_step_logits, pred_embed, energy_trace = predictor.run_mcmc(
+                    real_ctx=real_ctx,
+                    init_logits=None,
+                    parent_context=par_ctx,
+                    learning=self.training,
+                )
 
             Bs, Tc, C, Hs, Ws = pred_embed.shape
             N = Tc * Hs * Ws
@@ -460,10 +497,15 @@ class VQHVEBTModel(nn.Module):
                 contrastive_l = F.cross_entropy(-energy_stack, energy_targets)
                 l_pred = l_pred + self.cfg.contrastive_loss_weight * contrastive_l
 
+            # Adaptive MCMC step penalty (discourages long runs).
+            if stage_cfg.adaptive_mcmc and stage_cfg.adaptive_mcmc_step_penalty > 0 and mcmc_steps_taken is not None:
+                step_pen = stage_cfg.adaptive_mcmc_step_penalty * mcmc_steps_taken
+                l_pred = l_pred + step_pen
+
             if self.cfg.detach_parent_kv:
                 parent_pred = pred_embed.detach()
             else:
-                parent_pred = pred_embed
+                parent_pred = pred_embed  # grad_scale(pred_embed, self.cfg.bottom_up_grad_scale)
 
             # Compute per-token energy for diagnostics (energy maps).
             with torch.no_grad():
@@ -483,6 +525,7 @@ class VQHVEBTModel(nn.Module):
                 energy_trace=energy_trace,
                 final_logits=all_step_logits[-1].detach(),
                 final_energy=final_energy.detach(),
+                mcmc_steps_taken=mcmc_steps_taken,
             )
             stage_results[name] = sr
 
@@ -509,13 +552,14 @@ class VQHVEBTModel(nn.Module):
         if self.decoder is not None:
             finest_name = self.cfg.stages[-1].clip_stage_name
             finest_pred = stage_results[finest_name].pred_embed   # (B, T, C, H, W)
-            # Decoder is a diagnostic tool: detach so decoder gradient does
-            # NOT back-propagate into the quantizer or predictor.
-            finest_pred_det = finest_pred.detach()
+            # Detach by default so decoder gradient does NOT back-propagate
+            # into the predictor. Set decoder_detach=False to enable flow.
+            if self.cfg.decoder_detach:
+                finest_pred = finest_pred.detach()
 
             # Flatten (B, T, C, H, W) → (B*T, C, H, W) for conv decoder.
             BT = B * T
-            dec_in = finest_pred_det.reshape(BT, *finest_pred_det.shape[2:])
+            dec_in = finest_pred.reshape(BT, *finest_pred.shape[2:])
             pred_rgb_flat = self.decoder(dec_in)   # (B*T, 3, H_out, W_out)
             pred_rgb = pred_rgb_flat.reshape(B, T, 3, *pred_rgb_flat.shape[2:])
 
@@ -689,6 +733,13 @@ class VQHVEBTModel(nn.Module):
             if sr.energy_trace:
                 metrics[f"{name}/energy_step0"] = sr.energy_trace[0]
                 metrics[f"{name}/energy_final"] = sr.energy_trace[-1]
+
+            # Adaptive MCMC step count.
+            if sr.mcmc_steps_taken is not None:
+                metrics[f"{name}/mcmc_steps"] = float(sr.mcmc_steps_taken)
+                scfg = next((s for s in self.cfg.stages if s.clip_stage_name == name), None)
+                if scfg is not None:
+                    metrics[f"{name}/mcmc_converged"] = 1.0 if sr.mcmc_steps_taken < scfg.adaptive_mcmc_max_steps else 0.0
         if dec_loss is not None:
             metrics["decoder/loss"] = dec_loss.item()
         return metrics

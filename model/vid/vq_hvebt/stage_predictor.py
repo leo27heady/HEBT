@@ -240,8 +240,10 @@ class VQHVEBTStage(nn.Module):
         m = self._mask_cache.get(key)
         if m is None:
             m = build_block_causal_mask(
-                T, self.cfg.H * self.cfg.W, device,
+                T, self.cfg.H, device,
                 temporal_window=self.cfg.temporal_window,
+                W=self.cfg.W,
+                spatial_window=self.cfg.spatial_window,
             )
             self._mask_cache[key] = m
         return m
@@ -491,3 +493,131 @@ class VQHVEBTStage(nn.Module):
         z_pred_final = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
         return all_step_logits, z_pred_final, energy_trace
+
+    # ------------------------------------------------------------------ #
+    #  Adaptive MCMC (run until convergence)
+    # ------------------------------------------------------------------ #
+
+    def run_mcmc_adaptive(
+        self,
+        real_ctx: torch.Tensor,                          # (B, T, C, H, W)
+        init_logits: Optional[torch.Tensor] = None,
+        parent_context: Optional[torch.Tensor] = None,
+        learning: bool = True,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, List[float], int]:
+        """Adaptive MCMC: iterate until energy converges, then one final step with graph.
+
+        Phase 1: run without computation graph until convergence (relative energy
+                  change < tol) or max_steps reached. On consecutive overshoots,
+                  halve step size.
+        Phase 2: one step with create_graph=True to produce differentiable logits.
+
+        Returns:
+            all_step_logits : [pred_head_logits (if pred_head), final_logits].
+            final_embed     : (B, T, C, H, W).
+            energy_trace    : per-step summed energy.
+            num_steps       : total steps taken (for metrics / step penalty).
+        """
+        B, T, C, H, W = real_ctx.shape
+        N = T * H * W
+        K = self.cfg.codebook.num_codes
+        device = real_ctx.device
+        cfg = self.cfg
+
+        all_step_logits: List[torch.Tensor] = []
+
+        # ---- Initialise logits -------------------------------------------- #
+        if init_logits is not None:
+            pred_logits = init_logits.clone()
+        elif self.pred_head is not None:
+            pred_logits = self._compute_init_logits(real_ctx, parent_context)
+            all_step_logits.append(pred_logits)
+        else:
+            pred_logits = torch.zeros(B, N, K, device=device, dtype=real_ctx.dtype)
+
+        alpha = torch.clamp(self.alpha, min=1e-6)
+        use_per_token_norm = cfg.mcmc_per_token_norm
+        max_steps = cfg.adaptive_mcmc_max_steps
+        tol = cfg.adaptive_mcmc_tol
+        patience = cfg.adaptive_mcmc_patience
+        alpha_decay = cfg.adaptive_mcmc_alpha_decay
+
+        energy_trace: List[float] = []
+        prev_energy_val: Optional[float] = None
+        overshoot_count = 0
+        converge_step = 0
+
+        # ---- Phase 1: iterate without graph until convergence ------------- #
+        with torch.set_grad_enabled(True):
+            for step in range(max_steps - 1):
+                pred_logits = pred_logits.detach().requires_grad_(True)
+
+                z_pred_flat = self.quantizer.decode_logits(pred_logits)
+                z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
+                energy = self.forward_energy(real_ctx, z_pred, parent_context)
+                energy_val = energy.detach().sum().item()
+                energy_trace.append(energy_val)
+
+                # Convergence check.
+                if prev_energy_val is not None:
+                    rel = abs(energy_val - prev_energy_val) / (abs(prev_energy_val) + 1e-8)
+                    if rel < tol:
+                        converge_step = step
+                        break
+                    # Overshoot detection.
+                    if energy_val > prev_energy_val:
+                        overshoot_count += 1
+                        if overshoot_count >= patience:
+                            alpha = alpha * alpha_decay
+                            overshoot_count = 0
+                    else:
+                        overshoot_count = 0
+                prev_energy_val = energy_val
+
+                grad = torch.autograd.grad(
+                    [energy.sum()], [pred_logits], create_graph=False
+                )[0]
+                if torch.isnan(grad).any() or torch.isinf(grad).any():
+                    converge_step = step
+                    break
+
+                if use_per_token_norm:
+                    grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    grad = grad / grad_norm
+                elif cfg.mcmc_grad_clamp > 0:
+                    grad = torch.clamp(grad, min=-cfg.mcmc_grad_clamp, max=cfg.mcmc_grad_clamp)
+
+                pred_logits = (pred_logits - alpha * grad).detach()
+            else:
+                converge_step = max_steps - 1
+
+        # ---- Phase 2: one final step WITH graph --------------------------- #
+        pred_logits = pred_logits.detach().requires_grad_(True)
+
+        with torch.enable_grad():
+            z_pred_flat = self.quantizer.decode_logits(pred_logits)
+            z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
+            energy = self.forward_energy(real_ctx, z_pred, parent_context)
+            energy_trace.append(energy.detach().sum().item())
+
+            create_graph = learning
+            grad = torch.autograd.grad(
+                [energy.sum()], [pred_logits],
+                create_graph=create_graph, retain_graph=create_graph,
+            )[0]
+
+            if use_per_token_norm:
+                grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                grad = grad / grad_norm
+            elif cfg.mcmc_grad_clamp > 0:
+                grad = torch.clamp(grad, min=-cfg.mcmc_grad_clamp, max=cfg.mcmc_grad_clamp)
+
+            final_logits = pred_logits - alpha * grad
+            all_step_logits.append(final_logits)
+
+        # Decode final logits → final embedding.
+        z_pred_flat = self.quantizer.decode_logits(final_logits)
+        z_pred_final = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
+
+        num_steps = converge_step + 1  # +1 for the final graph step
+        return all_step_logits, z_pred_final, energy_trace, num_steps

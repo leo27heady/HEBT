@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import random
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -162,6 +163,13 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
             pred_head=args.pred_head,
             energy_bound=args.energy_bound,
             energy_reg_weight=args.energy_reg_weight,
+            temporal_window=args.temporal_window,
+            spatial_window=args.spatial_window,
+            adaptive_mcmc=args.adaptive_mcmc,
+            adaptive_mcmc_max_steps=args.adaptive_mcmc_max_steps,
+            adaptive_mcmc_tol=args.adaptive_mcmc_tol,
+            adaptive_mcmc_patience=args.adaptive_mcmc_patience,
+            adaptive_mcmc_step_penalty=args.adaptive_mcmc_step_penalty,
             codebook=VQCodebookConfig(
                 num_codes=args.num_codes,
                 code_dim=C,
@@ -185,6 +193,9 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         use_decoder=args.use_decoder,
         contrastive_loss_weight=args.contrastive_loss_weight,
         encoder_warmup_steps=args.encoder_warmup_steps,
+        detach_parent_kv=args.detach_parent_kv,
+        bottom_up_grad_scale=args.bottom_up_grad_scale,
+        decoder_detach=args.decoder_detach,
     )
     model = VQHVEBTModel(cfg).to(device)
     return model
@@ -256,6 +267,82 @@ def save_pred_images(pred_rgb: torch.Tensor, gt_batch: torch.Tensor,
         save_image(energy_rgb, save_dir / f"step_{step:06d}_energy_{name}.png", nrow=T)
 
 
+def save_entropy_maps(
+    stage_results: dict,
+    stage_configs: Dict[str, VQStageConfig],
+    step: int,
+    save_dir: Path,
+    pred_frame_size: Tuple[int, int],
+) -> None:
+    """Save per-stage entropy maps as grayscale images.
+
+    White = low entropy (certain), Black = high entropy (uncertain).
+    """
+    save_dir.mkdir(parents=True, exist_ok=True)
+    for name, sr in stage_results.items():
+        if sr.final_logits is None:
+            continue
+        cfg = stage_configs[name]
+        K = cfg.codebook.num_codes
+        H_s, W_s = cfg.H, cfg.W
+        if H_s < 2 or W_s < 2:
+            continue
+
+        T = sr.final_logits.shape[1] // (H_s * W_s)
+
+        # Shannon entropy in bits.
+        probs = torch.softmax(sr.final_logits[0], dim=-1)            # (N, K)
+        log_probs = torch.log2(probs + 1e-10)
+        entropy = -(probs * log_probs).sum(dim=-1)                   # (N,)
+        max_entropy = math.log2(K)
+
+        # 1 = certain (white), 0 = uncertain (black).
+        entropy_norm = (1.0 - (entropy / max_entropy).clamp(0, 1))
+
+        entropy_map = entropy_norm.reshape(T, H_s, W_s).unsqueeze(1)  # (T, 1, H, W)
+        entropy_map = nn.functional.interpolate(entropy_map, size=pred_frame_size, mode="nearest")
+        entropy_rgb = entropy_map.repeat(1, 3, 1, 1)
+        save_image(entropy_rgb, save_dir / f"step_{step:06d}_entropy_{name}.png", nrow=T)
+
+
+def save_energy_maps(
+    stage_results: dict,
+    stage_configs: Dict[str, VQStageConfig],
+    step: int,
+    save_dir: Path,
+    pred_frame_size: Tuple[int, int],
+) -> None:
+    """Save per-stage energy maps with principled normalization.
+
+    With bounded energy: black = -B, gray = 0, white = +B.
+    With unbounded energy: per-batch [min, max] normalization.
+    """
+    save_dir.mkdir(parents=True, exist_ok=True)
+    for name, sr in stage_results.items():
+        if sr.final_energy is None:
+            continue
+        cfg = stage_configs[name]
+        H_s, W_s = cfg.H, cfg.W
+        if H_s < 2 or W_s < 2:
+            continue
+
+        T = sr.final_energy.shape[1] // (H_s * W_s)
+        energy = sr.final_energy[0]
+
+        bound = cfg.energy_bound
+        if bound > 0:
+            energy_norm = (energy + bound) / (2 * bound)
+        else:
+            e_min, e_max = energy.min(), energy.max()
+            energy_norm = (energy - e_min) / (e_max - e_min + 1e-8)
+
+        energy_norm = energy_norm.clamp(0, 1)
+        energy_map = energy_norm.reshape(T, H_s, W_s).unsqueeze(1)
+        energy_map = nn.functional.interpolate(energy_map, size=pred_frame_size, mode="nearest")
+        energy_rgb = energy_map.repeat(1, 3, 1, 1)
+        save_image(energy_rgb, save_dir / f"step_{step:06d}_energy_bounded_{name}.png", nrow=T)
+
+
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
@@ -299,6 +386,13 @@ def train(args: argparse.Namespace) -> None:
             img_dir = (log_dir or Path("logs/_images")) / "predictions"
             img_dir.mkdir(parents=True, exist_ok=True)
             print(f"[VQ-HVEBT] Saving predicted images every {args.save_images_every} steps to {img_dir}")
+
+    # Build stage name → config map for entropy/energy map functions.
+    stage_configs_map: Dict[str, VQStageConfig] = {
+        sc.clip_stage_name: sc for sc in model.cfg.stages
+    }
+    # Predicted frame size (for upscaling maps) — use decoder output size or image_size.
+    pred_frame_size = (args.image_size, args.image_size)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -356,6 +450,8 @@ def train(args: argparse.Namespace) -> None:
                 if out.pred_rgb is not None:
                     save_pred_images(out.pred_rgb.detach(), fixed_batch.detach(),
                                      out.stage_results, step, img_dir)
+                save_entropy_maps(out.stage_results, stage_configs_map, step, img_dir, pred_frame_size)
+                save_energy_maps(out.stage_results, stage_configs_map, step, img_dir, pred_frame_size)
 
         if csv_file:
             csv_file.close()
@@ -437,6 +533,8 @@ def train(args: argparse.Namespace) -> None:
                 if out.pred_rgb is not None:
                     save_pred_images(out.pred_rgb.detach(), batch.detach(),
                                      out.stage_results, step, img_dir)
+                save_entropy_maps(out.stage_results, stage_configs_map, step, img_dir, pred_frame_size)
+                save_energy_maps(out.stage_results, stage_configs_map, step, img_dir, pred_frame_size)
 
     if csv_file:
         csv_file.close()
@@ -486,6 +584,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_mcmc_per_token_norm", dest="mcmc_per_token_norm", action="store_false")
     p.add_argument("--soft_target_tau", type=float, default=0.0,
                    help="Soft target temperature (>0: smooth distance-based targets, 0: hard one-hot)")
+    # ---- Adaptive MCMC (Improvement 2) ----
+    p.add_argument("--adaptive_mcmc", action="store_true",
+                   help="Enable adaptive MCMC convergence (run until energy converges)")
+    p.add_argument("--adaptive_mcmc_max_steps", type=int, default=50,
+                   help="Hard upper bound on adaptive MCMC iterations")
+    p.add_argument("--adaptive_mcmc_tol", type=float, default=1e-3,
+                   help="Relative energy-change threshold for convergence")
+    p.add_argument("--adaptive_mcmc_patience", type=int, default=3,
+                   help="Consecutive overshoots before halving step size")
+    p.add_argument("--adaptive_mcmc_step_penalty", type=float, default=0.0,
+                   help="Weight for step-count regularizer (0=disabled)")
+    # ---- Attention windowing (Improvement 1) ----
+    p.add_argument("--temporal_window", type=int, default=None,
+                   help="Temporal window for self-attention (None=full causal)")
+    p.add_argument("--spatial_window", type=int, default=None,
+                   help="Spatial window for self-attention (None=full spatial)")
     # ---- Prediction head (F2/F3) ----
     p.add_argument("--pred_head", action="store_true", default=True,
                    help="F2/F3: Learned prediction head for MCMC warm-start (default: enabled)")
@@ -495,6 +609,13 @@ def parse_args() -> argparse.Namespace:
                    help="F1: Bound energy via tanh to [-bound, +bound]. 0=unbounded.")
     p.add_argument("--energy_reg_weight", type=float, default=0.01,
                    help="F1: Energy regularization weight (λ * energy².mean()). 0=disabled.")
+    # ---- Bottom-up gradient flow (Improvement 3) ----
+    p.add_argument("--no_detach_parent_kv", dest="detach_parent_kv", action="store_false",
+                   default=True, help="Enable bottom-up gradient flow through parent KV")
+    p.add_argument("--bottom_up_grad_scale", type=float, default=0.1,
+                   help="Gradient scale for bottom-up flow (only when --no_detach_parent_kv)")
+    p.add_argument("--no_decoder_detach", dest="decoder_detach", action="store_false",
+                   default=True, help="Let decoder loss gradient flow into predictor")
     # ---- Training ----
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--T", type=int, default=4,
