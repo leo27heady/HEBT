@@ -6,11 +6,11 @@ vector quantizers (VQ-VAE style) and EBT predictors that model future
 quantized latent states via MCMC.
 
 Hierarchy (three stages, coarsest first in prediction order):
-    s3:  512 channels, 8x8 spatial   (coarsest / apex)
-    s2:  256 channels, 16x16 spatial
-    s1:  128 channels, 32x32 spatial  (finest / base)
+    s3:  256 channels, 2x2 spatial   (coarsest / apex)
+    s2:  128 channels, 4x4 spatial
+    s1:   64 channels, 8x8 spatial   (finest / base)
 
-CLIP spatial sizes assume 256x256 input frames.
+Spatial sizes assume 64x64 input frames with base_channels=32 encoder.
 """
 from __future__ import annotations
 
@@ -173,11 +173,16 @@ class VQHVEBTConfig:
     encoder_lr_scale: float = 1.0       # encoder LR relative to predictor
     weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
     use_custom_encoder: bool = True     # Option B: use small ConvEncoder instead of CLIP
-    encoder_base_channels: int = 64     # stem width for ConvEncoder (64 → ~2M params)
+    encoder_base_channels: int = 32     # stem width for ConvEncoder (32 → ~1.3M params)
     ema_target_decay: float = 0.999     # EMA decay for target encoder (BYOL/DINO style)
     use_decoder: bool = False
     decoder_loss_weight: float = 1.0
-    decoder_out_size: int = 256
+    decoder_out_size: int = 64          # output pixel size of the decoder
+    decoder_only_loss: bool = False     # If True, train only via decoder pixel loss.
+                                        # Disables per-stage CE loss (pred_loss_weight=0),
+                                        # forces decoder_detach=False and
+                                        # detach_parent_kv=False so gradient flows
+                                        # from decoder through entire hierarchy.
     detach_parent_kv: bool = True
     bottom_up_grad_scale: float = 0.1   # Scale factor for gradient flowing from
                                         # child through parent KV. Only active when
@@ -194,40 +199,46 @@ class VQHVEBTConfig:
                                         # loss gradient bomb, so we can let prediction
                                         # loss flow into the encoder via context too.
 
+    def __post_init__(self):
+        if self.decoder_only_loss:
+            self.use_decoder = True
+            self.decoder_detach = False
+            self.detach_parent_kv = False
+
 
 def _default_stages() -> List[VQStageConfig]:
-    """Three-stage hierarchy: s3 (coarsest) → s2 → s1 (finest).
+    """Three-stage hierarchy for 64×64 images: s3 (coarsest) → s2 → s1 (finest).
 
-    Windowing defaults follow exponential scaling:
-      s3: temporal_window=4 (2²), spatial_window=None (8≤8 → full)
-      s2: temporal_window=2 (2¹), spatial_window=8
-      s1: temporal_window=1 (2⁰), spatial_window=8
+    With base_channels=32 encoder on 64×64 input:
+      s3: 256 ch, 2×2, temporal_window=4 (full for T≤4)
+      s2: 128 ch, 4×4, temporal_window=2
+      s1:  64 ch, 8×8, temporal_window=1 (self-frame only)
     """
     s3 = VQStageConfig(
         clip_stage_name="s3",
-        clip_channels=512,
-        H=8, W=8,
-        transformer_dim=256, n_heads=4, n_layers=4,
+        clip_channels=256,
+        H=2, W=2,
+        transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=4,
-        spatial_window=None,   # 8×8 grid → full spatial is fine
-        codebook=VQCodebookConfig(num_codes=512, code_dim=512, ema_decay=0.99),
+        spatial_window=None,   # 2×2 grid → full spatial always
+        codebook=VQCodebookConfig(num_codes=256, code_dim=256, ema_decay=0.99),
     )
     s2 = VQStageConfig(
         clip_stage_name="s2",
-        clip_channels=256,
-        H=16, W=16,
-        transformer_dim=256, n_heads=4, n_layers=4,
+        clip_channels=128,
+        H=4, W=4,
+        transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=2,
-        spatial_window=8,
-        codebook=VQCodebookConfig(num_codes=512, code_dim=256, ema_decay=0.99),
+        spatial_window=None,   # 4×4 grid → spatial window not needed
+        codebook=VQCodebookConfig(num_codes=256, code_dim=128, ema_decay=0.99),
     )
     s1 = VQStageConfig(
         clip_stage_name="s1",
-        clip_channels=128,
-        H=32, W=32,
-        transformer_dim=256, n_heads=4, n_layers=4,
+        clip_channels=64,
+        H=8, W=8,
+        transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=1,
-        spatial_window=8,
-        codebook=VQCodebookConfig(num_codes=512, code_dim=128, ema_decay=0.99),
+        spatial_window=None,   # 8×8 grid → full spatial ok at this size
+        codebook=VQCodebookConfig(num_codes=256, code_dim=64, ema_decay=0.99),
     )
     return [s3, s2, s1]

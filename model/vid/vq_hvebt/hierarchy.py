@@ -117,6 +117,7 @@ class StageForwardResult:
     final_logits: Optional[torch.Tensor] = None   # (B, T*H*W, K) final MCMC logits
     final_energy: Optional[torch.Tensor] = None   # (B, T*H*W) per-token energy
     mcmc_steps_taken: Optional[int] = None         # adaptive MCMC: actual steps
+    mcmc_stop_reason: Optional[str] = None         # "converged" | "max_steps" | "nan_grad"
 
 
 @dataclass
@@ -419,8 +420,9 @@ class VQHVEBTModel(nn.Module):
             # MCMC prediction with pred_head warm-start.
             predictor: VQHVEBTStage = self.predictors[name]
             mcmc_steps_taken: Optional[int] = None
+            mcmc_stop_reason: Optional[str] = None
             if stage_cfg.adaptive_mcmc:
-                all_step_logits, pred_embed, energy_trace, mcmc_steps_taken = (
+                all_step_logits, pred_embed, energy_trace, mcmc_steps_taken, mcmc_stop_reason = (
                     predictor.run_mcmc_adaptive(
                         real_ctx=real_ctx,
                         init_logits=None,
@@ -441,66 +443,66 @@ class VQHVEBTModel(nn.Module):
             K = stage_cfg.codebook.num_codes
             tgt_idx_flat = target_indices.reshape(Bs, N)
 
-            use_soft = stage_cfg.soft_target_tau > 0
-
-            if use_soft:
-                z_e_future = z_e_5d[:, 1:]
-                z_e_future_flat = z_e_future.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
-                cb_weight = self.quantizers[name].codebook.weight
-                z_e_det = z_e_future_flat.detach()
-                cb_det = cb_weight.detach()
-
-            # Compute CE loss only on logits with live computation graphs.
-            # With truncate_mcmc=True: only pred_head (first) and last MCMC
-            # step have graphs. Intermediate steps are detached — computing
-            # CE on them dilutes the gradient by ~10× without benefit.
-            if stage_cfg.truncate_mcmc:
-                has_pred_head = predictor.pred_head is not None and len(all_step_logits) > 1
-                ce_logits = []
-                if has_pred_head:
-                    ce_logits.append(all_step_logits[0])   # pred_head output
-                ce_logits.append(all_step_logits[-1])      # last MCMC step
+            # ---- Per-stage prediction loss -------------------------------- #
+            # In decoder_only_loss mode, skip per-stage CE/energy/contrastive.
+            # The only training signal comes from the decoder pixel loss.
+            if self.cfg.decoder_only_loss:
+                l_pred = torch.tensor(0.0, device=pred_embed.device)
             else:
-                # All steps have create_graph=True → all contribute gradient.
-                ce_logits = all_step_logits
+                use_soft = stage_cfg.soft_target_tau > 0
 
-            l_pred = torch.tensor(0.0, device=pred_embed.device)
-            for step_logits in ce_logits:
                 if use_soft:
-                    l_pred = l_pred + soft_ce_prediction_loss(
-                        step_logits, z_e_det, cb_det,
-                        tau=stage_cfg.soft_target_tau,
-                    )
+                    z_e_future = z_e_5d[:, 1:]
+                    z_e_future_flat = z_e_future.permute(0, 1, 3, 4, 2).reshape(Bs, N, C)
+                    cb_weight = self.quantizers[name].codebook.weight
+                    z_e_det = z_e_future_flat.detach()
+                    cb_det = cb_weight.detach()
+
+                # Compute CE loss only on logits with live computation graphs.
+                if stage_cfg.truncate_mcmc:
+                    has_pred_head = predictor.pred_head is not None and len(all_step_logits) > 1
+                    ce_logits = []
+                    if has_pred_head:
+                        ce_logits.append(all_step_logits[0])   # pred_head output
+                    ce_logits.append(all_step_logits[-1])      # last MCMC step
                 else:
-                    l_pred = l_pred + ce_prediction_loss(step_logits, tgt_idx_flat)
-            l_pred = l_pred / max(len(ce_logits), 1)
+                    ce_logits = all_step_logits
 
-            # F1: Energy regularization — penalize large energy magnitudes.
-            if stage_cfg.energy_reg_weight > 0 and energy_trace:
-                # Use the last MCMC step's energy for regularization.
-                # Re-compute to get it in the graph.
-                z_pred_last_flat = self.quantizers[name].decode_logits(all_step_logits[-1])
-                z_pred_last = z_pred_last_flat.reshape(Bs, Tc, Hs, Ws, C).permute(0, 1, 4, 2, 3).contiguous()
-                energy_for_reg = predictor.forward_energy(real_ctx, z_pred_last.detach(), par_ctx)
-                energy_reg = stage_cfg.energy_reg_weight * energy_for_reg.pow(2).mean()
-                l_pred = l_pred + energy_reg
+                l_pred = torch.tensor(0.0, device=pred_embed.device)
+                for step_logits in ce_logits:
+                    if use_soft:
+                        l_pred = l_pred + soft_ce_prediction_loss(
+                            step_logits, z_e_det, cb_det,
+                            tau=stage_cfg.soft_target_tau,
+                        )
+                    else:
+                        l_pred = l_pred + ce_prediction_loss(step_logits, tgt_idx_flat)
+                l_pred = l_pred / max(len(ce_logits), 1)
 
-            # Contrastive energy loss.
-            if self.cfg.contrastive_loss_weight > 0 and self.training:
-                true_embed = qout.z_q[:, 1:].detach()
-                true_energy = predictor.forward_energy(real_ctx, true_embed, par_ctx)
-                pred_energy = predictor.forward_energy(
-                    real_ctx, pred_embed.detach(), par_ctx
-                )
-                energy_stack = torch.stack([true_energy.sum(-1), pred_energy.sum(-1)], dim=-1)
-                energy_targets = torch.zeros(Bs, dtype=torch.long, device=pred_embed.device)
-                contrastive_l = F.cross_entropy(-energy_stack, energy_targets)
-                l_pred = l_pred + self.cfg.contrastive_loss_weight * contrastive_l
+                # F1: Energy regularization — penalize large energy magnitudes.
+                if stage_cfg.energy_reg_weight > 0 and energy_trace:
+                    z_pred_last_flat = self.quantizers[name].decode_logits(all_step_logits[-1])
+                    z_pred_last = z_pred_last_flat.reshape(Bs, Tc, Hs, Ws, C).permute(0, 1, 4, 2, 3).contiguous()
+                    energy_for_reg = predictor.forward_energy(real_ctx, z_pred_last.detach(), par_ctx)
+                    energy_reg = stage_cfg.energy_reg_weight * energy_for_reg.pow(2).mean()
+                    l_pred = l_pred + energy_reg
 
-            # Adaptive MCMC step penalty (discourages long runs).
-            if stage_cfg.adaptive_mcmc and stage_cfg.adaptive_mcmc_step_penalty > 0 and mcmc_steps_taken is not None:
-                step_pen = stage_cfg.adaptive_mcmc_step_penalty * mcmc_steps_taken
-                l_pred = l_pred + step_pen
+                # Contrastive energy loss.
+                if self.cfg.contrastive_loss_weight > 0 and self.training:
+                    true_embed = qout.z_q[:, 1:].detach()
+                    true_energy = predictor.forward_energy(real_ctx, true_embed, par_ctx)
+                    pred_energy = predictor.forward_energy(
+                        real_ctx, pred_embed.detach(), par_ctx
+                    )
+                    energy_stack = torch.stack([true_energy.sum(-1), pred_energy.sum(-1)], dim=-1)
+                    energy_targets = torch.zeros(Bs, dtype=torch.long, device=pred_embed.device)
+                    contrastive_l = F.cross_entropy(-energy_stack, energy_targets)
+                    l_pred = l_pred + self.cfg.contrastive_loss_weight * contrastive_l
+
+                # Adaptive MCMC step penalty (discourages long runs).
+                if stage_cfg.adaptive_mcmc and stage_cfg.adaptive_mcmc_step_penalty > 0 and mcmc_steps_taken is not None:
+                    step_pen = stage_cfg.adaptive_mcmc_step_penalty * mcmc_steps_taken
+                    l_pred = l_pred + step_pen
 
             if self.cfg.detach_parent_kv:
                 parent_pred = pred_embed.detach()
@@ -526,6 +528,7 @@ class VQHVEBTModel(nn.Module):
                 final_logits=all_step_logits[-1].detach(),
                 final_energy=final_energy.detach(),
                 mcmc_steps_taken=mcmc_steps_taken,
+                mcmc_stop_reason=mcmc_stop_reason,
             )
             stage_results[name] = sr
 
@@ -734,12 +737,20 @@ class VQHVEBTModel(nn.Module):
                 metrics[f"{name}/energy_step0"] = sr.energy_trace[0]
                 metrics[f"{name}/energy_final"] = sr.energy_trace[-1]
 
-            # Adaptive MCMC step count.
+            # Adaptive MCMC step count and stop reason.
             if sr.mcmc_steps_taken is not None:
                 metrics[f"{name}/mcmc_steps"] = float(sr.mcmc_steps_taken)
                 scfg = next((s for s in self.cfg.stages if s.clip_stage_name == name), None)
                 if scfg is not None:
                     metrics[f"{name}/mcmc_converged"] = 1.0 if sr.mcmc_steps_taken < scfg.adaptive_mcmc_max_steps else 0.0
+            if sr.mcmc_stop_reason is not None:
+                # Encode as: converged=1, max_steps=0, nan_grad=-1.
+                reason_map = {"converged": 1.0, "max_steps": 0.0, "nan_grad": -1.0}
+                metrics[f"{name}/mcmc_stop_reason"] = reason_map.get(sr.mcmc_stop_reason, 0.0)
+
+            # Energy decrease: first energy minus last (positive = energy went down).
+            if len(sr.energy_trace) >= 2:
+                metrics[f"{name}/energy_decrease"] = sr.energy_trace[0] - sr.energy_trace[-1]
         if dec_loss is not None:
             metrics["decoder/loss"] = dec_loss.item()
         return metrics

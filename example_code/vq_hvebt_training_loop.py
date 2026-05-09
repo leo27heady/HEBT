@@ -139,11 +139,12 @@ def build_dataset(args: argparse.Namespace) -> VIDShapeSyntheticDataset:
 
 def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
     """Construct VQ-HVEBT model with selected stages."""
+    # Spatial sizes for 64×64 input with base_channels=32 encoder.
     STAGE_INFO = {
-        "s1": (128, 32, 32),
-        "s2": (256, 16, 16),
-        "s3": (512,  8,  8),
-        "s_pool": (512, 1, 1),
+        "s1": (64,   8,  8),
+        "s2": (128,  4,  4),
+        "s3": (256,  2,  2),
+        "s_pool": (256, 1, 1),
     }
 
     stage_cfgs: List[VQStageConfig] = []
@@ -215,11 +216,13 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         encoder_base_channels=args.encoder_base_channels,
         ema_target_decay=args.ema_target_decay,
         use_decoder=args.use_decoder,
+        decoder_out_size=args.image_size,
         contrastive_loss_weight=args.contrastive_loss_weight,
         encoder_warmup_steps=args.encoder_warmup_steps,
         detach_parent_kv=args.detach_parent_kv,
         bottom_up_grad_scale=args.bottom_up_grad_scale,
         decoder_detach=args.decoder_detach,
+        decoder_only_loss=args.decoder_only_loss,
     )
     model = VQHVEBTModel(cfg).to(device)
     return model
@@ -370,6 +373,15 @@ def save_energy_maps(
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
+
+    # ---- decoder_only_loss implies several flags -------------------------- #
+    if args.decoder_only_loss:
+        args.use_decoder = True
+        args.decoder_detach = False
+        args.detach_parent_kv = False
+        args.pred_head = False         # no CE loss → pred_head is useless
+        print("[VQ-HVEBT] decoder_only_loss: enabled decoder, disabled pred_head, "
+              "enabled bottom-up gradient flow")
 
     print(f"[VQ-HVEBT] Building model on {device} (stages: {args.stages}) ...")
     model = build_model(args, device)
@@ -583,12 +595,12 @@ def parse_args() -> argparse.Namespace:
                    help="Use custom ConvEncoder instead of CLIP (Option B, default: enabled)")
     p.add_argument("--use_clip_encoder", dest="use_custom_encoder", action="store_false",
                    help="Use pretrained CLIP backbone instead of custom ConvEncoder")
-    p.add_argument("--encoder_base_channels", type=int, default=64,
-                   help="Stem width for custom ConvEncoder (64 → ~2M params)")
+    p.add_argument("--encoder_base_channels", type=int, default=32,
+                   help="Stem width for custom ConvEncoder (32 → ~1.3M params)")
     p.add_argument("--ema_target_decay", type=float, default=0.999,
                    help="EMA decay for target encoder (BYOL/DINO style, 0.999 → 1000-step half-life)")
     # ---- VQ codebook ----
-    p.add_argument("--num_codes", type=int, default=512)
+    p.add_argument("--num_codes", type=int, default=256)
     p.add_argument("--ema_decay", type=float, default=0.99,
                    help="EMA decay for codebook updates (0.99-0.999)")
     p.add_argument("--dead_code_reset", action="store_true", default=True,
@@ -596,9 +608,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_dead_code_reset", dest="dead_code_reset", action="store_false",
                    help="Disable dead code reset")
     # ---- Transformer / predictor ----
-    p.add_argument("--transformer_dim", type=int, default=256)
-    p.add_argument("--n_heads", type=int, default=4)
-    p.add_argument("--n_layers", type=int, default=4)
+    p.add_argument("--transformer_dim", type=int, default=64)
+    p.add_argument("--n_heads", type=int, default=2)
+    p.add_argument("--n_layers", type=int, default=2)
     # ---- MCMC ----
     p.add_argument("--mcmc_steps", type=int, default=20)
     p.add_argument("--mcmc_step_size", type=float, default=1.0,
@@ -644,11 +656,14 @@ def parse_args() -> argparse.Namespace:
                    help="Gradient scale for bottom-up flow (only when --no_detach_parent_kv)")
     p.add_argument("--no_decoder_detach", dest="decoder_detach", action="store_false",
                    default=True, help="Let decoder loss gradient flow into predictor")
+    p.add_argument("--decoder_only_loss", action="store_true",
+                   help="Train only via decoder pixel loss (disables per-stage CE, "
+                        "enables --use_decoder, --no_decoder_detach, --no_detach_parent_kv)")
     # ---- Training ----
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--T", type=int, default=4,
                    help="Number of context frames; model predicts T future frames")
-    p.add_argument("--image_size", type=int, default=256)
+    p.add_argument("--image_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--encoder_lr_scale", type=float, default=1.0,
                    help="Encoder LR = lr * scale (1.0 for custom encoder, 0.01 for CLIP)")

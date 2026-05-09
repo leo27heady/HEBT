@@ -993,7 +993,7 @@ class TestAdaptiveMCMC:
         stage = self._make_adaptive_stage()
         B, T, C, H, W = 2, 3, 16, 4, 4
         ctx = torch.randn(B, T, C, H, W)
-        all_logits, final_embed, trace, n_steps = stage.run_mcmc_adaptive(
+        all_logits, final_embed, trace, n_steps, stop_reason = stage.run_mcmc_adaptive(
             ctx, learning=True
         )
         assert final_embed.shape == (B, T, C, H, W)
@@ -1001,6 +1001,7 @@ class TestAdaptiveMCMC:
         assert len(trace) > 0
         assert isinstance(n_steps, int)
         assert n_steps >= 1
+        assert stop_reason in ("converged", "max_steps", "nan_grad")
         # all_logits: pred_head + final = at least 2
         assert len(all_logits) >= 1
 
@@ -1011,17 +1012,18 @@ class TestAdaptiveMCMC:
         stage.cfg.adaptive_mcmc_max_steps = 5
         B, T, C, H, W = 2, 3, 16, 4, 4
         ctx = torch.randn(B, T, C, H, W)
-        _, _, _, n_steps = stage.run_mcmc_adaptive(ctx, learning=True)
+        _, _, _, n_steps, stop_reason = stage.run_mcmc_adaptive(ctx, learning=True)
         # n_steps = converge_step + 1 (final step). With impossible tol,
         # phase 1 runs max_steps-1 iterations (exhausting for-loop), then phase 2.
         assert n_steps == stage.cfg.adaptive_mcmc_max_steps
+        assert stop_reason == "max_steps"
 
     def test_adaptive_mcmc_has_gradient(self):
         """Final logits from adaptive MCMC should support backward."""
         stage = self._make_adaptive_stage()
         B, T, C, H, W = 2, 3, 16, 4, 4
         ctx = torch.randn(B, T, C, H, W)
-        all_logits, _, _, _ = stage.run_mcmc_adaptive(ctx, learning=True)
+        all_logits, _, _, _, _ = stage.run_mcmc_adaptive(ctx, learning=True)
         loss = all_logits[-1].sum()
         loss.backward()
         # Check transformer has gradients
@@ -1036,7 +1038,7 @@ class TestAdaptiveMCMC:
         stage.cfg.adaptive_mcmc_max_steps = 5
         B, T, C, H, W = 2, 3, 16, 4, 4
         ctx = torch.randn(B, T, C, H, W)
-        _, _, trace, _ = stage.run_mcmc_adaptive(ctx, learning=True)
+        _, _, trace, _, _ = stage.run_mcmc_adaptive(ctx, learning=True)
         # Phase 1 runs 4 steps (max_steps-1), phase 2 runs 1 → 5 entries
         assert len(trace) == 5, f"Expected 5 energy values, got {len(trace)}"
 
@@ -1312,3 +1314,58 @@ class TestEntropyEnergyMaps:
         assert norm.min() >= 0.0 and norm.max() <= 1.0
         assert torch.allclose(norm[0], torch.tensor(0.0), atol=1e-6)
         assert torch.allclose(norm[1], torch.tensor(1.0), atol=1e-6)
+
+
+class TestDecoderOnlyLoss:
+    """Tests for decoder-only loss mode."""
+
+    def test_decoder_only_skips_ce_loss(self):
+        """In decoder_only_loss mode, per-stage pred_loss should be zero."""
+        stages = [_make_stage_cfg(clip_channels=16, H=4, W=4, K=8, stage_name="s1")]
+        cfg = VQHVEBTConfig(
+            stages=stages,
+            train_encoder=True,
+            weights_path="FAKE",
+            use_custom_encoder=True,
+            encoder_warmup_steps=0,
+            decoder_only_loss=True,
+            decoder_detach=False,
+            detach_parent_kv=False,
+        )
+        with patch("model.vid.vq_hvebt.hierarchy.ConvEncoderWrapper") as MockEnc:
+            fake_enc = _FakeConvEncoder(stages, trainable=True)
+            MockEnc.return_value = fake_enc
+            model = VQHVEBTModel(cfg)
+            model.encoder = fake_enc
+        model.train()
+        video = torch.rand(2, 4, 3, 64, 64)
+        out = model.forward_loss(video)
+        sr = out.stage_results["s1"]
+        assert sr.pred_loss.item() == 0.0, "decoder_only_loss should skip per-stage CE loss"
+
+    def test_decoder_only_with_decoder(self):
+        """decoder_only_loss with use_decoder=True produces a finite total loss."""
+        stages = [_make_stage_cfg(clip_channels=16, H=4, W=4, K=8, stage_name="s1")]
+        cfg = VQHVEBTConfig(
+            stages=stages,
+            train_encoder=True,
+            weights_path="FAKE",
+            use_custom_encoder=True,
+            encoder_warmup_steps=0,
+            decoder_only_loss=True,
+            use_decoder=True,
+            decoder_out_size=64,
+            decoder_detach=False,
+            detach_parent_kv=False,
+        )
+        with patch("model.vid.vq_hvebt.hierarchy.ConvEncoderWrapper") as MockEnc:
+            fake_enc = _FakeConvEncoder(stages, trainable=True)
+            MockEnc.return_value = fake_enc
+            model = VQHVEBTModel(cfg)
+            model.encoder = fake_enc
+        model.train()
+        video = torch.rand(2, 4, 3, 64, 64)
+        out = model.forward_loss(video)
+        assert torch.isfinite(out.total_loss)
+        assert out.decoder_loss is not None
+        assert out.decoder_loss.item() > 0.0

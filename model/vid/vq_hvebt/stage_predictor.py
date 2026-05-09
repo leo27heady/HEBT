@@ -504,7 +504,7 @@ class VQHVEBTStage(nn.Module):
         init_logits: Optional[torch.Tensor] = None,
         parent_context: Optional[torch.Tensor] = None,
         learning: bool = True,
-    ) -> Tuple[List[torch.Tensor], torch.Tensor, List[float], int]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, List[float], int, str]:
         """Adaptive MCMC: iterate until energy converges, then one final step with graph.
 
         Phase 1: run without computation graph until convergence (relative energy
@@ -517,6 +517,7 @@ class VQHVEBTStage(nn.Module):
             final_embed     : (B, T, C, H, W).
             energy_trace    : per-step summed energy.
             num_steps       : total steps taken (for metrics / step penalty).
+            stop_reason     : "converged" | "max_steps" | "nan_grad".
         """
         B, T, C, H, W = real_ctx.shape
         N = T * H * W
@@ -546,6 +547,7 @@ class VQHVEBTStage(nn.Module):
         prev_energy_val: Optional[float] = None
         overshoot_count = 0
         converge_step = 0
+        stop_reason = "max_steps"   # default if loop exhausts all iterations
 
         # ---- Phase 1: iterate without graph until convergence ------------- #
         with torch.set_grad_enabled(True):
@@ -563,6 +565,7 @@ class VQHVEBTStage(nn.Module):
                     rel = abs(energy_val - prev_energy_val) / (abs(prev_energy_val) + 1e-8)
                     if rel < tol:
                         converge_step = step
+                        stop_reason = "converged"
                         break
                     # Overshoot detection.
                     if energy_val > prev_energy_val:
@@ -579,6 +582,7 @@ class VQHVEBTStage(nn.Module):
                 )[0]
                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                     converge_step = step
+                    stop_reason = "nan_grad"
                     break
 
                 if use_per_token_norm:
@@ -620,4 +624,4 @@ class VQHVEBTStage(nn.Module):
         z_pred_final = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
         num_steps = converge_step + 1  # +1 for the final graph step
-        return all_step_logits, z_pred_final, energy_trace, num_steps
+        return all_step_logits, z_pred_final, energy_trace, num_steps, stop_reason
