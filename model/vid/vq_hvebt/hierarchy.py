@@ -288,6 +288,7 @@ class VQHVEBTModel(nn.Module):
                 indices=qout.indices.reshape(Bs, T1s, Hs * Ws),
                 cb_loss=qout.cb_loss,
                 commit_loss=qout.commit_loss,
+                diversity_loss=qout.diversity_loss,
             )
             results[name] = (z_e_5d, qout_5d)
 
@@ -551,6 +552,19 @@ class VQHVEBTModel(nn.Module):
             cb_weights=cb_weight_map,
             commit_weights=commit_weight_map,
         )
+
+        # ---- 3b. Codebook diversity loss ------------------------------------
+        # Sum diversity losses from all stages.  Each diversity_loss is the
+        # mean pairwise cosine similarity of encoder features at that stage.
+        # Minimising it pushes features apart, preventing the EMA codebook
+        # from collapsing to a few active codes.
+        if self.cfg.codebook_diversity_weight > 0:
+            div_loss_total = torch.tensor(0.0, device=video.device)
+            for stage_cfg in self.cfg.stages:
+                name = stage_cfg.clip_stage_name
+                _, qout = enc_quant[name]
+                div_loss_total = div_loss_total + qout.diversity_loss
+            total = total + self.cfg.codebook_diversity_weight * div_loss_total
 
         # ---- 4. Optional pixel decoder on finest stage ----------------------
         dec_loss: Optional[torch.Tensor] = None

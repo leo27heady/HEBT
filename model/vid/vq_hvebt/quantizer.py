@@ -65,12 +65,16 @@ class QuantizerOutput(NamedTuple):
     indices : (B, N)      long tensor of nearest-code indices.
     cb_loss : ()          scalar zero (kept for API compat; codebook trains via EMA).
     commit_loss: ()       scalar zero (no commitment loss in EMA mode).
+    diversity_loss: ()    differentiable loss penalising encoder feature collapse.
+                          Computed from mean pairwise cosine similarity of encoder
+                          outputs — high sim → features cluster → codebook collapses.
     """
     z_q_st: torch.Tensor
     z_q: torch.Tensor
     indices: torch.Tensor
     cb_loss: torch.Tensor
     commit_loss: torch.Tensor
+    diversity_loss: torch.Tensor
 
 
 # --------------------------------------------------------------------------- #
@@ -199,7 +203,29 @@ class VectorQuantizer(nn.Module):
         if self.training:
             self._ema_update(z_flat.detach(), indices_flat)
 
-        # No explicit losses — codebook trains via EMA, encoder via straight-through.
+        # ---- Diversity loss: penalise encoder feature collapse ------------ #
+        # Mean pairwise cosine similarity of encoder features.  When features
+        # collapse to a single point, cosine sim → 1 and this loss is high.
+        # Gradient flows to the encoder (z_flat has grad), pushing features
+        # apart and counteracting the collapse pressure from decoder loss.
+        M = z_flat.shape[0]
+        if self.training and M > 1:
+            # Subsample for efficiency when token count is large.
+            max_sample = 128
+            if M > max_sample:
+                idx = torch.randperm(M, device=z_flat.device)[:max_sample]
+                z_sample = z_flat[idx]
+            else:
+                z_sample = z_flat
+            z_norm = F.normalize(z_sample, dim=1)              # unit-norm
+            cos_sim = z_norm @ z_norm.T                        # (S, S)
+            S = z_norm.shape[0]
+            # Exclude diagonal (self-similarity = 1).
+            mask = ~torch.eye(S, dtype=torch.bool, device=z_flat.device)
+            div_loss = cos_sim[mask].mean()                    # ∈ [-1, 1]
+        else:
+            div_loss = torch.tensor(0.0, device=z_e.device)
+
         zero = torch.tensor(0.0, device=z_e.device)
         return QuantizerOutput(
             z_q_st=z_q_st,
@@ -207,6 +233,7 @@ class VectorQuantizer(nn.Module):
             indices=indices,
             cb_loss=zero,
             commit_loss=zero,
+            diversity_loss=div_loss,
         )
 
     @torch.no_grad()

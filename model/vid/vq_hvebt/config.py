@@ -210,6 +210,12 @@ class VQHVEBTConfig:
     detach_pred_context: bool = False   # With EMA codebook there is no commitment
                                         # loss gradient bomb, so we can let prediction
                                         # loss flow into the encoder via context too.
+    codebook_diversity_weight: float = 1.0  # Weight for per-stage codebook diversity
+                                            # loss.  Penalises high pairwise cosine
+                                            # similarity among encoder features, which
+                                            # directly counteracts feature collapse at
+                                            # coarse stages (where few spatial tokens
+                                            # make EMA winner-take-all extreme).
 
     def __post_init__(self):
         if self.decoder_only_loss:
