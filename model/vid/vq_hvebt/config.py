@@ -218,7 +218,7 @@ class VQHVEBTConfig:
             self.decoder_detach = False
             self.detach_parent_kv = False
             for s in self.stages:
-                s.use_linear_decode = True
+                # s.use_linear_decode = True
                 s.mcmc_no_detach = True
                 s.truncate_mcmc = False
 

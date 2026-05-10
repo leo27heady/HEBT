@@ -87,8 +87,8 @@ def make_shape_batch(
         shape_scene_type="DIM_2",
         shape_min_cubes=2,
         shape_max_cubes=6,
-        shape_angle_min=5,
-        shape_angle_max=20,
+        shape_angle_min=15,
+        shape_angle_max=45,
         shape_temporal_patterns=[],
         shape_pattern_combining=False,
         shape_accel_min=3,
@@ -117,8 +117,8 @@ def build_dataset(args: argparse.Namespace) -> VIDShapeSyntheticDataset:
         shape_scene_type="DIM_2",
         shape_min_cubes=2,
         shape_max_cubes=6,
-        shape_angle_min=5,
-        shape_angle_max=20,
+        shape_angle_min=15,
+        shape_angle_max=45,
         shape_temporal_patterns=[],
         shape_pattern_combining=False,
         shape_accel_min=3,
@@ -623,7 +623,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_heads", type=int, default=2)
     p.add_argument("--n_layers", type=int, default=2)
     # ---- MCMC ----
-    p.add_argument("--mcmc_steps", type=int, default=20)
+    p.add_argument("--mcmc_steps", type=int, default=10)
     p.add_argument("--mcmc_step_size", type=float, default=1.0,
                    help="MCMC step size α (per-token after normalization)")
     p.add_argument("--mcmc_per_token_norm", action="store_true", default=True,
