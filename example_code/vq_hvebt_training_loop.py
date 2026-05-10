@@ -385,8 +385,8 @@ def train(args: argparse.Namespace) -> None:
         # No pred_head needed: MCMC starts from zeros, uses learned linear
         # projection (no softmax saturation), full graph preserved.
         args.pred_head = False
-        if args.context_recon_weight <= 0:
-            args.context_recon_weight = 1.0  # default for decoder_only_loss
+        # if args.context_recon_weight <= 0:
+        #     args.context_recon_weight = 1.0  # default for decoder_only_loss
         print("[VQ-HVEBT] decoder_only_loss: MCMC with linear decode, no detach, "
               f"context_recon_weight={args.context_recon_weight}")
 
