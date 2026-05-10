@@ -47,6 +47,7 @@ class VQCodebookConfig:
     code_dim: int = 256
     init_mode: str = "data_first_batch"   # "random" | "data_first_batch"
     use_ema: bool = False                 # False = gradient-trained codebook (standard VQ-VAE)
+    normalize_codebook: bool = True       # L2-normalize codebook entries to match feature norm
     ema_decay: float = 0.99
     commitment_beta: float = 0.25         # commitment loss weight (gradient mode)
     dead_code_reset: bool = True          # replace dead codes with encoder samples (EMA only)
@@ -149,6 +150,7 @@ class VQStageConfig:
                 code_dim=self.clip_channels,
                 init_mode=self.codebook.init_mode,
                 use_ema=self.codebook.use_ema,
+                normalize_codebook=self.codebook.normalize_codebook,
                 ema_decay=self.codebook.ema_decay,
                 commitment_beta=self.codebook.commitment_beta,
                 dead_code_reset=self.codebook.dead_code_reset,
@@ -252,19 +254,21 @@ def _default_stages() -> List[VQStageConfig]:
         clip_stage_name="s3",
         clip_channels=256,
         H=2, W=2,
-        transformer_dim=64, n_heads=2, n_layers=2,
+        transformer_dim=256, n_heads=4, n_layers=2,  # Fix A: D=C removes bottleneck
         temporal_window=4,
         spatial_window=None,   # 2×2 grid → full spatial always
-        codebook=VQCodebookConfig(num_codes=512, code_dim=256, use_ema=False),
+        codebook=VQCodebookConfig(num_codes=32, code_dim=256, use_ema=False,
+                                  commitment_beta=10.0),  # Fix C+D: boost β, reduce K
     )
     s2 = VQStageConfig(
         clip_stage_name="s2",
         clip_channels=128,
         H=4, W=4,
-        transformer_dim=64, n_heads=2, n_layers=2,
+        transformer_dim=128, n_heads=4, n_layers=2,  # Fix A: D=C
         temporal_window=2,
         spatial_window=None,   # 4×4 grid → spatial window not needed
-        codebook=VQCodebookConfig(num_codes=64, code_dim=128, use_ema=False),
+        codebook=VQCodebookConfig(num_codes=64, code_dim=128, use_ema=False,
+                                  commitment_beta=2.0),  # Fix C: moderate boost
     )
     s1 = VQStageConfig(
         clip_stage_name="s1",
@@ -273,6 +277,7 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=1,
         spatial_window=None,   # 8×8 grid → full spatial ok at this size
-        codebook=VQCodebookConfig(num_codes=16, code_dim=64, use_ema=False),
+        codebook=VQCodebookConfig(num_codes=16, code_dim=64, use_ema=False,
+                                  commitment_beta=0.25),
     )
     return [s3, s2, s1]

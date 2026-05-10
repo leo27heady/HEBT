@@ -259,24 +259,29 @@ class TestVectorQuantizer:
         assert out.shape == (B, N, C), f"decode_logits shape {out.shape}"
 
     def test_decode_logits_onehot_equals_codebook_entry(self):
-        """One-hot logits at code k must decode to exactly codebook[k]."""
+        """One-hot logits at code k must decode to normalized codebook[k]."""
         B, N, C, K = 1, 1, 8, 4
         q = _make_quantizer(C, K)
         target_code = 2
         logits = torch.full((B, N, K), fill_value=-1e9)
         logits[:, :, target_code] = 1e9  # one-hot at target_code
         decoded = q.decode_logits(logits)
-        expected = q.codebook.weight[target_code].detach()
+        # With normalize_codebook=True, decoded entry is normalized to sqrt(C)
+        raw = q.codebook.weight[target_code].detach()
+        expected = raw / raw.norm().clamp(min=1e-8) * (C ** 0.5)
         assert torch.allclose(decoded[0, 0], expected, atol=1e-4), \
-            "One-hot logits should decode to the corresponding codebook entry"
+            "One-hot logits should decode to the normalized codebook entry"
 
     def test_decode_logits_uniform_equals_mean_embedding(self):
-        """Uniform logits must decode to the mean of all codebook entries."""
+        """Uniform logits must decode to the mean of all normalized codebook entries."""
         B, N, C, K = 1, 1, 8, 4
         q = _make_quantizer(C, K)
         logits = torch.zeros(B, N, K)  # uniform after softmax
         decoded = q.decode_logits(logits)
-        expected = q.codebook.weight.mean(dim=0)
+        # With normalize_codebook, entries are normalized to sqrt(C) first
+        E = q.codebook.weight.detach()
+        E_normed = E / E.norm(dim=1, keepdim=True).clamp(min=1e-8) * (C ** 0.5)
+        expected = E_normed.mean(dim=0)
         assert torch.allclose(decoded[0, 0], expected, atol=1e-5), \
             "Uniform logits should decode to mean codebook entry"
 

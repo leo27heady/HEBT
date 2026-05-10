@@ -27,7 +27,7 @@ as BYOL/DINO/I-JEPA.
 from __future__ import annotations
 
 import copy
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -119,11 +119,18 @@ class MultiStageConvEncoder(nn.Module):
     bounds the per-step feature shift (tokens can only rotate on a
     hypersphere, max shift = 2 * target_norm).
 
+    When ``target_norm="sqrt_C"`` (recommended), each stage is normalized to
+    sqrt(C) where C is that stage's channel count.  This keeps per-channel
+    magnitude ≈ 1.0 regardless of C, which makes VQ discrimination equally
+    easy at all stages.
+
     Parameters
     ----------
     return_stages : which stages to return (subset of {"s1", "s2", "s3"}).
     base_channels : channel width of the stem.
     target_norm   : L2-normalize each spatial token to this norm.
+                    "sqrt_C" = per-stage sqrt(channels) (recommended).
+                    float > 0 = fixed norm for all stages.
                     0 = no normalization (not recommended for VQ).
     """
 
@@ -131,7 +138,7 @@ class MultiStageConvEncoder(nn.Module):
         self,
         return_stages: Iterable[str] = ("s1", "s2", "s3"),
         base_channels: int = 64,
-        target_norm: float = 1.0,
+        target_norm: Union[float, str] = "sqrt_C",
     ):
         super().__init__()
         self.return_stages = tuple(return_stages)
@@ -201,23 +208,28 @@ class MultiStageConvEncoder(nn.Module):
         # L2-normalize each spatial token to target_norm.
         # This ensures consistent magnitude for VQ quantization and
         # bounds the max per-step feature change to 2 * target_norm.
-        if self.target_norm > 0:
+        if self.target_norm == "sqrt_C":
             for name in list(out.keys()):
-                out[name] = self._l2_normalize(out[name])
+                C = out[name].shape[1]
+                out[name] = self._l2_normalize(out[name], C ** 0.5)
+        elif self.target_norm and self.target_norm > 0:
+            for name in list(out.keys()):
+                out[name] = self._l2_normalize(out[name], float(self.target_norm))
 
         return out
 
-    def _l2_normalize(self, x: torch.Tensor) -> torch.Tensor:
+    def _l2_normalize(self, x: torch.Tensor, norm_target: float) -> torch.Tensor:
         """L2-normalize over channels at each spatial position.
 
         Args:
             x: (B, C, H, W)
+            norm_target: desired L2 norm per spatial token.
 
         Returns:
-            (B, C, H, W) with ||x[:, :, h, w]||_2 == target_norm.
+            (B, C, H, W) with ||x[:, :, h, w]||_2 == norm_target.
         """
         norm = x.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        return x / norm * self.target_norm
+        return x / norm * norm_target
 
 
 # --------------------------------------------------------------------------- #
@@ -306,7 +318,7 @@ class ConvEncoderWrapper(nn.Module):
         self.return_stages = tuple(return_stages)
         self.lr_scale = lr_scale
 
-        self.live = MultiStageConvEncoder(return_stages, base_channels, target_norm=1.0)
+        self.live = MultiStageConvEncoder(return_stages, base_channels, target_norm="sqrt_C")
         self.ema = EMAEncoder(self.live, decay=ema_decay)
 
     def encode_video(self, video: torch.Tensor) -> Dict[str, torch.Tensor]:

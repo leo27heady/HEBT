@@ -89,6 +89,7 @@ class VectorQuantizer(nn.Module):
         self.ema_decay = cfg.ema_decay
         self.dead_code_reset = cfg.dead_code_reset
         self.commitment_beta = cfg.commitment_beta
+        self.normalize_codebook = cfg.normalize_codebook
         self._initialized = cfg.init_mode == "random"
 
         init_weight = torch.randn(self.K, self.C) * (1.0 / (self.C ** 0.5))
@@ -162,6 +163,14 @@ class VectorQuantizer(nn.Module):
         # ---- nearest-neighbor lookup --------------------------------------- #
         z_flat = z_e.reshape(B * N, C)                         # (M, C)
         E = self.codebook_weight                               # (K, C)
+
+        # Fix F: normalize codebook entries to match feature norm.
+        # With target_norm=sqrt(C), features have ||z||=sqrt(C).
+        # Without this, codebook norms drift and create assignment bias.
+        if self.normalize_codebook:
+            feat_norm = z_flat.detach().norm(dim=1).mean()      # scalar
+            cb_norm = E.norm(dim=1, keepdim=True).clamp(min=1e-8)  # (K, 1)
+            E = E / cb_norm * feat_norm                        # (K, C)
 
         # ||z - e||² = ||z||² + ||e||² - 2 <z, e>
         z_sq = (z_flat ** 2).sum(dim=1, keepdim=True)          # (M, 1)
@@ -315,6 +324,11 @@ class VectorQuantizer(nn.Module):
             E = self.codebook_weight.detach()                  # EMA: no grad
         else:
             E = self.codebook_weight                           # Gradient: keep grad
+        # Fix F: normalize codebook for decode too.
+        if self.normalize_codebook:
+            cb_norm = E.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            target = (self.C ** 0.5)  # match sqrt(C) feature norm
+            E = E / cb_norm * target
         return probs @ E                                       # (B, N, C)
 
     # ------------------------------------------------------------------ #

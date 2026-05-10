@@ -152,6 +152,15 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
     for idx, stage_name in enumerate(args.stages):
         C, H, W = STAGE_INFO[stage_name]
 
+        # Fix A: Scale transformer_dim with clip_channels (removes bottleneck).
+        # Default: D = C (no compression). CLI --transformer_dim overrides all.
+        if args.transformer_dim_auto:
+            stage_D = C
+            stage_n_heads = max(2, C // 64)  # 1 head per 64 dims
+        else:
+            stage_D = args.transformer_dim
+            stage_n_heads = args.n_heads
+
         # Per-stage windowing: auto_windowing assigns exponential temporal
         # windows (finest=1, each coarser stage doubles) and spatial_window=8
         # for stages with H>8. Explicit --temporal_window/--spatial_window
@@ -175,23 +184,31 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
             sw = None
 
         # Scale codebook size inversely with spatial resolution.
-        # Coarse stages (few tokens) must encode the whole scene → large K.
-        # Fine stages (many tokens) describe single patches → small K.
-        # Mapping: 1×1 → num_codes, 2×2 → num_codes, 4×4 → num_codes/8, 8×8 → 16
+        # Fix D: Coarse stages get K ≤ tokens_per_batch / 4 to avoid dead codes.
+        # With B=4, T+1=5: s3 has 4*5*2*2=80 tokens → K=32 is reasonable.
         STAGE_K = {
-            "s_pool": args.num_codes,            # 1×1: entire scene in 1 token
-            "s3":     args.num_codes,            # 2×2: scene in 4 tokens
-            "s2":     max(16, args.num_codes // 8),  # 4×4: 16 tokens
-            "s1":     16,                        # 8×8: 64 tokens, each is a small patch
+            "s_pool": min(args.num_codes, 16),   # 1×1: only 20 tokens/batch
+            "s3":     min(args.num_codes, 32),   # 2×2: 80 tokens/batch → K=32
+            "s2":     min(args.num_codes, 64),   # 4×4: 320 tokens/batch → K=64
+            "s1":     16,                        # 8×8: 1280 tokens/batch
         }
         stage_K = STAGE_K[stage_name]
+
+        # Fix C: Scale commitment_beta with stage (coarser = stronger anchoring).
+        STAGE_BETA = {
+            "s_pool": args.commitment_beta * 40,   # strongest anchoring
+            "s3":     args.commitment_beta * 40,   # 0.25*40 = 10.0
+            "s2":     args.commitment_beta * 8,    # 0.25*8 = 2.0
+            "s1":     args.commitment_beta,        # 0.25 (fine, already works)
+        }
+        stage_beta = STAGE_BETA[stage_name]
 
         stage_cfgs.append(VQStageConfig(
             clip_stage_name=stage_name,
             clip_channels=C,
             H=H, W=W,
-            transformer_dim=args.transformer_dim,
-            n_heads=args.n_heads,
+            transformer_dim=stage_D,
+            n_heads=stage_n_heads,
             n_layers=args.n_layers,
             mcmc_steps=args.mcmc_steps,
             mcmc_step_size=args.mcmc_step_size,
@@ -212,13 +229,14 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
                 code_dim=C,
                 init_mode="data_first_batch",
                 use_ema=args.use_ema_codebook,
+                normalize_codebook=True,
                 ema_decay=args.ema_decay,
-                commitment_beta=args.commitment_beta,
+                commitment_beta=stage_beta,
                 dead_code_reset=args.dead_code_reset,
             ),
             pred_loss_weight=1.0,
             cb_loss_weight=1.0 if not args.use_ema_codebook else 0.0,
-            commit_loss_weight=args.commitment_beta if not args.use_ema_codebook else 0.0,
+            commit_loss_weight=stage_beta if not args.use_ema_codebook else 0.0,
         ))
 
     cfg = VQHVEBTConfig(
@@ -636,6 +654,10 @@ def parse_args() -> argparse.Namespace:
                    help="Disable dead code reset")
     # ---- Transformer / predictor ----
     p.add_argument("--transformer_dim", type=int, default=64)
+    p.add_argument("--transformer_dim_auto", action="store_true", default=True,
+                   help="Fix A: Scale transformer_dim to clip_channels per stage (D=C). "
+                        "Overrides --transformer_dim. Disable with --no_transformer_dim_auto.")
+    p.add_argument("--no_transformer_dim_auto", dest="transformer_dim_auto", action="store_false")
     p.add_argument("--n_heads", type=int, default=2)
     p.add_argument("--n_layers", type=int, default=2)
     # ---- MCMC ----
