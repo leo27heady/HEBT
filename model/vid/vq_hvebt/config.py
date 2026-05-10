@@ -36,17 +36,20 @@ class VQCodebookConfig:
                                     outputs on the first forward pass. Call
                                     VectorQuantizer.initialize_from_data(z_e)
                                     manually after the first encoding.
-    ema_decay : EMA decay rate for codebook updates. Higher = more stable
-                codebook (slower adaptation). Typical: 0.99–0.999.
-    commitment_beta : UNUSED (kept for backward compat). No commitment loss
-                      in EMA mode.
+    use_ema   : if True, codebook is a buffer updated via EMA (no gradient).
+                if False, codebook is an nn.Parameter trained via gradient
+                descent with codebook loss + commitment loss (standard VQ-VAE).
+    ema_decay : EMA decay rate for codebook updates (only used when use_ema=True).
+    commitment_beta : weight β for commitment loss ||z_e - sg(z_q)||².
+                      Only used when use_ema=False. Typical: 0.25.
     """
     num_codes: int = 512
     code_dim: int = 256
     init_mode: str = "data_first_batch"   # "random" | "data_first_batch"
+    use_ema: bool = False                 # False = gradient-trained codebook (standard VQ-VAE)
     ema_decay: float = 0.99
-    commitment_beta: float = 0.0  # unused in EMA mode
-    dead_code_reset: bool = True  # replace dead codes with encoder samples
+    commitment_beta: float = 0.25         # commitment loss weight (gradient mode)
+    dead_code_reset: bool = True          # replace dead codes with encoder samples (EMA only)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,8 +138,8 @@ class VQStageConfig:
                                     # energy magnitudes small. 0 = disabled.
     pred_loss: str = "mse"              # "mse" | "smooth_l1"
     pred_loss_weight: float = 1.0
-    cb_loss_weight: float = 0.0     # unused (EMA codebook, no gradient loss)
-    commit_loss_weight: float = 0.0  # unused (no commitment loss)
+    cb_loss_weight: float = 1.0     # codebook loss weight (gradient mode)
+    commit_loss_weight: float = 0.25  # commitment loss weight (gradient mode)
 
     def __post_init__(self):
         # Auto-fill code_dim from clip_channels so caller doesn't have to repeat it.
@@ -145,8 +148,10 @@ class VQStageConfig:
                 num_codes=self.codebook.num_codes,
                 code_dim=self.clip_channels,
                 init_mode=self.codebook.init_mode,
+                use_ema=self.codebook.use_ema,
                 ema_decay=self.codebook.ema_decay,
                 commitment_beta=self.codebook.commitment_beta,
+                dead_code_reset=self.codebook.dead_code_reset,
             )
 
 
@@ -250,7 +255,7 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=4,
         spatial_window=None,   # 2×2 grid → full spatial always
-        codebook=VQCodebookConfig(num_codes=512, code_dim=256, ema_decay=0.99),
+        codebook=VQCodebookConfig(num_codes=512, code_dim=256, use_ema=False),
     )
     s2 = VQStageConfig(
         clip_stage_name="s2",
@@ -259,7 +264,7 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=2,
         spatial_window=None,   # 4×4 grid → spatial window not needed
-        codebook=VQCodebookConfig(num_codes=64, code_dim=128, ema_decay=0.99),
+        codebook=VQCodebookConfig(num_codes=64, code_dim=128, use_ema=False),
     )
     s1 = VQStageConfig(
         clip_stage_name="s1",
@@ -268,6 +273,6 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=1,
         spatial_window=None,   # 8×8 grid → full spatial ok at this size
-        codebook=VQCodebookConfig(num_codes=16, code_dim=64, ema_decay=0.99),
+        codebook=VQCodebookConfig(num_codes=16, code_dim=64, use_ema=False),
     )
     return [s3, s2, s1]

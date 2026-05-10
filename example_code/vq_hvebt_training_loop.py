@@ -211,12 +211,14 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
                 num_codes=stage_K,
                 code_dim=C,
                 init_mode="data_first_batch",
+                use_ema=args.use_ema_codebook,
                 ema_decay=args.ema_decay,
+                commitment_beta=args.commitment_beta,
                 dead_code_reset=args.dead_code_reset,
             ),
             pred_loss_weight=1.0,
-            cb_loss_weight=0.0,
-            commit_loss_weight=0.0,
+            cb_loss_weight=1.0 if not args.use_ema_codebook else 0.0,
+            commit_loss_weight=args.commitment_beta if not args.use_ema_codebook else 0.0,
         ))
 
     cfg = VQHVEBTConfig(
@@ -236,6 +238,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         decoder_detach=args.decoder_detach,
         decoder_only_loss=args.decoder_only_loss,
         context_recon_weight=args.context_recon_weight,
+        codebook_diversity_weight=args.codebook_diversity_weight,
     )
     model = VQHVEBTModel(cfg).to(device)
     return model
@@ -621,10 +624,14 @@ def parse_args() -> argparse.Namespace:
                    help="EMA decay for target encoder (BYOL/DINO style, 0.999 → 1000-step half-life)")
     # ---- VQ codebook ----
     p.add_argument("--num_codes", type=int, default=256)
+    p.add_argument("--use_ema_codebook", action="store_true", default=False,
+                   help="Use EMA-updated codebook (no gradient). Default: gradient-trained.")
     p.add_argument("--ema_decay", type=float, default=0.99,
-                   help="EMA decay for codebook updates (0.99-0.999)")
+                   help="EMA decay for codebook updates (only with --use_ema_codebook)")
+    p.add_argument("--commitment_beta", type=float, default=0.25,
+                   help="Commitment loss weight β (gradient codebook mode)")
     p.add_argument("--dead_code_reset", action="store_true", default=True,
-                   help="Reset dead codebook entries with encoder samples (default: enabled)")
+                   help="Reset dead codebook entries with encoder samples (EMA mode only)")
     p.add_argument("--no_dead_code_reset", dest="dead_code_reset", action="store_false",
                    help="Disable dead code reset")
     # ---- Transformer / predictor ----
@@ -683,6 +690,10 @@ def parse_args() -> argparse.Namespace:
                    help="Weight for context-frame reconstruction loss (VQ-VAE autoencoder "
                         "objective). Trains encoder-decoder feature space. "
                         "Auto-set to 1.0 when --decoder_only_loss is used.")
+    p.add_argument("--codebook_diversity_weight", type=float, default=1.0,
+                   help="Weight for codebook diversity loss. Penalises high pairwise "
+                        "cosine similarity among encoder features, preventing codebook "
+                        "collapse at coarse stages.")
     # ---- Training ----
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--T", type=int, default=4,

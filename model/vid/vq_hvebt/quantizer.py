@@ -1,5 +1,13 @@
 """
-VQ-VAE Vector Quantizer with EMA codebook and straight-through estimator.
+VQ-VAE Vector Quantizer with EMA or gradient-trained codebook.
+
+Supports two modes:
+  1. EMA codebook (use_ema=True): codebook is a buffer updated via exponential
+     moving average. No gradient, no codebook/commitment loss.
+  2. Gradient codebook (use_ema=False): codebook is an nn.Parameter trained via
+     standard VQ-VAE losses:
+       - Codebook loss:   ||sg(z_e) - e_k||²  — pulls codes toward encoder features
+       - Commitment loss:  β·||z_e - sg(e_k)||² — anchors encoder to codebook entries
 
 Mathematical specification
 --------------------------
@@ -14,32 +22,10 @@ Straight-through copy (gradient bypass):
     z_q_st = z_e + sg(z_q - z_e)
     Forward:  z_q_st == z_q   (uses quantized code)
     Backward: ∂loss/∂z_q_st is copied unchanged to ∂loss/∂z_e
-              (as if z_q_st were an identity function of z_e)
-
-Gradient flow:
-  - The ENCODER is trained ONLY via straight-through: gradients from
-    downstream (prediction loss) pass through z_q_st back to z_e.
-  - The CODEBOOK is trained via EMA updates (no gradient). Each entry
-    tracks the exponential moving average of encoder outputs assigned to it.
-  - NO commitment loss, NO codebook loss. The EMA update replaces both.
-
-EMA codebook update (VQ-VAE-2 style):
-    For each code j, track:
-        ema_count_j  = decay * ema_count_j + (1-decay) * count_j
-        ema_sum_j    = decay * ema_sum_j   + (1-decay) * sum_of_assigned_z_e_j
-        E_j          = ema_sum_j / ema_count_j
-
-    This makes the codebook track encoder outputs without ANY gradient
-    interaction, eliminating the 10⁹-magnitude gradient explosion that
-    commitment loss through LayerNorm produces.
 
 Prediction decode (logit → embedding):
     p = softmax(logits)                        logits ∈ R^{B, N, K}
     z_pred = p @ E                             z_pred ∈ R^{B, N, C}
-
-    The codebook is DETACHED during decode because the codebook is not
-    trained by gradient (it's EMA-only). Prediction loss flows through
-    softmax → logits only.
 """
 from __future__ import annotations
 
@@ -63,11 +49,9 @@ class QuantizerOutput(NamedTuple):
     z_q_st  : (B, N, C)   straight-through quantized (use this downstream).
     z_q     : (B, N, C)   hard-quantized (no grad to encoder; for targets).
     indices : (B, N)      long tensor of nearest-code indices.
-    cb_loss : ()          scalar zero (kept for API compat; codebook trains via EMA).
-    commit_loss: ()       scalar zero (no commitment loss in EMA mode).
-    diversity_loss: ()    differentiable loss penalising encoder feature collapse.
-                          Computed from mean pairwise cosine similarity of encoder
-                          outputs — high sim → features cluster → codebook collapses.
+    cb_loss : ()          codebook loss ||sg(z_e) - e_k||² (0 in EMA mode).
+    commit_loss: ()       commitment loss β·||z_e - sg(e_k)||² (0 in EMA mode).
+    diversity_loss: ()    mean pairwise cosine sim of encoder features.
     """
     z_q_st: torch.Tensor
     z_q: torch.Tensor
@@ -83,43 +67,42 @@ class QuantizerOutput(NamedTuple):
 
 
 class VectorQuantizer(nn.Module):
-    """EMA-updated VQ-VAE quantizer for a single hierarchy stage.
+    """VQ-VAE quantizer for a single hierarchy stage.
 
-    The codebook is NOT trained by gradient. Instead, it tracks encoder
-    outputs via exponential moving average (VQ-VAE-2 style). This eliminates
-    the gradient explosion that commitment loss through normalized features
-    produces.
+    Two modes:
+      - EMA (use_ema=True): codebook is a buffer, updated via exponential moving
+        average. No gradient to codebook. cb_loss=0, commit_loss=0.
+      - Gradient (use_ema=False): codebook is an nn.Parameter trained via
+        codebook loss + commitment loss. Standard VQ-VAE.
 
     Parameters
     ----------
     cfg : VQCodebookConfig
-        Codebook size K, dimension C, init mode, EMA decay.
-    detach_codebook_in_decode : bool
-        If True, the codebook is detached when decoding logits to embeddings.
-        Default True for EMA mode (codebook has no grad anyway).
+        Codebook size K, dimension C, mode, etc.
     """
 
-    def __init__(
-        self,
-        cfg: VQCodebookConfig,
-        detach_codebook_in_decode: bool = True,
-    ):
+    def __init__(self, cfg: VQCodebookConfig):
         super().__init__()
         self.K = cfg.num_codes
         self.C = cfg.code_dim
+        self.use_ema = cfg.use_ema
         self.ema_decay = cfg.ema_decay
         self.dead_code_reset = cfg.dead_code_reset
-        self.detach_codebook_in_decode = detach_codebook_in_decode
+        self.commitment_beta = cfg.commitment_beta
         self._initialized = cfg.init_mode == "random"
 
-        # Codebook as a buffer (NOT a parameter — no gradient).
-        self.register_buffer("codebook_weight", torch.randn(self.K, self.C) * (1.0 / (self.C ** 0.5)))
-        # EMA tracking buffers.
-        self.register_buffer("ema_count", torch.ones(self.K))
-        self.register_buffer("ema_sum", self.codebook_weight.clone())
+        init_weight = torch.randn(self.K, self.C) * (1.0 / (self.C ** 0.5))
 
-        # Backward-compat property so decode_logits and other code can still
-        # access `self.codebook.weight`.
+        if self.use_ema:
+            # EMA mode: codebook is a buffer (no gradient).
+            self.register_buffer("codebook_weight", init_weight)
+            self.register_buffer("ema_count", torch.ones(self.K))
+            self.register_buffer("ema_sum", init_weight.clone())
+        else:
+            # Gradient mode: codebook is a parameter (trained via optimizer).
+            self.codebook_weight = nn.Parameter(init_weight)
+
+        # Backward-compat: `self.codebook.weight` → `self.codebook_weight`.
         self.codebook = _CodebookView(self)
 
     # ------------------------------------------------------------------ #
@@ -129,10 +112,6 @@ class VectorQuantizer(nn.Module):
     @torch.no_grad()
     def initialize_from_data(self, z_e: torch.Tensor) -> None:
         """Replace codebook entries with randomly-sampled encoder outputs.
-
-        Should be called once after the first forward pass when
-        ``cfg.init_mode == "data_first_batch"``.  If z_e has fewer than K
-        tokens, entries cycle through the available samples with random jitter.
 
         Args:
             z_e: (M, C) flat encoder outputs (M >= 1).
@@ -151,8 +130,9 @@ class VectorQuantizer(nn.Module):
         jitter = torch.randn_like(sampled) * jitter_scale
         init_data = sampled + jitter
         self.codebook_weight.copy_(init_data)
-        self.ema_sum.copy_(init_data)
-        self.ema_count.fill_(1.0)
+        if self.use_ema:
+            self.ema_sum.copy_(init_data)
+            self.ema_count.fill_(1.0)
         self._initialized = True
 
     @property
@@ -166,14 +146,14 @@ class VectorQuantizer(nn.Module):
     def encode(self, z_e: torch.Tensor) -> QuantizerOutput:
         """Quantize encoder outputs with straight-through estimator.
 
-        The codebook is updated via EMA during training (when self.training).
-        No gradient flows to or from the codebook.
+        In gradient mode: computes codebook loss and commitment loss.
+        In EMA mode: updates codebook via EMA, losses are zero.
 
         Args:
             z_e: (B, N, C) encoder outputs; N = T*H*W.
 
         Returns:
-            QuantizerOutput with z_q_st, z_q, indices, cb_loss=0, commit_loss=0.
+            QuantizerOutput with z_q_st, z_q, indices, cb_loss, commit_loss.
         """
         B, N, C = z_e.shape
         if C != self.C:
@@ -199,40 +179,47 @@ class VectorQuantizer(nn.Module):
         # ---- straight-through copy ---------------------------------------- #
         z_q_st = z_e + (z_q - z_e).detach()                   # (B, N, C)
 
-        # ---- EMA codebook update (training only) -------------------------- #
-        if self.training:
-            self._ema_update(z_flat.detach(), indices_flat)
+        # ---- Losses -------------------------------------------------------- #
+        zero = torch.tensor(0.0, device=z_e.device)
+
+        if self.use_ema:
+            # EMA mode: update codebook from detached features, no losses.
+            if self.training:
+                self._ema_update(z_flat.detach(), indices_flat)
+            cb_loss = zero
+            commit_loss = zero
+        else:
+            # Gradient mode: standard VQ-VAE losses.
+            # Codebook loss: pull codebook entries toward encoder features.
+            cb_loss = F.mse_loss(z_q, z_e.detach().reshape(B, N, C))
+            # Commitment loss: anchor encoder features to codebook entries.
+            commit_loss = self.commitment_beta * F.mse_loss(
+                z_e, z_q.detach().reshape(B, N, C)
+            )
 
         # ---- Diversity loss: penalise encoder feature collapse ------------ #
-        # Mean pairwise cosine similarity of encoder features.  When features
-        # collapse to a single point, cosine sim → 1 and this loss is high.
-        # Gradient flows to the encoder (z_flat has grad), pushing features
-        # apart and counteracting the collapse pressure from decoder loss.
         M = z_flat.shape[0]
         if self.training and M > 1:
-            # Subsample for efficiency when token count is large.
             max_sample = 128
             if M > max_sample:
                 idx = torch.randperm(M, device=z_flat.device)[:max_sample]
                 z_sample = z_flat[idx]
             else:
                 z_sample = z_flat
-            z_norm = F.normalize(z_sample, dim=1)              # unit-norm
-            cos_sim = z_norm @ z_norm.T                        # (S, S)
+            z_norm = F.normalize(z_sample, dim=1)
+            cos_sim = z_norm @ z_norm.T
             S = z_norm.shape[0]
-            # Exclude diagonal (self-similarity = 1).
             mask = ~torch.eye(S, dtype=torch.bool, device=z_flat.device)
-            div_loss = cos_sim[mask].mean()                    # ∈ [-1, 1]
+            div_loss = cos_sim[mask].mean()
         else:
-            div_loss = torch.tensor(0.0, device=z_e.device)
+            div_loss = zero
 
-        zero = torch.tensor(0.0, device=z_e.device)
         return QuantizerOutput(
             z_q_st=z_q_st,
             z_q=z_q,
             indices=indices,
-            cb_loss=zero,
-            commit_loss=zero,
+            cb_loss=cb_loss,
+            commit_loss=commit_loss,
             diversity_loss=div_loss,
         )
 
@@ -311,9 +298,11 @@ class VectorQuantizer(nn.Module):
     def decode_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Convert predicted code-distribution logits to embedding vectors.
 
-        Computes z_pred = softmax(logits) @ E, which is a differentiable
-        weighted combination of codebook entries. Since the codebook is
-        EMA-updated (no gradient), E is always detached here.
+        Computes z_pred = softmax(logits) @ E.
+
+        In EMA mode:     E is detached (codebook has no gradient anyway).
+        In gradient mode: E keeps gradient so prediction loss trains the
+                          codebook alongside the predictor.
 
         Args:
             logits: (B, N, K) raw logits over the K codebook entries.
@@ -322,7 +311,10 @@ class VectorQuantizer(nn.Module):
             (B, N, C) predicted embedding.
         """
         probs = F.softmax(logits, dim=-1)                      # (B, N, K)
-        E = self.codebook_weight.detach()                      # (K, C) — always detach for EMA
+        if self.use_ema:
+            E = self.codebook_weight.detach()                  # EMA: no grad
+        else:
+            E = self.codebook_weight                           # Gradient: keep grad
         return probs @ E                                       # (B, N, C)
 
     # ------------------------------------------------------------------ #

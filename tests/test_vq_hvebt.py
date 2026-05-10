@@ -124,8 +124,8 @@ def _make_stage_cfg(
     )
 
 
-def _make_quantizer(C: int = 16, K: int = 8) -> VectorQuantizer:
-    cfg = VQCodebookConfig(num_codes=K, code_dim=C, init_mode="random")
+def _make_quantizer(C: int = 16, K: int = 8, use_ema: bool = False) -> VectorQuantizer:
+    cfg = VQCodebookConfig(num_codes=K, code_dim=C, init_mode="random", use_ema=use_ema)
     return VectorQuantizer(cfg)
 
 
@@ -190,7 +190,7 @@ class TestVectorQuantizer:
     def test_codebook_is_ema_updated_no_gradient(self):
         """In EMA mode, cb_loss is always zero and codebook has no gradient."""
         B, N, C, K = 2, 6, 16, 8
-        q = _make_quantizer(C, K)
+        q = _make_quantizer(C, K, use_ema=True)
         z_e = _make_z_e(B, N, C, requires_grad=True)
         out = q.encode(z_e)
         assert out.cb_loss.item() == 0.0, "cb_loss must be zero in EMA mode"
@@ -198,10 +198,38 @@ class TestVectorQuantizer:
         # Codebook is a buffer, not a parameter — no gradient.
         assert not q.codebook_weight.requires_grad, "Codebook buffer should not require grad"
 
+    def test_gradient_codebook_has_losses(self):
+        """In gradient mode, cb_loss and commit_loss are non-zero."""
+        B, N, C, K = 2, 6, 16, 8
+        q = _make_quantizer(C, K, use_ema=False)
+        q.train()
+        z_e = _make_z_e(B, N, C, requires_grad=True)
+        out = q.encode(z_e)
+        assert out.cb_loss.item() > 0, "cb_loss must be > 0 in gradient mode"
+        assert out.commit_loss.item() > 0, "commit_loss must be > 0 in gradient mode"
+        assert q.codebook_weight.requires_grad, "Codebook must be a Parameter in gradient mode"
+
+    def test_gradient_codebook_trains_via_optimizer(self):
+        """Gradient codebook entries must move when optimized with cb_loss."""
+        C, K = 16, 8
+        q = _make_quantizer(C, K, use_ema=False)
+        q.train()
+        old_weights = q.codebook_weight.data.clone()
+        opt = torch.optim.SGD(q.parameters(), lr=0.1)
+        z_e = torch.randn(2, 6, C)
+        for _ in range(5):
+            opt.zero_grad()
+            out = q.encode(z_e)
+            loss = out.cb_loss + out.commit_loss
+            loss.backward()
+            opt.step()
+        assert not torch.allclose(old_weights, q.codebook_weight.data, atol=1e-6), \
+            "Codebook should move after gradient updates"
+
     def test_ema_update_moves_codebook(self):
         """EMA update must shift codebook entries toward assigned encoder features."""
         B, N, C, K = 2, 6, 16, 8
-        q = _make_quantizer(C, K)
+        q = _make_quantizer(C, K, use_ema=True)
         q.train()
         old_weights = q.codebook_weight.clone()
         z_e = _make_z_e(B, N, C, requires_grad=False)
@@ -302,7 +330,7 @@ class TestVectorQuantizer:
         (≈ 0.0625) stay above threshold and codes are NOT perpetually reset.
         """
         C, K = 8, 64
-        q = _make_quantizer(C, K)
+        q = _make_quantizer(C, K, use_ema=True)
         q.train()
         M = 4
         z_e = torch.randn(1, M, C)
@@ -674,13 +702,28 @@ class TestVQHVEBTModel:
 
     def test_codebook_updated_via_ema_not_gradient(self):
         """In EMA mode, codebook is updated via EMA, not gradient."""
-        model = _make_model_with_fake_encoder(num_stages=1)
+        # Build model with EMA codebook explicitly
+        stages = [_make_stage_cfg(
+            clip_channels=16, H=4, W=4, K=8,
+            transformer_dim=32, n_heads=2, n_layers=1,
+            stage_name="s1",
+        )]
+        stages[0].codebook.use_ema = True
+        cfg = VQHVEBTConfig(
+            stages=stages, train_encoder=True, encoder_lr_scale=0.1,
+            weights_path="FAKE", use_custom_encoder=True,
+            encoder_warmup_steps=0,
+        )
+        with patch("model.vid.vq_hvebt.hierarchy.ConvEncoderWrapper") as MockEnc:
+            fake_enc = _FakeConvEncoder(stages, trainable=True)
+            MockEnc.return_value = fake_enc
+            model = VQHVEBTModel(cfg)
+            model.encoder = fake_enc
         model.train()
         old_weights = model.quantizers["s1"].codebook_weight.clone()
         video = torch.rand(2, 4, 3, 64, 64)
         out = model.forward_loss(video)
         out.total_loss.backward()
-        # Codebook should have moved via EMA update during encode().
         new_weights = model.quantizers["s1"].codebook_weight
         assert not torch.allclose(old_weights, new_weights, atol=1e-8), \
             "Codebook should move via EMA update during training"
