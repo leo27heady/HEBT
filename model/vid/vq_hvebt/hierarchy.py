@@ -417,7 +417,11 @@ class VQHVEBTModel(nn.Module):
             if parent_pred is not None:
                 par_ctx = parent_pred
 
-            # MCMC prediction with pred_head warm-start.
+            # MCMC prediction.
+            # In decoder_only_loss mode: use_linear_decode + mcmc_no_detach
+            # are set automatically, so MCMC uses learned linear projection
+            # (no softmax saturation) and keeps full computation graph
+            # (decoder loss gradient flows through all MCMC steps).
             predictor: VQHVEBTStage = self.predictors[name]
             mcmc_steps_taken: Optional[int] = None
             mcmc_stop_reason: Optional[str] = None
@@ -577,8 +581,31 @@ class VQHVEBTModel(nn.Module):
             dec_loss = decoder_loss_l1(pred_rgb, gt_future)
             total = total + self.cfg.decoder_loss_weight * dec_loss
 
+            # ---- Context reconstruction loss (autoencoder on input frames) ---
+            # Trains the encoder-decoder to faithfully reconstruct context
+            # frames, creating a meaningful feature space for MCMC prediction.
+            if self.cfg.context_recon_weight > 0:
+                finest_ctx = stage_results[finest_name].z_q_st[:, :T]  # (B, T, C, H, W)
+                ctx_in = finest_ctx.reshape(BT, *finest_ctx.shape[2:])
+                ctx_rgb_flat = self.decoder(ctx_in)  # (B*T, 3, H_out, W_out)
+                ctx_rgb = ctx_rgb_flat.reshape(B, T, 3, *ctx_rgb_flat.shape[2:])
+
+                gt_ctx = video[:, :T]  # (B, T, 3, H_in, W_in)
+                if ctx_rgb.shape[-2:] != gt_ctx.shape[-2:]:
+                    gt_ctx = F.interpolate(
+                        gt_ctx.reshape(BT, 3, *gt_ctx.shape[3:]),
+                        size=ctx_rgb.shape[-2:], mode="bilinear", align_corners=False,
+                    ).reshape(B, T, 3, *ctx_rgb.shape[-2:])
+
+                ctx_recon_loss = decoder_loss_l1(ctx_rgb, gt_ctx)
+                total = total + self.cfg.context_recon_weight * ctx_recon_loss
+            else:
+                ctx_recon_loss = None
+        else:
+            ctx_recon_loss = None
+
         # ---- 5. Build metrics dict ------------------------------------------
-        metrics = self._build_metrics(stage_results, dec_loss)
+        metrics = self._build_metrics(stage_results, dec_loss, ctx_recon_loss)
 
         return VQHVEBTOutput(
             total_loss=total,
@@ -703,6 +730,7 @@ class VQHVEBTModel(nn.Module):
         self,
         stage_results: Dict[str, StageForwardResult],
         dec_loss: Optional[torch.Tensor],
+        ctx_recon_loss: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
         for name, sr in stage_results.items():
@@ -753,4 +781,6 @@ class VQHVEBTModel(nn.Module):
                 metrics[f"{name}/energy_decrease"] = sr.energy_trace[0] - sr.energy_trace[-1]
         if dec_loss is not None:
             metrics["decoder/loss"] = dec_loss.item()
+        if ctx_recon_loss is not None:
+            metrics["decoder/ctx_recon_loss"] = ctx_recon_loss.item()
         return metrics

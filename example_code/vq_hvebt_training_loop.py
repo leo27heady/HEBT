@@ -223,6 +223,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         bottom_up_grad_scale=args.bottom_up_grad_scale,
         decoder_detach=args.decoder_detach,
         decoder_only_loss=args.decoder_only_loss,
+        context_recon_weight=args.context_recon_weight,
     )
     model = VQHVEBTModel(cfg).to(device)
     return model
@@ -379,9 +380,15 @@ def train(args: argparse.Namespace) -> None:
         args.use_decoder = True
         args.decoder_detach = False
         args.detach_parent_kv = False
-        args.pred_head = False         # no CE loss → pred_head is useless
-        print("[VQ-HVEBT] decoder_only_loss: enabled decoder, disabled pred_head, "
-              "enabled bottom-up gradient flow")
+        # Per-stage flags are set by VQHVEBTConfig.__post_init__:
+        #   use_linear_decode=True, mcmc_no_detach=True, truncate_mcmc=False
+        # No pred_head needed: MCMC starts from zeros, uses learned linear
+        # projection (no softmax saturation), full graph preserved.
+        args.pred_head = False
+        if args.context_recon_weight <= 0:
+            args.context_recon_weight = 1.0  # default for decoder_only_loss
+        print("[VQ-HVEBT] decoder_only_loss: MCMC with linear decode, no detach, "
+              f"context_recon_weight={args.context_recon_weight}")
 
     print(f"[VQ-HVEBT] Building model on {device} (stages: {args.stages}) ...")
     model = build_model(args, device)
@@ -457,6 +464,8 @@ def train(args: argparse.Namespace) -> None:
                 parts = [f"  step {step:>5}  total={out.total_loss.item():.4f}"]
                 if "decoder/loss" in m:
                     parts.append(f"  dec={m['decoder/loss']:.4f}")
+                if "decoder/ctx_recon_loss" in m:
+                    parts.append(f"  ctx_recon={m['decoder/ctx_recon_loss']:.4f}")
                 print("".join(parts))
                 # --- Per-stage details ---
                 for sname in args.stages:
@@ -539,6 +548,8 @@ def train(args: argparse.Namespace) -> None:
                 parts = [f"  step {step:>6}  total={out.total_loss.item():.4f}  dt={dt*1000:.0f}ms"]
                 if "decoder/loss" in m:
                     parts.append(f"  dec={m['decoder/loss']:.4f}")
+                if "decoder/ctx_recon_loss" in m:
+                    parts.append(f"  ctx_recon={m['decoder/ctx_recon_loss']:.4f}")
                 print("".join(parts))
                 # --- Per-stage details ---
                 for sname in args.stages:
@@ -641,7 +652,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spatial_window", type=int, default=None,
                    help="Override: apply same spatial window to ALL stages (None=use auto or full)")
     # ---- Prediction head (F2/F3) ----
-    p.add_argument("--pred_head", action="store_true", default=True,
+    p.add_argument("--pred_head", action="store_true", default=False,
                    help="F2/F3: Learned prediction head for MCMC warm-start (default: enabled)")
     p.add_argument("--no_pred_head", dest="pred_head", action="store_false")
     # ---- Energy bounding (F1) ----
@@ -659,6 +670,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decoder_only_loss", action="store_true",
                    help="Train only via decoder pixel loss (disables per-stage CE, "
                         "enables --use_decoder, --no_decoder_detach, --no_detach_parent_kv)")
+    p.add_argument("--context_recon_weight", type=float, default=0.0,
+                   help="Weight for context-frame reconstruction loss (VQ-VAE autoencoder "
+                        "objective). Trains encoder-decoder feature space. "
+                        "Auto-set to 1.0 when --decoder_only_loss is used.")
     # ---- Training ----
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--T", type=int, default=4,

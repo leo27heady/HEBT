@@ -969,6 +969,65 @@ class TestAttentionWindowing:
         assert mask.shape == (2 * 4 * 4, 2 * 4 * 4)
 
 
+class TestForwardDirect:
+    """Tests for forward_direct (decoder_only_loss prediction path)."""
+
+    def test_forward_direct_shapes(self):
+        """forward_direct returns correct shapes."""
+        cfg = _make_stage_cfg(clip_channels=16, H=4, W=4, K=8)
+        q = _make_quantizer(C=16, K=8)
+        stage = VQHVEBTStage(cfg, q)
+        B, T, C, H, W = 2, 3, 16, 4, 4
+        ctx = torch.randn(B, T, C, H, W)
+        all_logits, pred_embed = stage.forward_direct(ctx)
+        assert pred_embed.shape == (B, T, C, H, W)
+        assert len(all_logits) == 1
+        assert all_logits[0].shape == (B, T * H * W, 8)
+
+    def test_forward_direct_gradient_flow(self):
+        """Gradient flows from output to pred_head and transformer."""
+        cfg = _make_stage_cfg(clip_channels=16, H=4, W=4, K=8)
+        q = _make_quantizer(C=16, K=8)
+        stage = VQHVEBTStage(cfg, q)
+        ctx = torch.randn(2, 3, 16, 4, 4)
+        _, pred_embed = stage.forward_direct(ctx)
+        loss = pred_embed.sum()
+        loss.backward()
+        # pred_head should have gradient
+        assert any(p.grad is not None and p.grad.norm() > 0
+                    for p in stage.pred_head.parameters())
+        # transformer blocks should have gradient
+        assert any(p.grad is not None and p.grad.norm() > 0
+                    for p in stage.blocks.parameters())
+        # energy_head should NOT have gradient (not in this path)
+        assert stage.energy_head.weight.grad is None
+
+    def test_forward_direct_requires_pred_head(self):
+        """forward_direct raises if pred_head is disabled."""
+        cfg = _make_stage_cfg(clip_channels=16, H=4, W=4, K=8)
+        cfg.pred_head = False
+        q = _make_quantizer(C=16, K=8)
+        stage = VQHVEBTStage(cfg, q)
+        ctx = torch.randn(2, 3, 16, 4, 4)
+        with pytest.raises(RuntimeError, match="forward_direct requires pred_head"):
+            stage.forward_direct(ctx)
+
+    def test_forward_direct_healthy_entropy(self):
+        """Pred_head output should have healthy entropy (not collapsed)."""
+        cfg = _make_stage_cfg(clip_channels=16, H=4, W=4, K=8)
+        q = _make_quantizer(C=16, K=8)
+        stage = VQHVEBTStage(cfg, q)
+        ctx = torch.randn(2, 3, 16, 4, 4)
+        logits_list, _ = stage.forward_direct(ctx)
+        logits = logits_list[0]
+        probs = torch.softmax(logits, dim=-1)
+        entropy = -(probs * probs.log()).sum(dim=-1)  # nats
+        max_entropy = math.log(8)  # K=8
+        # With random init, entropy should be near max (uniform)
+        assert entropy.mean().item() > 0.5 * max_entropy, (
+            f"Entropy too low: {entropy.mean():.3f} vs max {max_entropy:.3f}")
+
+
 class TestAdaptiveMCMC:
     """Tests for Improvement 2: Adaptive MCMC convergence."""
 
@@ -1369,3 +1428,70 @@ class TestDecoderOnlyLoss:
         assert torch.isfinite(out.total_loss)
         assert out.decoder_loss is not None
         assert out.decoder_loss.item() > 0.0
+
+    def test_decoder_only_gradient_reaches_pred_head(self):
+        """decoder_only_loss should give gradient to pred_head via direct path."""
+        stages = [_make_stage_cfg(clip_channels=16, H=4, W=4, K=8, stage_name="s1")]
+        cfg = VQHVEBTConfig(
+            stages=stages,
+            train_encoder=True,
+            weights_path="FAKE",
+            use_custom_encoder=True,
+            encoder_warmup_steps=0,
+            decoder_only_loss=True,
+            use_decoder=True,
+            decoder_out_size=64,
+        )
+        with patch("model.vid.vq_hvebt.hierarchy.ConvEncoderWrapper") as MockEnc:
+            fake_enc = _FakeConvEncoder(stages, trainable=True)
+            MockEnc.return_value = fake_enc
+            model = VQHVEBTModel(cfg)
+            model.encoder = fake_enc
+        model.train()
+        video = torch.rand(2, 4, 3, 64, 64)
+        out = model.forward_loss(video)
+        out.total_loss.backward()
+
+        # pred_head should receive gradient (1st-order through decoder → decode_logits → pred_head).
+        predictor = model.predictors["s1"]
+        pred_head_grad = sum(
+            p.grad.norm().item() for p in predictor.pred_head.parameters()
+            if p.grad is not None
+        )
+        assert pred_head_grad > 0.0, "pred_head should receive gradient in decoder_only_loss mode"
+
+        # Transformer blocks should also receive gradient.
+        block_grad = sum(
+            p.grad.norm().item() for p in predictor.blocks.parameters()
+            if p.grad is not None
+        )
+        assert block_grad > 0.0, "transformer blocks should receive gradient"
+
+    def test_decoder_only_uses_mcmc_with_linear_decode(self):
+        """decoder_only_loss uses MCMC with linear decode (no softmax), not forward_direct."""
+        stages = [_make_stage_cfg(clip_channels=16, H=4, W=4, K=8, stage_name="s1")]
+        cfg = VQHVEBTConfig(
+            stages=stages,
+            train_encoder=True,
+            weights_path="FAKE",
+            use_custom_encoder=True,
+            encoder_warmup_steps=0,
+            decoder_only_loss=True,
+        )
+        # Verify __post_init__ set the right flags
+        assert cfg.stages[0].use_linear_decode is True
+        assert cfg.stages[0].mcmc_no_detach is True
+        assert cfg.stages[0].truncate_mcmc is False
+        with patch("model.vid.vq_hvebt.hierarchy.ConvEncoderWrapper") as MockEnc:
+            fake_enc = _FakeConvEncoder(stages, trainable=True)
+            MockEnc.return_value = fake_enc
+            model = VQHVEBTModel(cfg)
+            model.encoder = fake_enc
+        model.train()
+        video = torch.rand(2, 4, 3, 64, 64)
+        out = model.forward_loss(video)
+        sr = out.stage_results["s1"]
+        # MCMC runs, so energy_trace should NOT be empty
+        assert len(sr.energy_trace) > 0, "MCMC should run in decoder_only_loss"
+        # logits_to_embed should exist
+        assert model.predictors["s1"].logits_to_embed is not None

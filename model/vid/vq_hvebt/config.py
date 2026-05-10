@@ -107,6 +107,14 @@ class VQStageConfig:
                                         # to unit norm. Makes step size invariant
                                         # to energy function's absolute scale.
     truncate_mcmc: bool = True
+    mcmc_no_detach: bool = False     # Like NLP EBT's no_mcmc_detach: do NOT detach
+                                    # logits between MCMC steps, keeping the full
+                                    # computation graph.  Required for decoder_only_loss
+                                    # so pixel loss gradients flow through all steps.
+    use_linear_decode: bool = False  # Replace softmax(logits)@codebook with a learned
+                                    # nn.Linear(K, C) for MCMC decode (like NLP EBT's
+                                    # vocab_to_embed).  Eliminates softmax saturation
+                                    # that kills gradient after MCMC refinement.
     # Adaptive MCMC convergence (set adaptive_mcmc=True to enable).
     adaptive_mcmc: bool = False             # False = fixed mcmc_steps.
     adaptive_mcmc_max_steps: int = 50       # hard upper bound on iterations.
@@ -183,6 +191,11 @@ class VQHVEBTConfig:
                                         # forces decoder_detach=False and
                                         # detach_parent_kv=False so gradient flows
                                         # from decoder through entire hierarchy.
+                                        # Also sets per-stage: use_linear_decode=True,
+                                        # mcmc_no_detach=True, truncate_mcmc=False.
+    context_recon_weight: float = 0.0   # Weight for context-frame reconstruction loss.
+                                        # Trains encoder-decoder to faithfully reconstruct
+                                        # input frames, creating a meaningful feature space.
     detach_parent_kv: bool = True
     bottom_up_grad_scale: float = 0.1   # Scale factor for gradient flowing from
                                         # child through parent KV. Only active when
@@ -204,6 +217,10 @@ class VQHVEBTConfig:
             self.use_decoder = True
             self.decoder_detach = False
             self.detach_parent_kv = False
+            for s in self.stages:
+                s.use_linear_decode = True
+                s.mcmc_no_detach = True
+                s.truncate_mcmc = False
 
 
 def _default_stages() -> List[VQStageConfig]:

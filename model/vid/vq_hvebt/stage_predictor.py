@@ -187,6 +187,14 @@ class VQHVEBTStage(nn.Module):
                 nn.Linear(D, K, bias=True),
             )
 
+        # NLP EBT-style learned linear projection from logit space to embedding
+        # space. Replaces softmax(logits) @ codebook, eliminating the softmax
+        # saturation that kills gradient after MCMC refinement.
+        # Shape: (K) → (C), equivalent to NLP EBT's vocab_to_embed.
+        self.logits_to_embed: Optional[nn.Module] = None
+        if cfg.use_linear_decode:
+            self.logits_to_embed = nn.Linear(K, C, bias=False)
+
         # Learnable MCMC step size per stage.
         self.alpha = nn.Parameter(
             torch.tensor(float(cfg.mcmc_step_size)),
@@ -202,6 +210,45 @@ class VQHVEBTStage(nn.Module):
         self._init_weights()
 
     # ------------------------------------------------------------------ #
+    #  Direct prediction (no MCMC, for decoder_only_loss)
+    # ------------------------------------------------------------------ #
+
+    def forward_direct(
+        self,
+        real_ctx: torch.Tensor,                          # (B, T, C, H, W)
+        parent_context: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Direct prediction using pred_head, bypassing MCMC.
+
+        Used in decoder_only_loss mode where the decoder provides the only
+        training signal.  MCMC is skipped because:
+          1. Logits are detached between MCMC steps, so pred_head gets zero
+             gradient through the MCMC chain.
+          2. After many MCMC steps, softmax saturates (max prob ~0.998),
+             blocking gradient flow from decoder through decode_logits().
+          3. The 2nd-order gradient through MCMC is ~1000× amplified and
+             unstable.
+
+        By using the pred_head output directly, the decoder loss produces
+        clean 1st-order gradients to the prediction head and shared
+        transformer blocks.
+
+        Returns:
+            all_step_logits : [pred_head_logits] (single element list).
+            pred_embed      : (B, T, C, H, W) decoded embedding.
+        """
+        if self.pred_head is None:
+            raise RuntimeError(
+                "forward_direct requires pred_head=True "
+                "(set pred_head=True in VQStageConfig for decoder_only_loss)"
+            )
+        pred_logits = self._compute_init_logits(real_ctx, parent_context)
+        z_pred_flat = self.quantizer.decode_logits(pred_logits)  # (B, N, C)
+        B, T, C, H, W = real_ctx.shape
+        pred_embed = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
+        return [pred_logits], pred_embed
+
+    # ------------------------------------------------------------------ #
     #  Weight init
     # ------------------------------------------------------------------ #
 
@@ -211,6 +258,11 @@ class VQHVEBTStage(nn.Module):
                 nn.init.normal_(m.weight, std=self.cfg.init_std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # logits_to_embed: Initialize so that one-hot logits map to
+        # reasonable embedding magnitudes.  Small std keeps initial
+        # MCMC predictions near the origin (zero-init logits → zero embed).
+        if self.logits_to_embed is not None:
+            nn.init.normal_(self.logits_to_embed.weight, std=self.cfg.init_std)
         # Energy head: small init so initial energy is near zero.
         nn.init.normal_(self.energy_head.weight, std=self.cfg.init_std * 0.1)
         nn.init.zeros_(self.energy_head.bias)
@@ -221,6 +273,33 @@ class VQHVEBTStage(nn.Module):
                     nn.init.normal_(m.weight, std=self.cfg.init_std)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+
+    # ------------------------------------------------------------------ #
+    #  Cache helpers
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    #  Logit-to-embedding decode
+    # ------------------------------------------------------------------ #
+
+    def _decode_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Convert K-dimensional logits to C-dimensional embeddings.
+
+        Routes between two strategies:
+          - use_linear_decode=True:  logits_to_embed(logits)
+            Learned linear projection (no softmax). Gradient flows freely
+            regardless of logit magnitude — no saturation problem.
+          - use_linear_decode=False: quantizer.decode_logits(logits)
+            softmax(logits) @ codebook. Saturates after MCMC refinement.
+
+        Args:
+            logits: (B, N, K) raw logits over K codebook entries.
+        Returns:
+            (B, N, C) embedding vectors.
+        """
+        if self.logits_to_embed is not None:
+            return self.logits_to_embed(logits)
+        return self.quantizer.decode_logits(logits)
 
     # ------------------------------------------------------------------ #
     #  Cache helpers
@@ -452,6 +531,7 @@ class VQHVEBTStage(nn.Module):
         num_steps = self.cfg.mcmc_steps
         energy_trace: List[float] = []
         use_per_token_norm = self.cfg.mcmc_per_token_norm
+        no_detach = self.cfg.mcmc_no_detach
 
         for step in range(num_steps):
             create_graph = learning and (
@@ -459,10 +539,16 @@ class VQHVEBTStage(nn.Module):
             )
 
             # Detach logits between steps (NLP EBT default).
-            pred_logits = pred_logits.detach().requires_grad_(True)
+            # When mcmc_no_detach=True, keep the full computation graph
+            # so decoder loss gradient flows through all MCMC steps.
+            if no_detach:
+                if not pred_logits.requires_grad:
+                    pred_logits = pred_logits.requires_grad_(True)
+            else:
+                pred_logits = pred_logits.detach().requires_grad_(True)
 
             with torch.enable_grad():
-                z_pred_flat = self.quantizer.decode_logits(pred_logits)  # (B, N, C)
+                z_pred_flat = self._decode_logits(pred_logits)  # (B, N, C)
                 z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
                 energy = self.forward_energy(real_ctx, z_pred, parent_context)  # (B, N)
@@ -489,7 +575,7 @@ class VQHVEBTStage(nn.Module):
             all_step_logits.append(pred_logits)
 
         # Decode final logits → final embedding.
-        z_pred_flat = self.quantizer.decode_logits(pred_logits)   # (B, N, C)
+        z_pred_flat = self._decode_logits(pred_logits)   # (B, N, C)
         z_pred_final = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
         return all_step_logits, z_pred_final, energy_trace
@@ -550,11 +636,16 @@ class VQHVEBTStage(nn.Module):
         stop_reason = "max_steps"   # default if loop exhausts all iterations
 
         # ---- Phase 1: iterate without graph until convergence ------------- #
+        no_detach = cfg.mcmc_no_detach
         with torch.set_grad_enabled(True):
             for step in range(max_steps - 1):
-                pred_logits = pred_logits.detach().requires_grad_(True)
+                if no_detach:
+                    if not pred_logits.requires_grad:
+                        pred_logits = pred_logits.requires_grad_(True)
+                else:
+                    pred_logits = pred_logits.detach().requires_grad_(True)
 
-                z_pred_flat = self.quantizer.decode_logits(pred_logits)
+                z_pred_flat = self._decode_logits(pred_logits)
                 z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
                 energy = self.forward_energy(real_ctx, z_pred, parent_context)
                 energy_val = energy.detach().sum().item()
@@ -577,8 +668,13 @@ class VQHVEBTStage(nn.Module):
                         overshoot_count = 0
                 prev_energy_val = energy_val
 
+                # In no_detach mode, create_graph must be True for all steps
+                # so the gradient chain is preserved.
+                create_graph_phase1 = no_detach
                 grad = torch.autograd.grad(
-                    [energy.sum()], [pred_logits], create_graph=False
+                    [energy.sum()], [pred_logits],
+                    create_graph=create_graph_phase1,
+                    retain_graph=create_graph_phase1,
                 )[0]
                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                     converge_step = step
@@ -591,15 +687,21 @@ class VQHVEBTStage(nn.Module):
                 elif cfg.mcmc_grad_clamp > 0:
                     grad = torch.clamp(grad, min=-cfg.mcmc_grad_clamp, max=cfg.mcmc_grad_clamp)
 
-                pred_logits = (pred_logits - alpha * grad).detach()
+                if no_detach:
+                    pred_logits = pred_logits - alpha * grad
+                else:
+                    pred_logits = (pred_logits - alpha * grad).detach()
             else:
                 converge_step = max_steps - 1
 
         # ---- Phase 2: one final step WITH graph --------------------------- #
-        pred_logits = pred_logits.detach().requires_grad_(True)
+        if not no_detach:
+            pred_logits = pred_logits.detach().requires_grad_(True)
+        elif not pred_logits.requires_grad:
+            pred_logits = pred_logits.requires_grad_(True)
 
         with torch.enable_grad():
-            z_pred_flat = self.quantizer.decode_logits(pred_logits)
+            z_pred_flat = self._decode_logits(pred_logits)
             z_pred = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
             energy = self.forward_energy(real_ctx, z_pred, parent_context)
             energy_trace.append(energy.detach().sum().item())
@@ -620,7 +722,7 @@ class VQHVEBTStage(nn.Module):
             all_step_logits.append(final_logits)
 
         # Decode final logits → final embedding.
-        z_pred_flat = self.quantizer.decode_logits(final_logits)
+        z_pred_flat = self._decode_logits(final_logits)
         z_pred_final = z_pred_flat.reshape(B, T, H, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
         num_steps = converge_step + 1  # +1 for the final graph step
