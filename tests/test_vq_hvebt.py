@@ -293,6 +293,31 @@ class TestVectorQuantizer:
         perp = q.perplexity(indices).item()
         assert abs(perp - 1.0) < 0.05, f"Expected perplexity ≈ 1, got {perp}"
 
+    def test_dead_threshold_scales_with_token_count(self):
+        """Dead threshold must scale down when tokens << codes (M << K).
+
+        With M=4 tokens and K=64 codes, eq_count = M/K = 0.0625.
+        A fixed threshold of 1.0 would flag ALL codes as dead every step.
+        The scaled threshold = 0.5 * M/K = 0.03125, so equilibrium counts
+        (≈ 0.0625) stay above threshold and codes are NOT perpetually reset.
+        """
+        C, K = 8, 64
+        q = _make_quantizer(C, K)
+        q.train()
+        M = 4
+        z_e = torch.randn(1, M, C)
+        for _ in range(50):
+            _ = q.encode(z_e)
+        # With M/K = 0.0625, threshold = 0.03125.
+        # All codes should be alive (above threshold), not at fixed 1.0.
+        tokens_per_code = M / K  # 0.0625
+        threshold = min(1.0, tokens_per_code * 0.5)  # 0.03125
+        alive = (q.ema_count >= threshold).sum().item()
+        assert alive == K, (
+            f"All {K} codes should be alive with scaled threshold {threshold:.4f}, "
+            f"but only {alive} are. min_count={q.ema_count.min():.4f}"
+        )
+
 
 # --------------------------------------------------------------------------- #
 #  2. Losses module tests
@@ -1378,8 +1403,8 @@ class TestEntropyEnergyMaps:
 class TestDecoderOnlyLoss:
     """Tests for decoder-only loss mode."""
 
-    def test_decoder_only_skips_ce_loss(self):
-        """In decoder_only_loss mode, per-stage pred_loss should be zero."""
+    def test_decoder_only_has_ce_and_decoder_loss(self):
+        """decoder_only_loss mode computes BOTH CE and decoder losses."""
         stages = [_make_stage_cfg(clip_channels=16, H=4, W=4, K=8, stage_name="s1")]
         cfg = VQHVEBTConfig(
             stages=stages,
@@ -1400,7 +1425,11 @@ class TestDecoderOnlyLoss:
         video = torch.rand(2, 4, 3, 64, 64)
         out = model.forward_loss(video)
         sr = out.stage_results["s1"]
-        assert sr.pred_loss.item() == 0.0, "decoder_only_loss should skip per-stage CE loss"
+        # CE loss should be non-zero (not skipped)
+        assert sr.pred_loss.item() > 0.0, "decoder_only_loss should still compute CE loss"
+        # Decoder loss should also be present
+        assert out.decoder_loss is not None
+        assert out.decoder_loss.item() > 0.0
 
     def test_decoder_only_with_decoder(self):
         """decoder_only_loss with use_decoder=True produces a finite total loss."""
@@ -1467,8 +1496,8 @@ class TestDecoderOnlyLoss:
         )
         assert block_grad > 0.0, "transformer blocks should receive gradient"
 
-    def test_decoder_only_uses_mcmc_with_linear_decode(self):
-        """decoder_only_loss uses MCMC with linear decode (no softmax), not forward_direct."""
+    def test_decoder_only_uses_mcmc_with_no_detach(self):
+        """decoder_only_loss uses MCMC with no_detach (softmax decode, full graph)."""
         stages = [_make_stage_cfg(clip_channels=16, H=4, W=4, K=8, stage_name="s1")]
         cfg = VQHVEBTConfig(
             stages=stages,
@@ -1479,9 +1508,10 @@ class TestDecoderOnlyLoss:
             decoder_only_loss=True,
         )
         # Verify __post_init__ set the right flags
-        assert cfg.stages[0].use_linear_decode is True
         assert cfg.stages[0].mcmc_no_detach is True
         assert cfg.stages[0].truncate_mcmc is False
+        # linear_decode is NOT set (using softmax decode)
+        assert cfg.stages[0].use_linear_decode is False
         with patch("model.vid.vq_hvebt.hierarchy.ConvEncoderWrapper") as MockEnc:
             fake_enc = _FakeConvEncoder(stages, trainable=True)
             MockEnc.return_value = fake_enc
@@ -1493,5 +1523,5 @@ class TestDecoderOnlyLoss:
         sr = out.stage_results["s1"]
         # MCMC runs, so energy_trace should NOT be empty
         assert len(sr.energy_trace) > 0, "MCMC should run in decoder_only_loss"
-        # logits_to_embed should exist
-        assert model.predictors["s1"].logits_to_embed is not None
+        # No logits_to_embed (softmax decode)
+        assert model.predictors["s1"].logits_to_embed is None

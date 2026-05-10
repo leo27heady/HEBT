@@ -174,6 +174,18 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
         else:
             sw = None
 
+        # Scale codebook size inversely with spatial resolution.
+        # Coarse stages (few tokens) must encode the whole scene → large K.
+        # Fine stages (many tokens) describe single patches → small K.
+        # Mapping: 1×1 → num_codes, 2×2 → num_codes, 4×4 → num_codes/8, 8×8 → 16
+        STAGE_K = {
+            "s_pool": args.num_codes,            # 1×1: entire scene in 1 token
+            "s3":     args.num_codes,            # 2×2: scene in 4 tokens
+            "s2":     max(16, args.num_codes // 8),  # 4×4: 16 tokens
+            "s1":     16,                        # 8×8: 64 tokens, each is a small patch
+        }
+        stage_K = STAGE_K[stage_name]
+
         stage_cfgs.append(VQStageConfig(
             clip_stage_name=stage_name,
             clip_channels=C,
@@ -196,7 +208,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> VQHVEBTModel:
             adaptive_mcmc_patience=args.adaptive_mcmc_patience,
             adaptive_mcmc_step_penalty=args.adaptive_mcmc_step_penalty,
             codebook=VQCodebookConfig(
-                num_codes=args.num_codes,
+                num_codes=stage_K,
                 code_dim=C,
                 init_mode="data_first_batch",
                 ema_decay=args.ema_decay,
@@ -381,14 +393,11 @@ def train(args: argparse.Namespace) -> None:
         args.decoder_detach = False
         args.detach_parent_kv = False
         # Per-stage flags are set by VQHVEBTConfig.__post_init__:
-        #   use_linear_decode=True, mcmc_no_detach=True, truncate_mcmc=False
-        # No pred_head needed: MCMC starts from zeros, uses learned linear
-        # projection (no softmax saturation), full graph preserved.
-        args.pred_head = False
-        # if args.context_recon_weight <= 0:
-        #     args.context_recon_weight = 1.0  # default for decoder_only_loss
-        print("[VQ-HVEBT] decoder_only_loss: MCMC with linear decode, no detach, "
-              f"context_recon_weight={args.context_recon_weight}")
+        #   mcmc_no_detach=True, truncate_mcmc=False
+        # CE loss + decoder loss combine: CE gives energy function direct
+        # supervision, decoder provides pixel-level feedback.
+        print("[VQ-HVEBT] decoder_only_loss: CE + decoder loss, no detach, "
+              f"full gradient flow through MCMC chain")
 
     print(f"[VQ-HVEBT] Building model on {device} (stages: {args.stages}) ...")
     model = build_model(args, device)

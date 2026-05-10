@@ -186,13 +186,12 @@ class VQHVEBTConfig:
     use_decoder: bool = False
     decoder_loss_weight: float = 1.0
     decoder_out_size: int = 64          # output pixel size of the decoder
-    decoder_only_loss: bool = False     # If True, train only via decoder pixel loss.
-                                        # Disables per-stage CE loss (pred_loss_weight=0),
-                                        # forces decoder_detach=False and
+    decoder_only_loss: bool = False     # If True, enable decoder pixel loss alongside CE.
+                                        # Forces decoder_detach=False and
                                         # detach_parent_kv=False so gradient flows
                                         # from decoder through entire hierarchy.
-                                        # Also sets per-stage: use_linear_decode=True,
-                                        # mcmc_no_detach=True, truncate_mcmc=False.
+                                        # Also sets per-stage: mcmc_no_detach=True,
+                                        # truncate_mcmc=False.
     context_recon_weight: float = 0.0   # Weight for context-frame reconstruction loss.
                                         # Trains encoder-decoder to faithfully reconstruct
                                         # input frames, creating a meaningful feature space.
@@ -230,6 +229,13 @@ def _default_stages() -> List[VQStageConfig]:
       s3: 256 ch, 2×2, temporal_window=4 (full for T≤4)
       s2: 128 ch, 4×4, temporal_window=2
       s1:  64 ch, 8×8, temporal_window=1 (self-frame only)
+
+    Codebook K is INVERSELY proportional to spatial size:
+      - Coarser stages (fewer tokens) need MORE codes because each token
+        must describe the entire scene compressed into 1-4 spatial positions.
+      - Finer stages (many tokens) need FEWER codes because each token
+        only describes a single small patch; neighbouring pixels provide
+        context.
     """
     s3 = VQStageConfig(
         clip_stage_name="s3",
@@ -238,7 +244,7 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=4,
         spatial_window=None,   # 2×2 grid → full spatial always
-        codebook=VQCodebookConfig(num_codes=256, code_dim=256, ema_decay=0.99),
+        codebook=VQCodebookConfig(num_codes=512, code_dim=256, ema_decay=0.99),
     )
     s2 = VQStageConfig(
         clip_stage_name="s2",
@@ -247,7 +253,7 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=2,
         spatial_window=None,   # 4×4 grid → spatial window not needed
-        codebook=VQCodebookConfig(num_codes=256, code_dim=128, ema_decay=0.99),
+        codebook=VQCodebookConfig(num_codes=64, code_dim=128, ema_decay=0.99),
     )
     s1 = VQStageConfig(
         clip_stage_name="s1",
@@ -256,6 +262,6 @@ def _default_stages() -> List[VQStageConfig]:
         transformer_dim=64, n_heads=2, n_layers=2,
         temporal_window=1,
         spatial_window=None,   # 8×8 grid → full spatial ok at this size
-        codebook=VQCodebookConfig(num_codes=256, code_dim=64, ema_decay=0.99),
+        codebook=VQCodebookConfig(num_codes=16, code_dim=64, ema_decay=0.99),
     )
     return [s3, s2, s1]

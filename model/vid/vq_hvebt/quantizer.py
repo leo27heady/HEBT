@@ -244,11 +244,22 @@ class VectorQuantizer(nn.Module):
 
         # ---- Dead code reset ---------------------------------------------- #
         # Codes with very low EMA count are effectively unused. Replace them
-        # with randomly-chosen encoder features + small jitter. This prevents
-        # permanent codebook collapse.
+        # with randomly-chosen encoder features + small jitter.
+        #
+        # The threshold scales with M/K (expected tokens per code per batch).
+        # Equilibrium ema_count ≈ M/K when assignments are uniform.
+        # A code is "dead" if its count falls below half the equilibrium,
+        # meaning it gets far less than its fair share of assignments.
+        #
+        # Examples (B=4, T+1=5):
+        #   s_pool K=2048, M=20:  eq=0.0098, threshold=0.0049
+        #   s3     K=512,  M=160: eq=0.312,  threshold=0.156
+        #   s1     K=16,   M=2560: eq=160,   threshold=1.0 (capped)
         if not self.dead_code_reset:
             return
-        dead_mask = self.ema_count < 1.0  # threshold: count < 1 means nearly dead
+        tokens_per_code = M / max(self.K, 1)
+        dead_threshold = min(1.0, tokens_per_code * 0.5)
+        dead_mask = self.ema_count < dead_threshold
         n_dead = dead_mask.sum().item()
         if n_dead > 0 and M > 0:
             # Sample random encoder features as replacements.
@@ -260,7 +271,11 @@ class VectorQuantizer(nn.Module):
             # Reset the dead entries.
             self.codebook_weight[dead_mask] = new_codes
             self.ema_sum[dead_mask] = new_codes
-            self.ema_count[dead_mask] = 1.0
+            # Reset count to equilibrium level, not a fixed 1.0.
+            # Setting to 1.0 when equilibrium is 0.01 causes immediate
+            # decay back below threshold → perpetual reset cycle.
+            reset_count = max(tokens_per_code, dead_threshold * 2)
+            self.ema_count[dead_mask] = reset_count
 
     # ------------------------------------------------------------------ #
     #  Decode: logits → embedding (for predictor)
