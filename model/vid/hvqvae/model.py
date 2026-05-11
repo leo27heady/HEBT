@@ -12,15 +12,16 @@ Forward pass:
   2. Quantize at each stage → embedding loss per stage + straight-through z_q.
   3. Predict coarse→fine: each predictor takes context z_q, produces soft
      pred_embed via softmax(logits) @ codebook. Parent pred_embed is passed
-     (detached) as cross-attention context to finer stages.
+     as cross-attention context to finer stages (gradient flows through by
+     default; configurable via detach_parent_kv).
   4. Decode finest-stage pred_embed → predicted future RGB.
-  5. Decode finest-stage z_q → reconstructed RGB (autoencoder path).
-  6. Loss = recon_loss + pred_loss + sum(embedding_losses).
+  5. (Optional) Decode finest-stage z_q → reconstructed RGB (autoencoder path).
+  6. Loss = pred_loss + sum(embedding_losses) [+ recon_loss if enabled].
 
-Loss structure (matching reference):
-  - recon_loss:      MSE(decode(z_q_s1_all_frames), video) / data_var
+Loss structure:
   - pred_loss:       MSE(decode(pred_s1_future), future_frames) / data_var
   - embedding_loss:  Σ_stage [||z_q.detach()-z_e||² + β*||z_q-z_e.detach()||²]
+  - recon_loss:      MSE(decode(z_q_s1_all_frames), video) / data_var  [optional]
 """
 from __future__ import annotations
 
@@ -47,10 +48,12 @@ from model.vid.hvqvae.predictor import StagePredictor
 class HVQVAEOutput:
     """Full model output from one forward pass."""
     total_loss: torch.Tensor
-    recon_loss: torch.Tensor
+    recon_loss: Optional[torch.Tensor]       # None if recon disabled
     pred_loss: torch.Tensor
     embedding_loss: torch.Tensor
     perplexities: Dict[str, float]
+    embedding_losses_per_stage: Dict[str, float]
+    metrics: Dict[str, float]                # flat dict for logging
     recon_rgb: Optional[torch.Tensor] = None   # (B, T+1, 3, H, W)
     pred_rgb: Optional[torch.Tensor] = None    # (B, T, 3, H, W)
 
@@ -168,6 +171,7 @@ class HVQVAEModel(nn.Module):
         total_embedding_loss = torch.tensor(0.0, device=video.device)
         quantized: Dict[str, torch.Tensor] = {}        # z_q straight-through
         perplexities: Dict[str, float] = {}
+        embed_losses_per_stage: Dict[str, float] = {}
 
         for s in self.cfg.stages:
             name = s.stage_name
@@ -181,27 +185,30 @@ class HVQVAEModel(nn.Module):
             total_embedding_loss = total_embedding_loss + vq_loss
             quantized[name] = z_q_flat.reshape(B_s, T1_s, C_s, Hs, Ws)
             perplexities[name] = perplexity.item()
+            embed_losses_per_stage[name] = vq_loss.item()
 
-        # ---- 3. Autoencoder reconstruction (all frames, finest stage) ----
+        # ---- 3. Optional autoencoder reconstruction (all frames, finest stage) ----
         finest_name = self.cfg.stages[-1].stage_name
-        z_q_finest = quantized[finest_name]  # (B, T+1, C, Hs, Ws)
+        recon_loss: Optional[torch.Tensor] = None
+        recon_rgb: Optional[torch.Tensor] = None
 
-        recon_flat = self.decoder(
-            z_q_finest.reshape(B * T1, -1, *z_q_finest.shape[3:])
-        )  # (B*(T+1), 3, H_out, W_out)
-        recon_rgb = recon_flat.reshape(B, T1, 3, *recon_flat.shape[2:])
-
-        # Resize GT to match decoder output if needed
-        gt_all = video
-        if recon_rgb.shape[-2:] != gt_all.shape[-2:]:
-            gt_flat = gt_all.reshape(B * T1, 3, H_in, W_in)
-            gt_flat = F.interpolate(
-                gt_flat, size=recon_rgb.shape[-2:],
-                mode="bilinear", align_corners=False,
+        if self.cfg.use_recon_loss:
+            z_q_finest = quantized[finest_name]  # (B, T+1, C, Hs, Ws)
+            recon_flat = self.decoder(
+                z_q_finest.reshape(B * T1, -1, *z_q_finest.shape[3:])
             )
-            gt_all = gt_flat.reshape(B, T1, 3, *recon_rgb.shape[-2:])
+            recon_rgb = recon_flat.reshape(B, T1, 3, *recon_flat.shape[2:])
 
-        recon_loss = F.mse_loss(recon_rgb, gt_all) / self.data_variance
+            gt_all = video
+            if recon_rgb.shape[-2:] != gt_all.shape[-2:]:
+                gt_flat = gt_all.reshape(B * T1, 3, H_in, W_in)
+                gt_flat = F.interpolate(
+                    gt_flat, size=recon_rgb.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )
+                gt_all = gt_flat.reshape(B, T1, 3, *recon_rgb.shape[-2:])
+
+            recon_loss = F.mse_loss(recon_rgb, gt_all) / self.data_variance
 
         # ---- 4. Prediction: coarse → fine ----
         parent_pred: Optional[torch.Tensor] = None
@@ -213,12 +220,18 @@ class HVQVAEModel(nn.Module):
             predictor = self.predictors[name]
             logits, pred_embed = predictor(
                 context=z_q_ctx,
-                codebook_weight=self.quantizers[name].embedding.weight,
+                # Detach codebook weight so pred_loss gradient does NOT pull
+                # on codebook entries. Codebook trains via VQ embedding loss
+                # only (same as reference VQ-VAE).
+                codebook_weight=self.quantizers[name].embedding.weight.detach(),
                 parent_context=parent_pred,
             )
 
-            # Detach parent context for finer stage (no gradient leakage)
-            parent_pred = pred_embed.detach()
+            # Configurable: detach parent context or let gradient flow through
+            if self.cfg.detach_parent_kv:
+                parent_pred = pred_embed.detach()
+            else:
+                parent_pred = pred_embed
 
         # pred_embed from finest stage: (B, T, C, Hs, Ws)
         # Decode to pixels
@@ -240,7 +253,20 @@ class HVQVAEModel(nn.Module):
         pred_loss = F.mse_loss(pred_rgb, gt_future) / self.data_variance
 
         # ---- 5. Total loss ----
-        total_loss = recon_loss + pred_loss + total_embedding_loss
+        total_loss = pred_loss + total_embedding_loss
+        if recon_loss is not None:
+            total_loss = total_loss + recon_loss
+
+        # ---- 6. Build metrics dict ----
+        metrics: Dict[str, float] = {
+            "pred_loss": pred_loss.item(),
+            "embedding_loss": total_embedding_loss.item(),
+        }
+        if recon_loss is not None:
+            metrics["recon_loss"] = recon_loss.item()
+        for name in embed_losses_per_stage:
+            metrics[f"{name}/embed_loss"] = embed_losses_per_stage[name]
+            metrics[f"{name}/perplexity"] = perplexities[name]
 
         return HVQVAEOutput(
             total_loss=total_loss,
@@ -248,6 +274,8 @@ class HVQVAEModel(nn.Module):
             pred_loss=pred_loss,
             embedding_loss=total_embedding_loss,
             perplexities=perplexities,
+            embedding_losses_per_stage=embed_losses_per_stage,
+            metrics=metrics,
             recon_rgb=recon_rgb,
             pred_rgb=pred_rgb,
         )

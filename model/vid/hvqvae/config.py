@@ -44,6 +44,10 @@ class HVQVAEConfig:
     encoder_n_res_layers: int = 2       # residual layers per stage
     decoder_out_size: int = 64          # decoder output pixel size
     image_size: int = 64                # input image size
+    use_recon_loss: bool = False        # autoencoder reconstruction loss (disabled by default)
+    detach_parent_kv: bool = False      # if True, detach parent pred before cross-attn
+                                        # False = gradient flows from pixel loss through
+                                        # cross-attn KV up to the coarsest stage
 
 
 def _default_stages() -> List[HVQVAEStageConfig]:

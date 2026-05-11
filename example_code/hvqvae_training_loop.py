@@ -151,6 +151,8 @@ def build_model(args: argparse.Namespace, device: torch.device) -> HVQVAEModel:
         encoder_n_res_layers=2,
         decoder_out_size=args.image_size,
         image_size=args.image_size,
+        use_recon_loss=args.use_recon_loss,
+        detach_parent_kv=args.detach_parent_kv,
     )
 
     model = HVQVAEModel(cfg).to(device)
@@ -207,6 +209,40 @@ def save_comparison_images(
 
 
 # --------------------------------------------------------------------------- #
+#  Logging helper
+# --------------------------------------------------------------------------- #
+
+
+def _log_step(step, out, dt, stages, csv_file, csv_writer):
+    """Print VQ-HVEBT-style hierarchical log line."""
+    m = out.metrics
+
+    # --- General summary line ---
+    parts = [f"  step {step:>6}  total={out.total_loss.item():.4f}  dt={dt*1000:.0f}ms"]
+    parts.append(f"  pred={m['pred_loss']:.4f}")
+    parts.append(f"  embed={m['embedding_loss']:.4f}")
+    if out.recon_loss is not None:
+        parts.append(f"  recon={m['recon_loss']:.4f}")
+    print("".join(parts))
+
+    # --- Per-stage details ---
+    for sname in stages:
+        embed_l = m.get(f"{sname}/embed_loss", 0)
+        perpl = m.get(f"{sname}/perplexity", 0)
+        print(
+            f"    {sname:>6}: embed={embed_l:.4f}"
+            f"  perpl={perpl:.1f}"
+        )
+
+    # CSV logging
+    if csv_file:
+        row = {"step": step, "total_loss": out.total_loss.item(), "dt_ms": dt * 1000, **m}
+        if csv_writer is not None:
+            csv_writer.writerow(row)
+            csv_file.flush()
+
+
+# --------------------------------------------------------------------------- #
 #  Training
 # --------------------------------------------------------------------------- #
 
@@ -226,6 +262,9 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, amsgrad=True
     )
+
+    # Gradient clipping to stabilize embedding loss
+    max_grad_norm = args.max_grad_norm
 
     # Logging setup
     log_dir = Path(args.log_dir) if args.log_dir else None
@@ -255,38 +294,24 @@ def train(args: argparse.Namespace) -> None:
         print(f"[HVQVAE] Data variance: {data_var:.4f}")
 
         model.train()
+        t_prev = time.monotonic()
         for step in range(1, args.steps + 1):
             optimizer.zero_grad()
             out = model(fixed_batch)
             out.total_loss.backward()
+            if max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
 
             if step % args.log_every == 0 or step == 1:
-                perp_str = "  ".join(
-                    f"{k}: {v:.1f}" for k, v in out.perplexities.items()
-                )
-                print(
-                    f"  step {step:5d} | "
-                    f"loss {out.total_loss.item():.4f} | "
-                    f"recon {out.recon_loss.item():.4f} | "
-                    f"pred {out.pred_loss.item():.4f} | "
-                    f"embed {out.embedding_loss.item():.4f} | "
-                    f"perplexity [{perp_str}]"
-                )
-
-                if csv_file:
-                    row = {
-                        "step": step,
-                        "total_loss": out.total_loss.item(),
-                        "recon_loss": out.recon_loss.item(),
-                        "pred_loss": out.pred_loss.item(),
-                        "embedding_loss": out.embedding_loss.item(),
-                    }
-                    for k, v in out.perplexities.items():
-                        row[f"perplexity_{k}"] = v
-                    if csv_writer is None:
-                        csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
-                        csv_writer.writeheader()
+                t_now = time.monotonic()
+                dt = t_now - t_prev
+                t_prev = t_now
+                _log_step(step, out, dt, args.stages, csv_file, csv_writer)
+                if csv_writer is None and csv_file:
+                    row = {"step": step, "total_loss": out.total_loss.item(), "dt_ms": dt * 1000, **out.metrics}
+                    csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
+                    csv_writer.writeheader()
                     csv_writer.writerow(row)
                     csv_file.flush()
 
@@ -321,6 +346,7 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     step = 0
     epoch = 0
+    t_prev = time.monotonic()
 
     while step < args.steps:
         epoch += 1
@@ -334,34 +360,19 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad()
             out = model(batch)
             out.total_loss.backward()
+            if max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
 
             if step % args.log_every == 0 or step == 1:
-                perp_str = "  ".join(
-                    f"{k}: {v:.1f}" for k, v in out.perplexities.items()
-                )
-                print(
-                    f"  epoch {epoch} step {step:5d} | "
-                    f"loss {out.total_loss.item():.4f} | "
-                    f"recon {out.recon_loss.item():.4f} | "
-                    f"pred {out.pred_loss.item():.4f} | "
-                    f"embed {out.embedding_loss.item():.4f} | "
-                    f"perplexity [{perp_str}]"
-                )
-
-                if csv_file:
-                    row = {
-                        "step": step,
-                        "total_loss": out.total_loss.item(),
-                        "recon_loss": out.recon_loss.item(),
-                        "pred_loss": out.pred_loss.item(),
-                        "embedding_loss": out.embedding_loss.item(),
-                    }
-                    for k, v in out.perplexities.items():
-                        row[f"perplexity_{k}"] = v
-                    if csv_writer is None:
-                        csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
-                        csv_writer.writeheader()
+                t_now = time.monotonic()
+                dt = t_now - t_prev
+                t_prev = t_now
+                _log_step(step, out, dt, args.stages, csv_file, csv_writer)
+                if csv_writer is None and csv_file:
+                    row = {"step": step, "total_loss": out.total_loss.item(), "dt_ms": dt * 1000, **out.metrics}
+                    csv_writer = csv.DictWriter(csv_file, fieldnames=list(row.keys()))
+                    csv_writer.writeheader()
                     csv_writer.writerow(row)
                     csv_file.flush()
 
@@ -399,6 +410,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--steps", type=int, default=10000)
+    p.add_argument("--max_grad_norm", type=float, default=1.0,
+                   help="Max gradient norm for clipping (0=disabled)")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -408,6 +421,10 @@ def parse_args() -> argparse.Namespace:
     # Modes
     p.add_argument("--overfit_single_batch", action="store_true",
                    help="Overfit on a single fixed batch for debugging")
+    p.add_argument("--use_recon_loss", action="store_true",
+                   help="Enable autoencoder reconstruction loss (disabled by default)")
+    p.add_argument("--detach_parent_kv", action="store_true",
+                   help="Detach parent pred before cross-attn (default: gradient flows through)")
     p.add_argument("--log_dir", type=str, default=None,
                    help="Directory for CSV logs and images")
     p.add_argument("--save_images_every", type=int, default=0,
