@@ -153,6 +153,10 @@ def build_model(args: argparse.Namespace, device: torch.device) -> HVQVAEModel:
         image_size=args.image_size,
         use_recon_loss=args.use_recon_loss,
         detach_parent_kv=args.detach_parent_kv,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
+        dead_code_threshold=args.dead_code_threshold,
+        entropy_weight=args.entropy_weight,
     )
 
     model = HVQVAEModel(cfg).to(device)
@@ -425,6 +429,17 @@ def parse_args() -> argparse.Namespace:
                    help="Enable autoencoder reconstruction loss (disabled by default)")
     p.add_argument("--detach_parent_kv", action="store_true",
                    help="Detach parent pred before cross-attn (default: gradient flows through)")
+    # VQ codebook options
+    p.add_argument("--use_ema", action="store_true", default=True,
+                   help="EMA codebook updates (default: True)")
+    p.add_argument("--no_ema", dest="use_ema", action="store_false",
+                   help="Disable EMA, use gradient-based codebook")
+    p.add_argument("--ema_decay", type=float, default=0.99,
+                   help="EMA decay factor")
+    p.add_argument("--dead_code_threshold", type=int, default=100,
+                   help="Reset codes unused for N steps (0=disable)")
+    p.add_argument("--entropy_weight", type=float, default=0.0,
+                   help="Entropy regularization weight for codebook usage")
     p.add_argument("--log_dir", type=str, default=None,
                    help="Directory for CSV logs and images")
     p.add_argument("--save_images_every", type=int, default=0,

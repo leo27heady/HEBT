@@ -91,6 +91,10 @@ class HVQVAEModel(nn.Module):
                 n_e=s.num_codes,
                 e_dim=s.channels,
                 beta=cfg.beta,
+                use_ema=cfg.use_ema,
+                ema_decay=cfg.ema_decay,
+                dead_code_threshold=cfg.dead_code_threshold,
+                entropy_weight=cfg.entropy_weight,
             )
 
         # Per-stage predictors (coarsest first, cross-attn from parent)

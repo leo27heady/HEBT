@@ -49,6 +49,12 @@ class HVQVAEConfig:
                                         # False = gradient flows from pixel loss through
                                         # cross-attn KV up to the coarsest stage
 
+    # VQ codebook options
+    use_ema: bool = True                # EMA codebook updates (more stable than gradient)
+    ema_decay: float = 0.99             # EMA decay factor
+    dead_code_threshold: int = 100      # reset codes unused for N steps (0=disable)
+    entropy_weight: float = 0.0         # entropy regularization weight (0=disable)
+
 
 def _default_stages() -> List[HVQVAEStageConfig]:
     """Three-stage hierarchy for 64×64 images: s3 (coarsest) → s2 → s1 (finest).
