@@ -50,15 +50,6 @@ class FreshHVQVAE(nn.Module):
             parent_dim=cfg.pred_dim_mid, lfq_dim=cfg.lfq_dim_bot, max_T=cfg.max_T,
         )
 
-        # Codebook matrices as registered buffers (move to GPU with model)
-        self.register_buffer('codebook_top', build_lfq_codebook_matrix(cfg.lfq_dim_top))
-        self.register_buffer('codebook_mid', build_lfq_codebook_matrix(cfg.lfq_dim_mid))
-        self.register_buffer('codebook_bot', build_lfq_codebook_matrix(cfg.lfq_dim_bot))
-
-        # Share references with predictor stages
-        self.predictor_top.codebook_weights = self.codebook_top
-        self.predictor_mid.codebook_weights = self.codebook_mid
-        self.predictor_bot.codebook_weights = self.codebook_bot
 
     def encode(self, video: torch.Tensor) -> dict:
         """

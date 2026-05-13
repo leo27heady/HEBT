@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .masks import build_temporal_window_mask, build_cross_attn_mask_top_to_mid, build_cross_attn_mask_mid_to_bot
+from .soft_lookup import build_lfq_codebook_matrix
 
 
 class TransformerBlock(nn.Module):
@@ -110,9 +111,9 @@ class PredictorStage(nn.Module):
         # Soft-lookup projection: lfq_dim → dim
         if lfq_dim is not None:
             self.soft_lookup_proj = nn.Linear(lfq_dim, dim)
-
-        # Codebook weights buffer (set externally)
-        self.codebook_weights = None
+            self.register_buffer('codebook_weights', build_lfq_codebook_matrix(lfq_dim))
+        else:
+            self.register_buffer('codebook_weights', None)
 
     def _get_pos_encoding(self, T: int, S: int, device: torch.device) -> torch.Tensor:
         """Combine spatial and temporal positional encodings."""
