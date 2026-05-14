@@ -56,6 +56,7 @@ def generate_synthetic_shapes_batch(B: int, T: int, H: int = 64, W: int = 64, de
     """
     Generate a synthetic video batch using the VIDShapeSyntheticDataset.
     Rotating 2D shapes — more complex and realistic than the simple square.
+    Returns [0,1] range (no ImageNet normalization — decoder uses Sigmoid).
     """
     from types import SimpleNamespace
     from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset
@@ -77,6 +78,7 @@ def generate_synthetic_shapes_batch(B: int, T: int, H: int = 64, W: int = 64, de
         shape_interruption_period_min=1,
         shape_interruption_period_max=4,
         shape_cache_dir="data/vid/shape_cache",
+        shape_no_imagenet_norm=True,
     )
     ds = VIDShapeSyntheticDataset(hparams, size=B, cache=False)
     frames = torch.stack([ds[i] for i in range(B)], dim=0)  # (B, T+1, 3, H, W)
@@ -133,6 +135,40 @@ def train_step(model: FreshHVQVAE, batch: torch.Tensor, opt_enc_dec, opt_pred_to
     return {k: v.item() for k, v in losses.items()}
 
 
+def train_step_encoder_only(model: FreshHVQVAE, batch: torch.Tensor, opt_enc_dec, cfg: FreshHVQVAEConfig):
+    """
+    Encoder-only training step: reconstruction loss only, no predictors.
+    batch: (B, T+1, 3, 64, 64)
+    """
+    B, Tp1 = batch.shape[:2]
+    all_frames = batch.reshape(B * Tp1, 3, batch.shape[3], batch.shape[4])
+
+    enc = model.encode(batch)
+    recon_bot, recon_mid, recon_top = model.reconstruct(enc, B, Tp1)
+
+    mse_bot = F.mse_loss(recon_bot, all_frames)
+    mse_mid = F.mse_loss(recon_mid, all_frames)
+    mse_top = F.mse_loss(recon_top, all_frames)
+    vq_loss = enc['loss_bot'] + enc['loss_mid'] + enc['loss_top']
+
+    recon_total = (
+        cfg.weight_mse_bot * mse_bot +
+        cfg.weight_mse_mid * mse_mid +
+        cfg.weight_mse_top * mse_top +
+        vq_loss
+    )
+
+    opt_enc_dec.zero_grad()
+    recon_total.backward()
+    torch.nn.utils.clip_grad_norm_(model.get_encoder_decoder_params(), max_norm=cfg.max_grad_norm)
+    opt_enc_dec.step()
+
+    return {
+        'mse_bot': mse_bot.item(), 'mse_mid': mse_mid.item(), 'mse_top': mse_top.item(),
+        'vq_loss': vq_loss.item(),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Fresh HVQVAE Training')
     parser.add_argument('--batch_size', type=int, default=2)
@@ -148,11 +184,14 @@ def main():
     parser.add_argument('--data_source', type=str, default='simple',
                         choices=['simple', 'shapes'],
                         help="'simple' = translating square; 'shapes' = rotating 2D shapes (VIDShapeSyntheticDataset)")
+    parser.add_argument('--encoder_only', action='store_true',
+                        help='Train encoder+decoder only (no predictors). For verifying reconstruction.')
     args = parser.parse_args()
 
     print(f"Device: {args.device}")
     print(f"Batch size: {args.batch_size}, T: {args.T}, Steps: {args.steps}")
     print(f"Data source: {args.data_source}")
+    print(f"Encoder only: {args.encoder_only}")
     print(f"Log dir: {args.log_dir}")
     if args.save_images_every > 0:
         print(f"Saving images every {args.save_images_every} steps")
@@ -170,9 +209,12 @@ def main():
 
     # Optimizers (strictly separated)
     opt_enc_dec = Adam(model.get_encoder_decoder_params(), lr=cfg.lr_encoder_decoder)
-    opt_pred_top = Adam(model.get_predictor_top_params(), lr=cfg.lr_predictor_top)
-    opt_pred_mid = Adam(model.get_predictor_mid_params(), lr=cfg.lr_predictor_mid)
-    opt_pred_bot = Adam(model.get_predictor_bot_params(), lr=cfg.lr_predictor_bot)
+    if not args.encoder_only:
+        opt_pred_top = Adam(model.get_predictor_top_params(), lr=cfg.lr_predictor_top)
+        opt_pred_mid = Adam(model.get_predictor_mid_params(), lr=cfg.lr_predictor_mid)
+        opt_pred_bot = Adam(model.get_predictor_bot_params(), lr=cfg.lr_predictor_bot)
+    else:
+        opt_pred_top = opt_pred_mid = opt_pred_bot = None
 
     # Generate synthetic data
     if args.overfit_single_batch:
@@ -183,8 +225,11 @@ def main():
 
     # CSV logging setup
     csv_path = os.path.join(args.log_dir, 'training_log.csv')
-    csv_fields = ['step', 'mse_bot', 'mse_mid', 'mse_top', 'vq_loss',
-                  'ce_top', 'ce_mid', 'ce_bot', 'time_s']
+    if args.encoder_only:
+        csv_fields = ['step', 'mse_bot', 'mse_mid', 'mse_top', 'vq_loss', 'time_s']
+    else:
+        csv_fields = ['step', 'mse_bot', 'mse_mid', 'mse_top', 'vq_loss',
+                      'ce_top', 'ce_mid', 'ce_bot', 'time_s']
     csv_file = open(csv_path, 'w', newline='')
     csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
     csv_writer.writeheader()
@@ -196,7 +241,10 @@ def main():
             batch = make_batch(args.data_source, args.batch_size, args.T, device=args.device)
 
         t0 = time.time()
-        losses = train_step(model, batch, opt_enc_dec, opt_pred_top, opt_pred_mid, opt_pred_bot, cfg)
+        if args.encoder_only:
+            losses = train_step_encoder_only(model, batch, opt_enc_dec, cfg)
+        else:
+            losses = train_step(model, batch, opt_enc_dec, opt_pred_top, opt_pred_mid, opt_pred_bot, cfg)
         dt = time.time() - t0
 
         # CSV logging (every step)
@@ -208,11 +256,16 @@ def main():
 
         # Console logging
         if step % 10 == 0 or step == 1:
-            print(f"Step {step:4d} | "
-                  f"mse_bot={losses['mse_bot']:.4f} mse_mid={losses['mse_mid']:.4f} "
-                  f"mse_top={losses['mse_top']:.4f} vq={losses['vq_loss']:.4f} | "
-                  f"ce_top={losses['ce_top']:.3f} ce_mid={losses['ce_mid']:.3f} "
-                  f"ce_bot={losses['ce_bot']:.3f} | {dt:.2f}s")
+            if args.encoder_only:
+                print(f"Step {step:4d} | "
+                      f"mse_bot={losses['mse_bot']:.4f} mse_mid={losses['mse_mid']:.4f} "
+                      f"mse_top={losses['mse_top']:.4f} vq={losses['vq_loss']:.4f} | {dt:.2f}s")
+            else:
+                print(f"Step {step:4d} | "
+                      f"mse_bot={losses['mse_bot']:.4f} mse_mid={losses['mse_mid']:.4f} "
+                      f"mse_top={losses['mse_top']:.4f} vq={losses['vq_loss']:.4f} | "
+                      f"ce_top={losses['ce_top']:.3f} ce_mid={losses['ce_mid']:.3f} "
+                      f"ce_bot={losses['ce_bot']:.3f} | {dt:.2f}s")
 
         # Image saving
         if args.save_images_every > 0 and step % args.save_images_every == 0:
@@ -235,9 +288,10 @@ def main():
         print(f"  mse_bot: {losses['mse_bot']:.6f} (should approach 0)")
         print(f"  mse_mid: {losses['mse_mid']:.6f} (should be small)")
         print(f"  mse_top: {losses['mse_top']:.6f} (stays relatively high — expected)")
-        print(f"  ce_top:  {losses['ce_top']:.4f} (should approach 0)")
-        print(f"  ce_mid:  {losses['ce_mid']:.4f} (should approach 0)")
-        print(f"  ce_bot:  {losses['ce_bot']:.4f} (should approach 0)")
+        if not args.encoder_only:
+            print(f"  ce_top:  {losses['ce_top']:.4f} (should approach 0)")
+            print(f"  ce_mid:  {losses['ce_mid']:.4f} (should approach 0)")
+            print(f"  ce_bot:  {losses['ce_bot']:.4f} (should approach 0)")
 
 
 if __name__ == '__main__':

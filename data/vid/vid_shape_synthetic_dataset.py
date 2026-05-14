@@ -53,12 +53,19 @@ class VIDShapeSyntheticDataset(Dataset):
 
         self.render_size = max(self.image_dims)
 
-        # ImageNet normalization (applied at load time)
-        self.transform = transforms.Compose([
-            transforms.Resize((self.image_dims[0], self.image_dims[1])),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        # Normalization (optional ImageNet normalization, or plain [0,1] for VQ-VAE)
+        no_norm = getattr(hparams, "shape_no_imagenet_norm", False)
+        if no_norm:
+            self.transform = transforms.Compose([
+                transforms.Resize((self.image_dims[0], self.image_dims[1])),
+                transforms.ToTensor(),  # [0,1] range only
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((self.image_dims[0], self.image_dims[1])),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
 
         # Cache directory
         cache_root = getattr(hparams, "shape_cache_dir", "data/vid/shape_cache")
