@@ -3,7 +3,7 @@
 from .config import FreshHVQVAEConfig
 from .model import FreshHVQVAE
 from .encoder import HierarchicalEncoder, ResBlock
-from .decoder import Decoder, UpscaleMid, UpscaleTop
+from .decoder import DecoderBot, DecoderMid, DecoderTop
 from .predictor import PredictorStage, TransformerBlock
 from .masks import (
     build_temporal_window_mask,
@@ -17,9 +17,9 @@ __all__ = [
     'FreshHVQVAE',
     'HierarchicalEncoder',
     'ResBlock',
-    'Decoder',
-    'UpscaleMid',
-    'UpscaleTop',
+    'DecoderBot',
+    'DecoderMid',
+    'DecoderTop',
     'PredictorStage',
     'TransformerBlock',
     'build_temporal_window_mask',

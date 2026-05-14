@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from .config import FreshHVQVAEConfig
 from .encoder import HierarchicalEncoder
-from .decoder import Decoder, UpscaleMid, UpscaleTop
+from .decoder import DecoderBot, DecoderMid, DecoderTop
 from .predictor import PredictorStage
 from .soft_lookup import build_lfq_codebook_matrix
 
@@ -15,40 +15,42 @@ class FreshHVQVAE(nn.Module):
     """
     Fresh Hierarchical VQ-VAE for video prediction.
     3-stage hierarchy: bot (16x16), mid (4x4), top (1x1).
-    Per-stage reconstruction + isolated per-stage prediction.
+    Per-stage reconstruction with per-stage decoders + isolated per-stage prediction.
     """
 
-    def __init__(self, cfg: FreshHVQVAEConfig):
+    def __init__(self, cfg: FreshHVQVAEConfig, skip_predictors: bool = False):
         super().__init__()
         self.cfg = cfg
+        self.skip_predictors = skip_predictors
 
         # Encoder
         self.encoder = HierarchicalEncoder(cfg)
 
-        # Decoder + Upscalers
-        self.decoder = Decoder(cfg.C_bot)
-        self.upscale_mid = UpscaleMid(cfg.C_mid, cfg.C_bot)
-        self.upscale_top = UpscaleTop(cfg.C_top, cfg.C_bot)
+        # Per-stage decoders
+        self.decoder_bot = DecoderBot(cfg.C_bot)
+        self.decoder_mid = DecoderMid(cfg.C_mid)
+        self.decoder_top = DecoderTop(cfg.C_top)
 
-        # Predictor stages
-        self.predictor_top = PredictorStage(
-            dim=cfg.pred_dim_top, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-            codebook_size=cfg.K_top, spatial_size=1,
-            temporal_window=cfg.window_top, has_parent=False,
-            lfq_dim=cfg.lfq_dim_top, max_T=cfg.max_T,
-        )
-        self.predictor_mid = PredictorStage(
-            dim=cfg.pred_dim_mid, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-            codebook_size=cfg.K_mid, spatial_size=16,
-            temporal_window=cfg.window_mid, has_parent=True,
-            parent_dim=cfg.pred_dim_top, lfq_dim=cfg.lfq_dim_mid, max_T=cfg.max_T,
-        )
-        self.predictor_bot = PredictorStage(
-            dim=cfg.pred_dim_bot, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-            codebook_size=cfg.K_bot, spatial_size=256,
-            temporal_window=cfg.window_bot, has_parent=True,
-            parent_dim=cfg.pred_dim_mid, lfq_dim=cfg.lfq_dim_bot, max_T=cfg.max_T,
-        )
+        # Predictor stages (optional)
+        if not skip_predictors:
+            self.predictor_top = PredictorStage(
+                dim=cfg.pred_dim_top, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
+                codebook_size=cfg.K_top, spatial_size=1,
+                temporal_window=cfg.window_top, has_parent=False,
+                lfq_dim=cfg.lfq_dim_top, max_T=cfg.max_T,
+            )
+            self.predictor_mid = PredictorStage(
+                dim=cfg.pred_dim_mid, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
+                codebook_size=cfg.K_mid, spatial_size=16,
+                temporal_window=cfg.window_mid, has_parent=True,
+                parent_dim=cfg.pred_dim_top, lfq_dim=cfg.lfq_dim_mid, max_T=cfg.max_T,
+            )
+            self.predictor_bot = PredictorStage(
+                dim=cfg.pred_dim_bot, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
+                codebook_size=cfg.K_bot, spatial_size=256,
+                temporal_window=cfg.window_bot, has_parent=True,
+                parent_dim=cfg.pred_dim_mid, lfq_dim=cfg.lfq_dim_bot, max_T=cfg.max_T,
+            )
 
 
     def encode(self, video: torch.Tensor) -> dict:
@@ -79,17 +81,17 @@ class FreshHVQVAE(nn.Module):
         """
         cfg = self.cfg
 
-        # Bot: direct to decoder
+        # Bot: direct to decoder_bot
         quant_bot = enc['quant_bot'].reshape(B * Tp1, cfg.C_bot, 16, 16)
-        recon_bot = self.decoder(quant_bot)
+        recon_bot = self.decoder_bot(quant_bot)
 
-        # Mid: upscale then decode
+        # Mid: direct to decoder_mid
         quant_mid = enc['quant_mid'].reshape(B * Tp1, cfg.C_mid, 4, 4)
-        recon_mid = self.decoder(self.upscale_mid(quant_mid))
+        recon_mid = self.decoder_mid(quant_mid)
 
-        # Top: upscale then decode
+        # Top: direct to decoder_top
         quant_top = enc['quant_top'].reshape(B * Tp1, cfg.C_top, 1, 1)
-        recon_top = self.decoder(self.upscale_top(quant_top))
+        recon_top = self.decoder_top(quant_top)
 
         return recon_bot, recon_mid, recon_top
 
@@ -167,9 +169,9 @@ class FreshHVQVAE(nn.Module):
         """Parameters updated by reconstruction loss."""
         return (
             list(self.encoder.parameters()) +
-            list(self.decoder.parameters()) +
-            list(self.upscale_mid.parameters()) +
-            list(self.upscale_top.parameters())
+            list(self.decoder_bot.parameters()) +
+            list(self.decoder_mid.parameters()) +
+            list(self.decoder_top.parameters())
         )
 
     def get_predictor_top_params(self):
@@ -188,16 +190,9 @@ class FreshHVQVAE(nn.Module):
         video: (B, T+1, 3, 64, 64)
         Returns: (3, H_grid, W_grid) image tensor in [0,1].
 
-        Grid layout: (T+1) columns × 7 rows, with text labels.
-          Header row: frame index labels (0, 1, ..., T)
-          Left column: row name labels
-          Row 0: GT           — all frames 0..T
-          Row 1: Enc Bot      — all frames 0..T (encoder bot reconstruction)
-          Row 2: Enc Mid      — all frames 0..T (encoder mid reconstruction)
-          Row 3: Enc Top      — all frames 0..T (encoder top reconstruction)
-          Row 4: Pred Bot     — blank + frames 1..T (predictor bot decoded)
-          Row 5: Pred Mid     — blank + frames 1..T (predictor mid decoded)
-          Row 6: Pred Top     — blank + frames 1..T (predictor top decoded)
+        Grid layout depends on whether predictors are present:
+          Encoder-only: 4 rows (GT, Enc Bot, Enc Mid, Enc Top)
+          Full: 7 rows (+ Pred Bot, Pred Mid, Pred Top)
         """
         from PIL import Image, ImageDraw, ImageFont
 
@@ -212,58 +207,59 @@ class FreshHVQVAE(nn.Module):
 
         # --- Encoder reconstructions (ALL frames 0..T) ---
         quant_bot_all = enc['quant_bot'][:1].reshape(Tp1, cfg.C_bot, 16, 16)
-        recon_enc_bot = self.decoder(quant_bot_all)  # (T+1, 3, 64, 64)
+        recon_enc_bot = self.decoder_bot(quant_bot_all)
 
         quant_mid_all = enc['quant_mid'][:1].reshape(Tp1, cfg.C_mid, 4, 4)
-        recon_enc_mid = self.decoder(self.upscale_mid(quant_mid_all))
+        recon_enc_mid = self.decoder_mid(quant_mid_all)
 
         quant_top_all = enc['quant_top'][:1].reshape(Tp1, cfg.C_top, 1, 1)
-        recon_enc_top = self.decoder(self.upscale_top(quant_top_all))
-
-        # --- Predictor decoded (predicted frames 1..T) ---
-        pred = self.predict(enc, T)
-
-        # Bot predictor
-        pred_idx_bot = pred['logits_bot'][0].argmax(dim=-1)  # (T*256,)
-        pred_codes_bot = self.encoder.vq_bot.indices_to_codes(pred_idx_bot)
-        pred_codes_bot = pred_codes_bot.reshape(T, 16, 16, cfg.lfq_dim_bot).permute(0, 3, 1, 2)
-        pred_recon_bot = self.decoder(self.encoder.bot_from_vq(pred_codes_bot))  # (T, 3, H, W)
-
-        # Mid predictor
-        pred_idx_mid = pred['logits_mid'][0].argmax(dim=-1)
-        pred_codes_mid = self.encoder.vq_mid.indices_to_codes(pred_idx_mid)
-        pred_codes_mid = pred_codes_mid.reshape(T, 4, 4, cfg.lfq_dim_mid).permute(0, 3, 1, 2)
-        pred_recon_mid = self.decoder(self.upscale_mid(self.encoder.mid_from_vq(pred_codes_mid)))
-
-        # Top predictor
-        pred_idx_top = pred['logits_top'][0].argmax(dim=-1)
-        pred_codes_top = self.encoder.vq_top.indices_to_codes(pred_idx_top)
-        pred_codes_top = pred_codes_top.reshape(T, 1, 1, cfg.lfq_dim_top).permute(0, 3, 1, 2)
-        pred_recon_top = self.decoder(self.upscale_top(self.encoder.top_from_vq(pred_codes_top)))
-
-        # Pad predictor rows: blank first frame + T predicted frames
-        blank = torch.zeros(1, 3, H, W, device=device)
-        pred_recon_bot_padded = torch.cat([blank, pred_recon_bot], dim=0)   # (T+1, 3, H, W)
-        pred_recon_mid_padded = torch.cat([blank, pred_recon_mid], dim=0)
-        pred_recon_top_padded = torch.cat([blank, pred_recon_top], dim=0)
+        recon_enc_top = self.decoder_top(quant_top_all)
 
         # Ground truth all frames
         gt_all = video[0]  # (T+1, 3, 64, 64)
 
-        # Build pixel grid: 7 rows × (T+1) columns
-        row_data = [
-            gt_all, recon_enc_bot, recon_enc_mid, recon_enc_top,
-            pred_recon_bot_padded, pred_recon_mid_padded, pred_recon_top_padded,
-        ]
-        row_labels = ['GT', 'Enc Bot', 'Enc Mid', 'Enc Top',
-                       'Pred Bot', 'Pred Mid', 'Pred Top']
+        row_data = [gt_all, recon_enc_bot, recon_enc_mid, recon_enc_top]
+        row_labels = ['GT', 'Enc Bot', 'Enc Mid', 'Enc Top']
+
+        # --- Predictor decoded (predicted frames 1..T) ---
+        if not self.skip_predictors:
+            pred = self.predict(enc, T)
+
+            # Bot predictor
+            pred_idx_bot = pred['logits_bot'][0].argmax(dim=-1)
+            pred_codes_bot = self.encoder.vq_bot.indices_to_codes(pred_idx_bot)
+            pred_codes_bot = pred_codes_bot.reshape(T, 16, 16, cfg.lfq_dim_bot).permute(0, 3, 1, 2)
+            pred_recon_bot = self.decoder_bot(self.encoder.bot_from_vq(pred_codes_bot))
+
+            # Mid predictor
+            pred_idx_mid = pred['logits_mid'][0].argmax(dim=-1)
+            pred_codes_mid = self.encoder.vq_mid.indices_to_codes(pred_idx_mid)
+            pred_codes_mid = pred_codes_mid.reshape(T, 4, 4, cfg.lfq_dim_mid).permute(0, 3, 1, 2)
+            pred_recon_mid = self.decoder_mid(self.encoder.mid_from_vq(pred_codes_mid))
+
+            # Top predictor
+            pred_idx_top = pred['logits_top'][0].argmax(dim=-1)
+            pred_codes_top = self.encoder.vq_top.indices_to_codes(pred_idx_top)
+            pred_codes_top = pred_codes_top.reshape(T, 1, 1, cfg.lfq_dim_top).permute(0, 3, 1, 2)
+            pred_recon_top = self.decoder_top(self.encoder.top_from_vq(pred_codes_top))
+
+            # Pad predictor rows: blank first frame + T predicted frames
+            blank = torch.zeros(1, 3, H, W, device=device)
+            row_data += [
+                torch.cat([blank, pred_recon_bot], dim=0),
+                torch.cat([blank, pred_recon_mid], dim=0),
+                torch.cat([blank, pred_recon_top], dim=0),
+            ]
+            row_labels += ['Pred Bot', 'Pred Mid', 'Pred Top']
 
         # Assemble raw grid without labels
+        n_rows = len(row_data)
+        n_cols = Tp1
         row_images = []
         for frames in row_data:
-            row_img = torch.cat([frames[t] for t in range(Tp1)], dim=2)  # (3, H, Tp1*W)
+            row_img = torch.cat([frames[t] for t in range(Tp1)], dim=2)
             row_images.append(row_img)
-        raw_grid = torch.cat(row_images, dim=1)  # (3, 7*H, Tp1*W)
+        raw_grid = torch.cat(row_images, dim=1)
         raw_grid = raw_grid.clamp(0, 1)
 
         # Convert to PIL for text rendering
@@ -271,10 +267,8 @@ class FreshHVQVAE(nn.Module):
         pil_img = Image.fromarray(grid_np)
 
         # Add margins for labels
-        label_left_w = 70   # pixels for row labels
-        label_top_h = 18    # pixels for column headers
-        n_rows = 7
-        n_cols = Tp1
+        label_left_w = 70
+        label_top_h = 18
 
         canvas = Image.new('RGB', (label_left_w + n_cols * W, label_top_h + n_rows * H), (0, 0, 0))
         canvas.paste(pil_img, (label_left_w, label_top_h))
@@ -295,7 +289,6 @@ class FreshHVQVAE(nn.Module):
             y = label_top_h + r * H + H // 2 - 6
             draw.text((3, y), label, fill=(255, 255, 255), font=font)
 
-        # Convert back to tensor
         import numpy as np
         result = torch.from_numpy(np.array(canvas)).permute(2, 0, 1).float() / 255.0
         return result

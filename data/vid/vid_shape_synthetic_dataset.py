@@ -145,77 +145,7 @@ class VIDShapeSyntheticDataset(Dataset):
         t0 = time.time()
 
         for idx in range(self.size):
-            # Create new figure, reuse scene
-            if is_2d:
-                base = random.randint(self._scale(0.5), self._scale(1)) / self.SCALE_FACTOR
-                shift = random.randint(self._scale(-0.2), self._scale(base + 0.2)) / self.SCALE_FACTOR
-                height = random.randint(self._scale(0.5), self._scale(1)) / self.SCALE_FACTOR
-                figure = creator_2d.create_triangle(base, shift, height)
-            else:
-                num_blocks = random.randint(self.min_cubes, self.max_cubes)
-                figure, _ = creator_3d.create_connected_cubes(num_blocks)
-
-            scene.prepare_scene(
-                figure,
-                bg_color="white",
-                mesh_color="black" if is_2d else "gray",
-                lighting=not is_2d,
-                show_edges=False,
-                line_width=4.0,
-                distance_factor=1.0 if is_2d else 2.5,
-                fixed_camera_distance=2.7 if is_2d else None,
-                axis="z",
-            )
-            scene.plotter.render()
-
-            step = np.array([self._angle_gen(), self._angle_gen(), self._angle_gen()])
-            if is_2d:
-                step[0] = 0.0
-                step[1] = 0.0
-
-            selected_patterns = self._select_patterns()
-            acceleration = 1.0
-            oscillation_period = 0
-            interruption_period = 0
-            step_swap = np.array([0.0, 0.0, 0.0])
-
-            if TemporalPattern.OSCILLATION in selected_patterns:
-                oscillation_period = random.randint(self.oscillation_period_min, self.oscillation_period_max)
-            elif TemporalPattern.INTERRUPTION in selected_patterns:
-                interruption_period = random.randint(self.interruption_period_min, self.interruption_period_max)
-
-            if TemporalPattern.ACCELERATION in selected_patterns:
-                step /= 1.5
-                acceleration = 1.0 + random.randint(
-                    self._scale(self.accel_min / 2), self._scale(self.accel_max / 2)
-                ) / (self.SCALE_FACTOR * 100)
-            elif TemporalPattern.DECELERATION in selected_patterns:
-                step *= 1.5
-                dec = 1.0 + random.randint(
-                    self._scale(self.accel_min * 2), self._scale(self.accel_max * 2)
-                ) / (self.SCALE_FACTOR * 100)
-                acceleration = 1.0 / dec
-
-            # Render frames as uint8 numpy array
-            frames = np.empty((self.context_length, self.render_size, self.render_size, 3), dtype=np.uint8)
-            for i in range(self.context_length):
-                if not is_2d:
-                    figure.rotate_x(step[0], point=scene.center_of_mass, inplace=True)
-                    figure.rotate_y(step[1], point=scene.center_of_mass, inplace=True)
-                figure.rotate_z(step[2], point=scene.center_of_mass, inplace=True)
-                scene.plotter.render()
-                frames[i] = np.array(scene.plotter.screenshot())
-
-                if TemporalPattern.OSCILLATION in selected_patterns and oscillation_period > 0:
-                    if (i + 1) % oscillation_period == 0:
-                        step = step * -1.0
-                elif TemporalPattern.INTERRUPTION in selected_patterns and interruption_period > 0:
-                    if (i + 1) % interruption_period == 0:
-                        step, step_swap = step_swap, step
-
-                if TemporalPattern.ACCELERATION in selected_patterns or TemporalPattern.DECELERATION in selected_patterns:
-                    step = step * acceleration
-
+            frames = self._render_with_scene(scene, creator_2d, creator_3d, is_2d)
             np.save(os.path.join(self.cache_dir, f"{idx}.npy"), frames)
 
             if (idx + 1) % 500 == 0:
@@ -238,14 +168,38 @@ class VIDShapeSyntheticDataset(Dataset):
 
     def _generate_in_memory(self):
         """Generate all samples into RAM (no disk I/O). Used when cache=False."""
-        return [self._render_one_sample() for _ in range(self.size)]
-
-    def _render_one_sample(self):
-        """Render a single sample as a (context_length, H, W, 3) uint8 numpy array."""
         is_2d = self.scene_type == SceneType.DIM_2
         creator_2d = Random2DShapeCreator()
         creator_3d = None if is_2d else Random3DShapeCreator(self.max_cubes, include_reflections=False)
 
+        if is_2d:
+            init_fig = creator_2d.create_equilateral_triangle()
+        else:
+            init_fig, _ = creator_3d.create_connected_cubes(self.min_cubes)
+
+        scene = Scene(
+            init_fig, self.scene_type, self.render_size,
+            bg_color="white",
+            mesh_color="black" if is_2d else "gray",
+            show_edges=False,
+            lighting=not is_2d,
+            line_width=4.0,
+            distance_factor=1.0 if is_2d else 2.5,
+            fixed_camera_distance=2.7 if is_2d else None,
+            axis="z",
+        )
+        scene.plotter.render()
+
+        samples = [self._render_with_scene(scene, creator_2d, creator_3d, is_2d)
+                    for _ in range(self.size)]
+        scene.plotter.close()
+        return samples
+
+    def _render_with_scene(self, scene, creator_2d, creator_3d, is_2d):
+        """Render a single sample using an existing scene (shared between cache and in-memory paths).
+
+        Returns (context_length, render_size, render_size, 3) uint8 numpy array.
+        """
         if is_2d:
             base = random.randint(self._scale(0.5), self._scale(1)) / self.SCALE_FACTOR
             shift = random.randint(self._scale(-0.2), self._scale(base + 0.2)) / self.SCALE_FACTOR
@@ -255,12 +209,12 @@ class VIDShapeSyntheticDataset(Dataset):
             num_blocks = random.randint(self.min_cubes, self.max_cubes)
             figure, _ = creator_3d.create_connected_cubes(num_blocks)
 
-        scene = Scene(
-            figure, self.scene_type, self.render_size,
+        scene.prepare_scene(
+            figure,
             bg_color="white",
             mesh_color="black" if is_2d else "gray",
-            show_edges=False,
             lighting=not is_2d,
+            show_edges=False,
             line_width=4.0,
             distance_factor=1.0 if is_2d else 2.5,
             fixed_camera_distance=2.7 if is_2d else None,
@@ -315,7 +269,6 @@ class VIDShapeSyntheticDataset(Dataset):
             if TemporalPattern.ACCELERATION in selected_patterns or TemporalPattern.DECELERATION in selected_patterns:
                 step = step * acceleration
 
-        scene.plotter.close()
         return frames
 
     def __getitem__(self, idx):
