@@ -9,19 +9,19 @@ class FreshHVQVAEConfig:
     image_size: int = 64
 
     # Encoder channels
-    C_bot: int = 128
-    C_mid: int = 192
+    C_bot: int = 64
+    C_mid: int = 128
     C_top: int = 256
 
     # Codebook sizes (must be powers of 2 for LFQ)
-    K_bot: int = 4096   # 2^12
-    K_mid: int = 1024   # 2^10
-    K_top: int = 512    # 2^9
+    K_bot: int = 2**14
+    K_mid: int = 2**10
+    K_top: int = 2**6
 
     # LFQ dims (= log2(K))
-    lfq_dim_bot: int = 12
+    lfq_dim_bot: int = 14
     lfq_dim_mid: int = 10
-    lfq_dim_top: int = 9
+    lfq_dim_top: int = 6
 
     # LFQ entropy regularization
     entropy_loss_weight: float = 0.1
@@ -31,8 +31,8 @@ class FreshHVQVAEConfig:
     pred_n_heads: int = 8
     pred_n_layers: int = 4
     pred_dim_top: int = 256    # = C_top
-    pred_dim_mid: int = 192    # = C_mid
-    pred_dim_bot: int = 128    # = C_bot
+    pred_dim_mid: int = 128    # = C_mid
+    pred_dim_bot: int = 64     # = C_bot
 
     # Temporal windows
     window_top: int = -1       # -1 = full context (causal)
