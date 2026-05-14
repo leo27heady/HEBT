@@ -29,7 +29,8 @@ class VIDShapeSyntheticDataset(Dataset):
 
     SCALE_FACTOR = 1000
 
-    def __init__(self, hparams, size=10000):
+    def __init__(self, hparams, size=10000, cache=True):
+        self.cache = cache
         self.context_length = hparams.context_length
         self.image_dims = hparams.image_dims
 
@@ -65,7 +66,9 @@ class VIDShapeSyntheticDataset(Dataset):
         self.cache_dir = os.path.join(cache_root, config_hash)
         self.size = size
 
-        if self._cache_valid():
+        if not self.cache:
+            self._samples = self._generate_in_memory()
+        elif self._cache_valid():
             print(f"[VIDShapeSyntheticDataset] Using cached dataset at {self.cache_dir} ({self.size} samples)")
         else:
             self._generate_and_save()
@@ -226,8 +229,91 @@ class VIDShapeSyntheticDataset(Dataset):
     def __len__(self):
         return self.size
 
+    def _generate_in_memory(self):
+        """Generate all samples into RAM (no disk I/O). Used when cache=False."""
+        return [self._render_one_sample() for _ in range(self.size)]
+
+    def _render_one_sample(self):
+        """Render a single sample as a (context_length, H, W, 3) uint8 numpy array."""
+        is_2d = self.scene_type == SceneType.DIM_2
+        creator_2d = Random2DShapeCreator()
+        creator_3d = None if is_2d else Random3DShapeCreator(self.max_cubes, include_reflections=False)
+
+        if is_2d:
+            base = random.randint(self._scale(0.5), self._scale(1)) / self.SCALE_FACTOR
+            shift = random.randint(self._scale(-0.2), self._scale(base + 0.2)) / self.SCALE_FACTOR
+            height = random.randint(self._scale(0.5), self._scale(1)) / self.SCALE_FACTOR
+            figure = creator_2d.create_triangle(base, shift, height)
+        else:
+            num_blocks = random.randint(self.min_cubes, self.max_cubes)
+            figure, _ = creator_3d.create_connected_cubes(num_blocks)
+
+        scene = Scene(
+            figure, self.scene_type, self.render_size,
+            bg_color="white",
+            mesh_color="black" if is_2d else "gray",
+            show_edges=False,
+            lighting=not is_2d,
+            line_width=4.0,
+            distance_factor=1.0 if is_2d else 2.5,
+            fixed_camera_distance=2.7 if is_2d else None,
+            axis="z",
+        )
+        scene.plotter.render()
+
+        step = np.array([self._angle_gen(), self._angle_gen(), self._angle_gen()])
+        if is_2d:
+            step[0] = 0.0
+            step[1] = 0.0
+
+        selected_patterns = self._select_patterns()
+        acceleration = 1.0
+        oscillation_period = 0
+        interruption_period = 0
+        step_swap = np.array([0.0, 0.0, 0.0])
+
+        if TemporalPattern.OSCILLATION in selected_patterns:
+            oscillation_period = random.randint(self.oscillation_period_min, self.oscillation_period_max)
+        elif TemporalPattern.INTERRUPTION in selected_patterns:
+            interruption_period = random.randint(self.interruption_period_min, self.interruption_period_max)
+
+        if TemporalPattern.ACCELERATION in selected_patterns:
+            step /= 1.5
+            acceleration = 1.0 + random.randint(
+                self._scale(self.accel_min / 2), self._scale(self.accel_max / 2)
+            ) / (self.SCALE_FACTOR * 100)
+        elif TemporalPattern.DECELERATION in selected_patterns:
+            step *= 1.5
+            dec = 1.0 + random.randint(
+                self._scale(self.accel_min * 2), self._scale(self.accel_max * 2)
+            ) / (self.SCALE_FACTOR * 100)
+            acceleration = 1.0 / dec
+
+        frames = np.empty((self.context_length, self.render_size, self.render_size, 3), dtype=np.uint8)
+        for i in range(self.context_length):
+            if not is_2d:
+                figure.rotate_x(step[0], point=scene.center_of_mass, inplace=True)
+                figure.rotate_y(step[1], point=scene.center_of_mass, inplace=True)
+            figure.rotate_z(step[2], point=scene.center_of_mass, inplace=True)
+            scene.plotter.render()
+            frames[i] = np.array(scene.plotter.screenshot())
+
+            if TemporalPattern.OSCILLATION in selected_patterns and oscillation_period > 0:
+                if (i + 1) % oscillation_period == 0:
+                    step = step * -1.0
+            elif TemporalPattern.INTERRUPTION in selected_patterns and interruption_period > 0:
+                if (i + 1) % interruption_period == 0:
+                    step, step_swap = step_swap, step
+
+            if TemporalPattern.ACCELERATION in selected_patterns or TemporalPattern.DECELERATION in selected_patterns:
+                step = step * acceleration
+
+        scene.plotter.close()
+        return frames
+
     def __getitem__(self, idx):
-        frames_uint8 = np.load(os.path.join(self.cache_dir, f"{idx}.npy"))  # (T, H, W, 3)
+        frames_uint8 = self._samples[idx] if not self.cache else \
+            np.load(os.path.join(self.cache_dir, f"{idx}.npy"))  # (T, H, W, 3)
         frame_tensors = []
         for i in range(frames_uint8.shape[0]):
             pil_image = Image.fromarray(frames_uint8[i])

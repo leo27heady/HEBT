@@ -180,3 +180,122 @@ class FreshHVQVAE(nn.Module):
 
     def get_predictor_bot_params(self):
         return list(self.predictor_bot.parameters())
+
+    @torch.no_grad()
+    def build_visualization(self, video: torch.Tensor) -> torch.Tensor:
+        """
+        Build a visualization grid for the first sample in the batch.
+        video: (B, T+1, 3, 64, 64)
+        Returns: (3, H_grid, W_grid) image tensor in [0,1].
+
+        Grid layout: (T+1) columns × 7 rows, with text labels.
+          Header row: frame index labels (0, 1, ..., T)
+          Left column: row name labels
+          Row 0: GT           — all frames 0..T
+          Row 1: Enc Bot      — all frames 0..T (encoder bot reconstruction)
+          Row 2: Enc Mid      — all frames 0..T (encoder mid reconstruction)
+          Row 3: Enc Top      — all frames 0..T (encoder top reconstruction)
+          Row 4: Pred Bot     — blank + frames 1..T (predictor bot decoded)
+          Row 5: Pred Mid     — blank + frames 1..T (predictor mid decoded)
+          Row 6: Pred Top     — blank + frames 1..T (predictor top decoded)
+        """
+        from PIL import Image, ImageDraw, ImageFont
+
+        cfg = self.cfg
+        B, Tp1 = video.shape[:2]
+        T = Tp1 - 1
+        H, W = video.shape[3], video.shape[4]
+        device = video.device
+
+        # Encode all frames
+        enc = self.encode(video)
+
+        # --- Encoder reconstructions (ALL frames 0..T) ---
+        quant_bot_all = enc['quant_bot'][:1].reshape(Tp1, cfg.C_bot, 16, 16)
+        recon_enc_bot = self.decoder(quant_bot_all)  # (T+1, 3, 64, 64)
+
+        quant_mid_all = enc['quant_mid'][:1].reshape(Tp1, cfg.C_mid, 4, 4)
+        recon_enc_mid = self.decoder(self.upscale_mid(quant_mid_all))
+
+        quant_top_all = enc['quant_top'][:1].reshape(Tp1, cfg.C_top, 1, 1)
+        recon_enc_top = self.decoder(self.upscale_top(quant_top_all))
+
+        # --- Predictor decoded (predicted frames 1..T) ---
+        pred = self.predict(enc, T)
+
+        # Bot predictor
+        pred_idx_bot = pred['logits_bot'][0].argmax(dim=-1)  # (T*256,)
+        pred_codes_bot = self.encoder.vq_bot.indices_to_codes(pred_idx_bot)
+        pred_codes_bot = pred_codes_bot.reshape(T, 16, 16, cfg.lfq_dim_bot).permute(0, 3, 1, 2)
+        pred_recon_bot = self.decoder(self.encoder.bot_from_vq(pred_codes_bot))  # (T, 3, H, W)
+
+        # Mid predictor
+        pred_idx_mid = pred['logits_mid'][0].argmax(dim=-1)
+        pred_codes_mid = self.encoder.vq_mid.indices_to_codes(pred_idx_mid)
+        pred_codes_mid = pred_codes_mid.reshape(T, 4, 4, cfg.lfq_dim_mid).permute(0, 3, 1, 2)
+        pred_recon_mid = self.decoder(self.upscale_mid(self.encoder.mid_from_vq(pred_codes_mid)))
+
+        # Top predictor
+        pred_idx_top = pred['logits_top'][0].argmax(dim=-1)
+        pred_codes_top = self.encoder.vq_top.indices_to_codes(pred_idx_top)
+        pred_codes_top = pred_codes_top.reshape(T, 1, 1, cfg.lfq_dim_top).permute(0, 3, 1, 2)
+        pred_recon_top = self.decoder(self.upscale_top(self.encoder.top_from_vq(pred_codes_top)))
+
+        # Pad predictor rows: blank first frame + T predicted frames
+        blank = torch.zeros(1, 3, H, W, device=device)
+        pred_recon_bot_padded = torch.cat([blank, pred_recon_bot], dim=0)   # (T+1, 3, H, W)
+        pred_recon_mid_padded = torch.cat([blank, pred_recon_mid], dim=0)
+        pred_recon_top_padded = torch.cat([blank, pred_recon_top], dim=0)
+
+        # Ground truth all frames
+        gt_all = video[0]  # (T+1, 3, 64, 64)
+
+        # Build pixel grid: 7 rows × (T+1) columns
+        row_data = [
+            gt_all, recon_enc_bot, recon_enc_mid, recon_enc_top,
+            pred_recon_bot_padded, pred_recon_mid_padded, pred_recon_top_padded,
+        ]
+        row_labels = ['GT', 'Enc Bot', 'Enc Mid', 'Enc Top',
+                       'Pred Bot', 'Pred Mid', 'Pred Top']
+
+        # Assemble raw grid without labels
+        row_images = []
+        for frames in row_data:
+            row_img = torch.cat([frames[t] for t in range(Tp1)], dim=2)  # (3, H, Tp1*W)
+            row_images.append(row_img)
+        raw_grid = torch.cat(row_images, dim=1)  # (3, 7*H, Tp1*W)
+        raw_grid = raw_grid.clamp(0, 1)
+
+        # Convert to PIL for text rendering
+        grid_np = (raw_grid.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+        pil_img = Image.fromarray(grid_np)
+
+        # Add margins for labels
+        label_left_w = 70   # pixels for row labels
+        label_top_h = 18    # pixels for column headers
+        n_rows = 7
+        n_cols = Tp1
+
+        canvas = Image.new('RGB', (label_left_w + n_cols * W, label_top_h + n_rows * H), (0, 0, 0))
+        canvas.paste(pil_img, (label_left_w, label_top_h))
+        draw = ImageDraw.Draw(canvas)
+
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+
+        # Column headers (frame indices)
+        for c in range(n_cols):
+            x = label_left_w + c * W + W // 2 - 5
+            draw.text((x, 2), str(c), fill=(255, 255, 255), font=font)
+
+        # Row labels
+        for r, label in enumerate(row_labels):
+            y = label_top_h + r * H + H // 2 - 6
+            draw.text((3, y), label, fill=(255, 255, 255), font=font)
+
+        # Convert back to tensor
+        import numpy as np
+        result = torch.from_numpy(np.array(canvas)).permute(2, 0, 1).float() / 255.0
+        return result

@@ -92,14 +92,14 @@ vq_bot = LFQ(
     dim=12,                   # log2(codebook_size)
     entropy_loss_weight=0.1,
     diversity_gamma=1.0,
-    accept_image_fmap=True,   # REQUIRED: encoder outputs (B, C, H, W) format
+    channel_first=True,       # REQUIRED: encoder outputs (B, C, H, W) format
 )
 
 # Input: (B*(T+1), 12, 16, 16) — channel-first spatial tensor
 # Output: quantized (B*(T+1), 12, 16, 16), indices (B*(T+1), 16, 16), entropy_loss ()
 ```
 
-**Important**: `accept_image_fmap=True` is required because our encoder outputs are `(B, C, H, W)` format (standard Conv2d output). Without this flag, LFQ expects channels-last `(B, ..., C)`.
+**Important**: `channel_first=True` is required because our encoder outputs are `(B, C, H, W)` format (standard Conv2d output). Without this flag, LFQ expects channels-last `(B, ..., C)`.
 
 The encoder's final projection per stage maps `C_stage → lfq_dim` before quantization. After VQ, a projection maps `lfq_dim → C_stage` back for predictor input and decoder input.
 
