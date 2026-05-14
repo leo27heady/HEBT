@@ -14,14 +14,14 @@ class FreshHVQVAEConfig:
     C_top: int = 256
 
     # Codebook sizes (must be powers of 2 for LFQ)
-    K_bot: int = 2**14
+    K_bot: int = 2**6
     K_mid: int = 2**10
-    K_top: int = 2**6
+    K_top: int = 2**14
 
     # LFQ dims (= log2(K))
-    lfq_dim_bot: int = 14
+    lfq_dim_bot: int = 6
     lfq_dim_mid: int = 10
-    lfq_dim_top: int = 6
+    lfq_dim_top: int = 14
 
     # LFQ entropy regularization
     entropy_loss_weight: float = 0.1
