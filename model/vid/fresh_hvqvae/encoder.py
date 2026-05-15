@@ -100,14 +100,14 @@ class HierarchicalEncoder(nn.Module):
         quant_bot, idx_bot, loss_bot = self.vq_bot(z_bot)  # channel_first handles (B,C,H,W)
         quant_bot_feat = self.bot_from_vq(quant_bot)     # (B, C_bot, 16, 16)
 
-        # Mid stage (takes pre-VQ features for gradient flow)
-        feat_mid = self.enc_bot_to_mid(feat_bot)         # (B, C_mid, 4, 4)
+        # Mid stage — detach to isolate gradients (mid loss won't corrupt bot encoder)
+        feat_mid = self.enc_bot_to_mid(feat_bot.detach())  # (B, C_mid, 4, 4)
         z_mid = self.mid_to_vq(feat_mid)                 # (B, lfq_dim_mid, 4, 4)
         quant_mid, idx_mid, loss_mid = self.vq_mid(z_mid)
         quant_mid_feat = self.mid_from_vq(quant_mid)
 
-        # Top stage
-        feat_top = self.enc_mid_to_top(feat_mid)         # (B, C_top, 1, 1)
+        # Top stage — detach to isolate gradients (top loss won't corrupt mid/bot encoder)
+        feat_top = self.enc_mid_to_top(feat_mid.detach())  # (B, C_top, 1, 1)
         z_top = self.top_to_vq(feat_top)                 # (B, lfq_dim_top, 1, 1)
         z_top = self.top_pre_vq_norm(z_top)              # center per-dim to mean=0 → prevents sign() collapse
         quant_top, idx_top, loss_top = self.vq_top(z_top)
