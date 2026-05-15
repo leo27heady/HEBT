@@ -174,6 +174,37 @@ class FreshHVQVAE(nn.Module):
             list(self.decoder_top.parameters())
         )
 
+    def get_bot_stage_params(self):
+        """Bot encoder block + VQ + decoder."""
+        return (
+            list(self.encoder.enc_to_bot.parameters()) +
+            list(self.encoder.bot_to_vq.parameters()) +
+            list(self.encoder.bot_from_vq.parameters()) +
+            list(self.encoder.vq_bot.parameters()) +
+            list(self.decoder_bot.parameters())
+        )
+
+    def get_mid_stage_params(self):
+        """Mid encoder block + VQ + decoder."""
+        return (
+            list(self.encoder.enc_bot_to_mid.parameters()) +
+            list(self.encoder.mid_to_vq.parameters()) +
+            list(self.encoder.mid_from_vq.parameters()) +
+            list(self.encoder.vq_mid.parameters()) +
+            list(self.decoder_mid.parameters())
+        )
+
+    def get_top_stage_params(self):
+        """Top encoder block + VQ + BN + decoder."""
+        return (
+            list(self.encoder.enc_mid_to_top.parameters()) +
+            list(self.encoder.top_to_vq.parameters()) +
+            list(self.encoder.top_pre_vq_norm.parameters()) +
+            list(self.encoder.top_from_vq.parameters()) +
+            list(self.encoder.vq_top.parameters()) +
+            list(self.decoder_top.parameters())
+        )
+
     def get_predictor_top_params(self):
         return list(self.predictor_top.parameters())
 
