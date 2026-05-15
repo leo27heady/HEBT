@@ -44,8 +44,8 @@ class FreshHVQVAEConfig:
 
     # Reconstruction loss weights
     weight_mse_bot: float = 1.0
-    weight_mse_mid: float = 0.5
-    weight_mse_top: float = 0.1
+    weight_mse_mid: float = 1.0
+    weight_mse_top: float = 1.0
 
     # Training
     lr_encoder_decoder: float = 3e-4
