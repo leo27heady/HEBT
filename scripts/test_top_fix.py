@@ -1,4 +1,4 @@
-"""Quick test: verify the L2 norm fix prevents top-stage codebook collapse."""
+"""Quick test: verify the BatchNorm fix prevents top-stage codebook collapse."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from model.vid.fresh_hvqvae import FreshHVQVAE, FreshHVQVAEConfig
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def generate_batch(B=4, T=4, H=64, W=64):
@@ -23,12 +25,13 @@ def generate_batch(B=4, T=4, H=64, W=64):
         shape_no_imagenet_norm=True,
     )
     ds = VIDShapeSyntheticDataset(hparams, size=B, cache=False)
-    return torch.stack([ds[i] for i in range(B)], dim=0)
+    return torch.stack([ds[i] for i in range(B)], dim=0).to(DEVICE)
 
 
 def main():
+    print(f"Device: {DEVICE}")
     cfg = FreshHVQVAEConfig()
-    model = FreshHVQVAE(cfg, skip_predictors=True)
+    model = FreshHVQVAE(cfg, skip_predictors=True).to(DEVICE)
     model.train()
     opt = torch.optim.Adam(model.get_encoder_decoder_params(), lr=cfg.lr_encoder_decoder)
 
@@ -74,11 +77,11 @@ def main():
             model.encoder.enc_bot_to_mid(model.encoder.enc_to_bot(all_frames))
         )
         z_top_raw = model.encoder.top_to_vq(feat_top)
-        z_top_normed = F.normalize(z_top_raw, dim=1) * model.encoder.top_l2_scale
+        z_top_normed = model.encoder.top_pre_vq_norm(z_top_raw)
         
-    idx_top = enc['idx_top'].reshape(-1).numpy()
-    idx_mid = enc['idx_mid'].reshape(-1).numpy()
-    idx_bot = enc['idx_bot'].reshape(-1).numpy()
+    idx_top = enc['idx_top'].reshape(-1).cpu().numpy()
+    idx_mid = enc['idx_mid'].reshape(-1).cpu().numpy()
+    idx_bot = enc['idx_bot'].reshape(-1).cpu().numpy()
     
     unique_top = len(np.unique(idx_top))
     unique_mid = len(np.unique(idx_mid))
@@ -88,11 +91,11 @@ def main():
     print(f"  [MID] Unique codes: {unique_mid} / 1024 (from {len(idx_mid)} tokens)")
     print(f"  [BOT] Unique codes: {unique_bot} / 64 (from {len(idx_bot)} tokens)")
     
-    z_flat = z_top_normed.reshape(all_frames.shape[0], -1).numpy()
-    print(f"\n  z_top (after L2 norm) stats:")
+    z_flat = z_top_normed.reshape(all_frames.shape[0], -1).cpu().numpy()
+    print(f"\n  z_top (after BatchNorm) stats:")
     print(f"  Mean per dim: {z_flat.mean(axis=0)}")
     print(f"  Std per dim:  {z_flat.std(axis=0)}")
-    print(f"  top_l2_scale: {model.encoder.top_l2_scale.item():.4f}")
+    print(f"  BN running_mean (first 5): {model.encoder.top_pre_vq_norm.running_mean[:5].tolist()}")
     
     # Check reconstruction quality
     with torch.no_grad():
@@ -110,11 +113,11 @@ def main():
     print(f"  Output diversity (pairwise L2): mean={dists.mean():.4f}, max={dists.max():.4f}")
     
     if unique_top > 10:
-        print("\n  ✓ SUCCESS: Top stage is using diverse codes!")
+        print("\n  SUCCESS: Top stage is using diverse codes!")
     elif unique_top > 2:
-        print("\n  ~ PARTIAL: Some diversity, may need more training")
+        print("\n  PARTIAL: Some diversity, may need more training")
     else:
-        print("\n  ✗ STILL COLLAPSED: Fix insufficient")
+        print("\n  STILL COLLAPSED: Fix insufficient")
 
 
 if __name__ == "__main__":

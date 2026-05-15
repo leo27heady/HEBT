@@ -76,8 +76,8 @@ class HierarchicalEncoder(nn.Module):
             ResBlock(C_top, C_top, stride=2),  # 2→1
         )
         self.top_to_vq = nn.Conv2d(C_top, cfg.lfq_dim_top, 1)
+        self.top_pre_vq_norm = nn.BatchNorm2d(cfg.lfq_dim_top)  # centers each dim to mean=0, prevents sign() collapse
         self.top_from_vq = nn.Conv2d(cfg.lfq_dim_top, C_top, 1)
-        self.top_l2_scale = nn.Parameter(torch.ones(1) * cfg.lfq_dim_top ** 0.5)  # learnable scale after L2 norm
         self.vq_top = LFQ(
             codebook_size=cfg.K_top,
             dim=cfg.lfq_dim_top,
@@ -109,8 +109,7 @@ class HierarchicalEncoder(nn.Module):
         # Top stage
         feat_top = self.enc_mid_to_top(feat_mid)         # (B, C_top, 1, 1)
         z_top = self.top_to_vq(feat_top)                 # (B, lfq_dim_top, 1, 1)
-        # L2 normalize to keep activations near sign() boundary, preventing codebook collapse
-        z_top = F.normalize(z_top, dim=1) * self.top_l2_scale
+        z_top = self.top_pre_vq_norm(z_top)              # center per-dim to mean=0 → prevents sign() collapse
         quant_top, idx_top, loss_top = self.vq_top(z_top)
         quant_top_feat = self.top_from_vq(quant_top)
 
