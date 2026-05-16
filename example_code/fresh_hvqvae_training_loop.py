@@ -285,7 +285,8 @@ def train_step_encoder_stage(model, batch, optimizer, stage, cfg):
         idx = enc['idx_top']
         codebook_size = cfg.K_top
 
-    loss = mse + vq_loss
+    # Scale MSE by 0.25 to compensate for [-1,1] range (4x larger than [0,1] for same error)
+    loss = 0.25 * mse + vq_loss
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'],
@@ -299,6 +300,7 @@ def train_step_encoder_stage(model, batch, optimizer, stage, cfg):
         f'vq_{stage}': vq_loss.item(),
         f'unique_{stage}': cb_stats['unique_codes'],
         f'ppl_{stage}': cb_stats['perplexity'],
+        f'_idx_{stage}': idx.detach(),  # for EMA tracker (avoid redundant forward)
     }
 
     # Add pre-VQ diagnostic stats for top stage
@@ -653,12 +655,9 @@ def run_sequential(model, cfg, args):
             t0 = time.time()
             if phase_type == 'encoder':
                 losses = train_step_encoder_stage(model, batch, optimizer, stage, cfg)
-                # Update EMA tracker
+                # Update EMA tracker using indices from training step (no redundant forward)
                 if cb_tracker is not None:
-                    with torch.no_grad():
-                        enc_for_track = model.encoder(
-                            batch.reshape(-1, 3, batch.shape[3], batch.shape[4]))
-                        cb_tracker.update(enc_for_track[f'idx_{stage}'])
+                    cb_tracker.update(losses.pop(f'_idx_{stage}'))
                     ema_stats = cb_tracker.get_stats()
                     losses[f'ema_active_{stage}'] = ema_stats['active_codes']
                     losses[f'ema_ppl_{stage}'] = ema_stats['ema_perplexity']
