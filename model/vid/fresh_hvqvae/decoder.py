@@ -25,7 +25,7 @@ class DecoderBot(nn.Module):
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),      # 32→64
             nn.SiLU(),
             nn.Conv2d(32, 3, 3, padding=1),
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -54,7 +54,7 @@ class DecoderMid(nn.Module):
             nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),      # 32→64
             nn.SiLU(),
             nn.Conv2d(16, 3, 3, padding=1),
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,7 +89,7 @@ class DecoderTop(nn.Module):
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),      # 32→64
             nn.SiLU(),
             nn.Conv2d(32, 3, 3, padding=1),
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

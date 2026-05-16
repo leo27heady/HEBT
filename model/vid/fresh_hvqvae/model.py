@@ -8,6 +8,7 @@ from .config import FreshHVQVAEConfig
 from .encoder import HierarchicalEncoder
 from .decoder import DecoderBot, DecoderMid, DecoderTop
 from .predictor import PredictorStage
+from .ebt_predictor import EBTPredictorStage
 from .soft_lookup import build_lfq_codebook_matrix
 
 
@@ -33,24 +34,55 @@ class FreshHVQVAE(nn.Module):
 
         # Predictor stages (optional)
         if not skip_predictors:
-            self.predictor_top = PredictorStage(
-                dim=cfg.pred_dim_top, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-                codebook_size=cfg.K_top, spatial_size=1,
-                temporal_window=cfg.window_top, has_parent=False,
-                lfq_dim=cfg.lfq_dim_top, max_T=cfg.max_T,
-            )
-            self.predictor_mid = PredictorStage(
-                dim=cfg.pred_dim_mid, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-                codebook_size=cfg.K_mid, spatial_size=16,
-                temporal_window=cfg.window_mid, has_parent=True,
-                parent_dim=cfg.pred_dim_top, lfq_dim=cfg.lfq_dim_mid, max_T=cfg.max_T,
-            )
-            self.predictor_bot = PredictorStage(
-                dim=cfg.pred_dim_bot, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-                codebook_size=cfg.K_bot, spatial_size=256,
-                temporal_window=cfg.window_bot, has_parent=True,
-                parent_dim=cfg.pred_dim_mid, lfq_dim=cfg.lfq_dim_bot, max_T=cfg.max_T,
-            )
+            if cfg.predictor_mode == 'ebt':
+                ebt_kwargs = dict(
+                    mcmc_num_steps=cfg.ebt_mcmc_num_steps,
+                    mcmc_step_size=cfg.ebt_mcmc_step_size,
+                    langevin_noise=cfg.ebt_langevin_noise,
+                    truncate_mcmc=cfg.ebt_truncate_mcmc,
+                    clamp_grad_max=cfg.ebt_clamp_grad_max,
+                    mcmc_step_size_learnable=cfg.ebt_mcmc_step_size_learnable,
+                    initial_condition=cfg.ebt_initial_condition,
+                )
+                self.predictor_top = EBTPredictorStage(
+                    dim=cfg.pred_dim_top, n_heads=cfg.pred_n_heads, n_layers=cfg.ebt_n_layers,
+                    codebook_size=cfg.K_top, spatial_size=1,
+                    temporal_window=cfg.window_top, has_parent=False,
+                    lfq_dim=cfg.lfq_dim_top, max_T=cfg.max_T, **ebt_kwargs,
+                )
+                self.predictor_mid = EBTPredictorStage(
+                    dim=cfg.pred_dim_mid, n_heads=cfg.pred_n_heads, n_layers=cfg.ebt_n_layers,
+                    codebook_size=cfg.K_mid, spatial_size=16,
+                    temporal_window=cfg.window_mid, has_parent=True,
+                    parent_dim=cfg.pred_dim_top, lfq_dim=cfg.lfq_dim_mid, max_T=cfg.max_T,
+                    **ebt_kwargs,
+                )
+                self.predictor_bot = EBTPredictorStage(
+                    dim=cfg.pred_dim_bot, n_heads=cfg.pred_n_heads, n_layers=cfg.ebt_n_layers,
+                    codebook_size=cfg.K_bot, spatial_size=256,
+                    temporal_window=cfg.window_bot, has_parent=True,
+                    parent_dim=cfg.pred_dim_mid, lfq_dim=cfg.lfq_dim_bot, max_T=cfg.max_T,
+                    **ebt_kwargs,
+                )
+            else:
+                self.predictor_top = PredictorStage(
+                    dim=cfg.pred_dim_top, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
+                    codebook_size=cfg.K_top, spatial_size=1,
+                    temporal_window=cfg.window_top, has_parent=False,
+                    lfq_dim=cfg.lfq_dim_top, max_T=cfg.max_T,
+                )
+                self.predictor_mid = PredictorStage(
+                    dim=cfg.pred_dim_mid, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
+                    codebook_size=cfg.K_mid, spatial_size=16,
+                    temporal_window=cfg.window_mid, has_parent=True,
+                    parent_dim=cfg.pred_dim_top, lfq_dim=cfg.lfq_dim_mid, max_T=cfg.max_T,
+                )
+                self.predictor_bot = PredictorStage(
+                    dim=cfg.pred_dim_bot, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
+                    codebook_size=cfg.K_bot, spatial_size=256,
+                    temporal_window=cfg.window_bot, has_parent=True,
+                    parent_dim=cfg.pred_dim_mid, lfq_dim=cfg.lfq_dim_bot, max_T=cfg.max_T,
+                )
 
 
     def encode(self, video: torch.Tensor) -> dict:
@@ -118,10 +150,20 @@ class FreshHVQVAE(nn.Module):
             temperature=cfg.soft_lookup_temperature,
         )
 
-        return {
+        result = {
             'logits_top': logits_top, 'logits_mid': logits_mid, 'logits_bot': logits_bot,
             'feat_top': feat_top, 'feat_mid': feat_mid, 'feat_bot': feat_bot,
         }
+
+        # Include EBT energy maps if available
+        if hasattr(self.predictor_top, '_last_energy') and self.predictor_top._last_energy is not None:
+            result['energy_top'] = self.predictor_top._last_energy
+        if hasattr(self.predictor_mid, '_last_energy') and self.predictor_mid._last_energy is not None:
+            result['energy_mid'] = self.predictor_mid._last_energy
+        if hasattr(self.predictor_bot, '_last_energy') and self.predictor_bot._last_energy is not None:
+            result['energy_bot'] = self.predictor_bot._last_energy
+
+        return result
 
     def forward(self, video: torch.Tensor) -> dict:
         """
@@ -221,11 +263,12 @@ class FreshHVQVAE(nn.Module):
         video: (B, T+1, 3, 64, 64)
         Returns: (3, H_grid, W_grid) image tensor in [0,1].
 
-        Grid layout depends on whether predictors are present:
+        Grid layout:
           Encoder-only: 4 rows (GT, Enc Bot, Enc Mid, Enc Top)
-          Full: 7 rows (+ Pred Bot, Pred Mid, Pred Top)
+          With predictors: adds per-stage Pred + Entropy rows (+ Energy rows in EBT mode)
         """
         from PIL import Image, ImageDraw, ImageFont
+        import math
 
         cfg = self.cfg
         B, Tp1 = video.shape[:2]
@@ -254,34 +297,78 @@ class FreshHVQVAE(nn.Module):
 
         # --- Predictor decoded (predicted frames 1..T) ---
         if not self.skip_predictors:
-            pred = self.predict(enc, T)
+            # EBT predictors need gradients for MCMC, so re-enable inside no_grad block
+            with torch.enable_grad():
+                pred = self.predict(enc, T)
+            # Blank frames: black in [-1,1] space = -1, gray maps in [-1,1] space
+            blank = torch.full((1, 3, H, W), -1.0, device=device)
+            blank_gray = torch.full((1, 3, H, W), -1.0, device=device)
 
-            # Bot predictor
-            pred_idx_bot = pred['logits_bot'][0].argmax(dim=-1)
-            pred_codes_bot = self.encoder.vq_bot.indices_to_codes(pred_idx_bot)
-            pred_codes_bot = pred_codes_bot.reshape(T, 16, 16, cfg.lfq_dim_bot).permute(0, 3, 1, 2)
-            pred_recon_bot = self.decoder_bot(self.encoder.bot_from_vq(pred_codes_bot))
-
-            # Mid predictor
-            pred_idx_mid = pred['logits_mid'][0].argmax(dim=-1)
-            pred_codes_mid = self.encoder.vq_mid.indices_to_codes(pred_idx_mid)
-            pred_codes_mid = pred_codes_mid.reshape(T, 4, 4, cfg.lfq_dim_mid).permute(0, 3, 1, 2)
-            pred_recon_mid = self.decoder_mid(self.encoder.mid_from_vq(pred_codes_mid))
-
-            # Top predictor
-            pred_idx_top = pred['logits_top'][0].argmax(dim=-1)
-            pred_codes_top = self.encoder.vq_top.indices_to_codes(pred_idx_top)
-            pred_codes_top = pred_codes_top.reshape(T, 1, 1, cfg.lfq_dim_top).permute(0, 3, 1, 2)
-            pred_recon_top = self.decoder_top(self.encoder.top_from_vq(pred_codes_top))
-
-            # Pad predictor rows: blank first frame + T predicted frames
-            blank = torch.zeros(1, 3, H, W, device=device)
-            row_data += [
-                torch.cat([blank, pred_recon_bot], dim=0),
-                torch.cat([blank, pred_recon_mid], dim=0),
-                torch.cat([blank, pred_recon_top], dim=0),
+            stages = [
+                ('bot', pred['logits_bot'], self.encoder.vq_bot, self.encoder.bot_from_vq,
+                 self.decoder_bot, cfg.lfq_dim_bot, cfg.K_bot, 16),
+                ('mid', pred['logits_mid'], self.encoder.vq_mid, self.encoder.mid_from_vq,
+                 self.decoder_mid, cfg.lfq_dim_mid, cfg.K_mid, 4),
+                ('top', pred['logits_top'], self.encoder.vq_top, self.encoder.top_from_vq,
+                 self.decoder_top, cfg.lfq_dim_top, cfg.K_top, 1),
             ]
-            row_labels += ['Pred Bot', 'Pred Mid', 'Pred Top']
+
+            for stage_name, logits, vq_mod, from_vq, decoder, lfq_dim, K, spatial_hw in stages:
+                # Decode predicted frames
+                pred_idx = logits[0].argmax(dim=-1)  # (T*S,)
+                pred_codes = vq_mod.indices_to_codes(pred_idx)
+                S = spatial_hw * spatial_hw
+                pred_codes = pred_codes.reshape(T, spatial_hw, spatial_hw, lfq_dim).permute(0, 3, 1, 2)
+                pred_recon = decoder(from_vq(pred_codes))  # (T, 3, 64, 64)
+
+                # Prediction row (blank first frame + T predicted)
+                row_data.append(torch.cat([blank, pred_recon], dim=0))
+                row_labels.append(f'Pred {stage_name.capitalize()}')
+
+                # --- Entropy map ---
+                # logits shape: (B, T*S, K) — take first sample
+                stage_logits = logits[0]  # (T*S, K)
+                probs = torch.softmax(stage_logits, dim=-1)  # (T*S, K)
+                log_probs = torch.log(probs + 1e-10)
+                entropy_per_pos = -(probs * log_probs).sum(dim=-1)  # (T*S,)
+                max_entropy = math.log(K)
+                # Normalize: 0 entropy → black (0), max entropy → white (1)
+                entropy_norm = (entropy_per_pos / max_entropy).clamp(0, 1)  # (T*S,)
+                entropy_map = entropy_norm.reshape(T, 1, spatial_hw, spatial_hw)  # (T, 1, h, w)
+                # Interpolate to 64x64
+                entropy_map_up = F.interpolate(entropy_map, size=(H, W), mode='nearest')  # (T, 1, 64, 64)
+                # Convert to [-1, 1] so global (x+1)/2 rescaling maps back to [0, 1]
+                entropy_map_up = entropy_map_up * 2 - 1
+                entropy_rgb = entropy_map_up.expand(T, 3, H, W)  # grayscale → RGB
+                row_data.append(torch.cat([blank_gray, entropy_rgb], dim=0))
+                row_labels.append(f'Entropy {stage_name.capitalize()}')
+
+            # --- Energy maps (EBT mode only) ---
+            has_energy = any(f'energy_{s}' in pred for s in ('bot', 'mid', 'top'))
+            if has_energy:
+                for stage_name, spatial_hw in [('bot', 16), ('mid', 4), ('top', 1)]:
+                    energy_key = f'energy_{stage_name}'
+                    if energy_key not in pred:
+                        continue
+                    S = spatial_hw * spatial_hw
+                    energy = pred[energy_key][0]  # (T*S, 1)
+                    energy_flat = energy.squeeze(-1)  # (T*S,)
+
+                    # Robust normalization: use percentile-based min/max to handle outliers
+                    e_min = energy_flat.quantile(0.02)
+                    e_max = energy_flat.quantile(0.98)
+                    if e_max - e_min < 1e-6:
+                        energy_norm = torch.zeros_like(energy_flat)
+                    else:
+                        energy_norm = ((energy_flat - e_min) / (e_max - e_min)).clamp(0, 1)
+
+                    energy_map = energy_norm.reshape(T, 1, spatial_hw, spatial_hw)
+                    energy_map_up = F.interpolate(energy_map, size=(H, W), mode='nearest')
+                    # Convert to [-1, 1] so global (x+1)/2 rescaling maps back to [0, 1]
+                    energy_map_up = energy_map_up * 2 - 1
+                    energy_rgb = energy_map_up.expand(T, 3, H, W)
+                    row_data.append(torch.cat([blank_gray, energy_rgb], dim=0))
+                    row_labels.append(f'Energy {stage_name.capitalize()}')
 
         # Assemble raw grid without labels
         n_rows = len(row_data)
@@ -291,6 +378,9 @@ class FreshHVQVAE(nn.Module):
             row_img = torch.cat([frames[t] for t in range(Tp1)], dim=2)
             row_images.append(row_img)
         raw_grid = torch.cat(row_images, dim=1)
+        # Rescale from [-1, 1] to [0, 1] for visualization
+        # Entropy/energy rows are stored in [-1, 1] too, so this is uniform
+        raw_grid = (raw_grid + 1) / 2
         raw_grid = raw_grid.clamp(0, 1)
 
         # Convert to PIL for text rendering
@@ -298,7 +388,7 @@ class FreshHVQVAE(nn.Module):
         pil_img = Image.fromarray(grid_np)
 
         # Add margins for labels
-        label_left_w = 70
+        label_left_w = 90
         label_top_h = 18
 
         canvas = Image.new('RGB', (label_left_w + n_cols * W, label_top_h + n_rows * H), (0, 0, 0))

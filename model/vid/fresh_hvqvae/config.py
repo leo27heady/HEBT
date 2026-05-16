@@ -56,3 +56,16 @@ class FreshHVQVAEConfig:
 
     # Sequence
     max_T: int = 16
+
+    # Predictor mode
+    predictor_mode: str = 'vanilla'  # 'vanilla' | 'ebt'
+
+    # EBT-MCMC predictor settings
+    ebt_mcmc_num_steps: int = 5
+    ebt_mcmc_step_size: float = 0.1
+    ebt_langevin_noise: float = 0.01
+    ebt_truncate_mcmc: bool = True
+    ebt_clamp_grad_max: float = 10.0
+    ebt_mcmc_step_size_learnable: bool = True
+    ebt_initial_condition: str = 'zeros'  # 'zeros' | 'random_noise'
+    ebt_n_layers: int = 2  # energy transformer layers (can be shallower)

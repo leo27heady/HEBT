@@ -117,4 +117,5 @@ class HierarchicalEncoder(nn.Module):
             'quant_bot': quant_bot_feat, 'idx_bot': idx_bot, 'loss_bot': loss_bot,
             'quant_mid': quant_mid_feat, 'idx_mid': idx_mid, 'loss_mid': loss_mid,
             'quant_top': quant_top_feat, 'idx_top': idx_top, 'loss_top': loss_top,
+            'z_top': z_top,  # pre-VQ activations for diagnostic logging
         }

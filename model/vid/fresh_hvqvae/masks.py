@@ -80,3 +80,73 @@ def build_cross_attn_mask_mid_to_bot(T: int, device: torch.device) -> torch.Tens
         full_mask[t * S_child:(t + 1) * S_child, t * S_parent:(t + 1) * S_parent] = frame_mask
 
     return full_mask
+
+
+def build_ebt_self_attn_mask(T: int, S: int, temporal_window: int, device: torch.device) -> torch.Tensor:
+    """
+    Build boolean self-attention mask for EBT combined context [real | predicted].
+    Total sequence length = 2 * T * S.
+
+    Quadrant layout (rows = queries, cols = keys):
+        Real→Real:       Causal + temporal window (same as vanilla)
+        Real→Predicted:  BLOCKED (real tokens never see predicted)
+        Pred→Real:       Causal + temporal window (pred frame t sees real frames ≤ t)
+        Pred→Predicted:  Same-frame only (per-frame block-diagonal, no cross-frame leakage)
+
+    Args:
+        T: number of frames
+        S: spatial positions per frame
+        temporal_window: how many past frames (inclusive of current). -1 = full causal.
+        device: torch device
+
+    Returns:
+        (2*T*S, 2*T*S) boolean mask. True = allowed to attend.
+    """
+    seq_len = T * S
+
+    # Standard causal+window mask for real→real and pred→real
+    real_real = build_temporal_window_mask(T, S, temporal_window, device)  # (T*S, T*S)
+
+    # Real→Predicted: BLOCKED
+    real_pred = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+
+    # Pred→Real: same causal+window as real→real
+    pred_real = real_real.clone()
+
+    # Pred→Predicted: same-frame block-diagonal (each frame's tokens see each other)
+    pred_pred = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+    for t in range(T):
+        start = t * S
+        end = (t + 1) * S
+        pred_pred[start:end, start:end] = True
+
+    # Assemble full mask: [real | predicted] rows × [real | predicted] cols
+    full_mask = torch.zeros(2 * seq_len, 2 * seq_len, dtype=torch.bool, device=device)
+    full_mask[:seq_len, :seq_len] = real_real          # Real→Real
+    full_mask[:seq_len, seq_len:] = real_pred          # Real→Predicted (blocked)
+    full_mask[seq_len:, :seq_len] = pred_real          # Pred→Real
+    full_mask[seq_len:, seq_len:] = pred_pred          # Pred→Predicted
+
+    return full_mask
+
+
+def build_ebt_cross_attn_mask_top_to_mid(T: int, device: torch.device) -> torch.Tensor:
+    """
+    Cross-attention mask for EBT mid stage: mid predicted queries (T*16)
+    attending to top parent predicted features (T*1).
+    Each mid token at frame t attends to top token at frame t.
+
+    Returns: (T*16, T*1) boolean mask.
+    """
+    return build_cross_attn_mask_top_to_mid(T, device)
+
+
+def build_ebt_cross_attn_mask_mid_to_bot(T: int, device: torch.device) -> torch.Tensor:
+    """
+    Cross-attention mask for EBT bot stage: bot predicted queries (T*256)
+    attending to mid parent predicted features (T*16).
+    Same spatial alignment as vanilla.
+
+    Returns: (T*256, T*16) boolean mask.
+    """
+    return build_cross_attn_mask_mid_to_bot(T, device)

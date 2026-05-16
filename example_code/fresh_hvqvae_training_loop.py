@@ -43,7 +43,7 @@ from model.vid.fresh_hvqvae import FreshHVQVAE, FreshHVQVAEConfig
 # ---------------------------------------------------------------------------
 
 def generate_synthetic_batch(B: int, T: int, H: int = 64, W: int = 64, device: str = 'cpu'):
-    """Simple translating colored square + static circle on black background."""
+    """Simple translating colored square + static circle on black background. Returns [-1, 1] range."""
     frames = []
     for t in range(T + 1):
         frame = torch.zeros(B, 3, H, W, device=device)
@@ -59,11 +59,12 @@ def generate_synthetic_batch(B: int, T: int, H: int = 64, W: int = 64, device: s
                 if (r - H // 2) ** 2 + (c - W // 4) ** 2 < 100:
                     frame[:, 2, r, c] = 0.7
         frames.append(frame)
-    return torch.stack(frames, dim=1)
+    # Scale from [0, 1] to [-1, 1]
+    return torch.stack(frames, dim=1) * 2 - 1
 
 
 def generate_synthetic_shapes_batch(B: int, T: int, H: int = 64, W: int = 64, device: str = 'cpu'):
-    """Rotating 2D shapes via VIDShapeSyntheticDataset. Returns [0,1] range."""
+    """Rotating 2D shapes via VIDShapeSyntheticDataset. Returns [-1, 1] range."""
     from types import SimpleNamespace
     from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset
 
@@ -80,7 +81,8 @@ def generate_synthetic_shapes_batch(B: int, T: int, H: int = 64, W: int = 64, de
     )
     ds = VIDShapeSyntheticDataset(hparams, size=B, cache=False)
     frames = torch.stack([ds[i] for i in range(B)], dim=0)
-    return frames.to(device)
+    # Scale from [0, 1] to [-1, 1]
+    return (frames.to(device) * 2 - 1)
 
 
 def make_batch(data_source: str, B: int, T: int, H: int = 64, W: int = 64, device: str = 'cpu'):
@@ -188,8 +190,52 @@ def save_phase_checkpoint(model, phase_name, log_dir):
 # Codebook statistics
 # ---------------------------------------------------------------------------
 
+class CodebookUsageTracker:
+    """Track codebook utilization over a sliding window via EMA."""
+
+    def __init__(self, codebook_size: int, decay: float = 0.99):
+        self.codebook_size = codebook_size
+        self.decay = decay
+        self.ema_counts = torch.zeros(codebook_size)
+        self.total_updates = 0
+
+    def update(self, indices: torch.Tensor):
+        """Update with new batch of indices."""
+        flat = indices.reshape(-1).cpu()
+        batch_counts = torch.bincount(flat, minlength=self.codebook_size).float()
+        batch_counts = batch_counts / batch_counts.sum()  # normalize to prob dist
+
+        if self.total_updates == 0:
+            self.ema_counts = batch_counts
+        else:
+            self.ema_counts = self.decay * self.ema_counts + (1 - self.decay) * batch_counts
+        self.total_updates += 1
+
+    def get_stats(self) -> dict:
+        """Get current utilization statistics."""
+        if self.total_updates == 0:
+            return {'active_codes': 0, 'dead_codes': self.codebook_size,
+                    'ema_usage_pct': 0.0, 'ema_perplexity': 0.0, 'max_prob': 0.0}
+        probs = self.ema_counts
+        active_mask = probs > 1e-8
+        active_codes = active_mask.sum().item()
+        dead_codes = self.codebook_size - active_codes
+
+        probs_active = probs[active_mask]
+        entropy = -(probs_active * probs_active.log()).sum()
+        perplexity = entropy.exp().item()
+
+        return {
+            'active_codes': int(active_codes),
+            'dead_codes': int(dead_codes),
+            'ema_usage_pct': 100.0 * active_codes / self.codebook_size,
+            'ema_perplexity': perplexity,
+            'max_prob': probs.max().item(),
+        }
+
+
 def compute_codebook_stats(indices, codebook_size):
-    """Compute codebook usage statistics from index tensor."""
+    """Compute per-batch codebook usage statistics from index tensor."""
     flat = indices.reshape(-1)
     total = flat.numel()
     if total == 0:
@@ -248,12 +294,22 @@ def train_step_encoder_stage(model, batch, optimizer, stage, cfg):
 
     cb_stats = compute_codebook_stats(idx.detach(), codebook_size)
 
-    return {
+    result = {
         f'mse_{stage}': mse.item(),
         f'vq_{stage}': vq_loss.item(),
         f'unique_{stage}': cb_stats['unique_codes'],
         f'ppl_{stage}': cb_stats['perplexity'],
     }
+
+    # Add pre-VQ diagnostic stats for top stage
+    if stage == 'top' and 'z_top' in enc:
+        z = enc['z_top'].detach()
+        result['z_top_mean'] = z.mean().item()
+        result['z_top_std'] = z.std().item()
+        # Sign balance: fraction of positive values (should be ~0.5)
+        result['z_top_sign_balance'] = (z > 0).float().mean().item()
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -403,12 +459,18 @@ def format_log_line(phase_name, step, total_steps, losses, dt):
         vq_k = f'vq_{stage}'
         ppl_k = f'ppl_{stage}'
         uniq_k = f'unique_{stage}'
+        ema_active_k = f'ema_active_{stage}'
+        ema_ppl_k = f'ema_ppl_{stage}'
         if mse_k in losses:
             s = f"mse={losses[mse_k]:.4f} vq={losses[vq_k]:.3f}"
-            if ppl_k in losses:
-                s += f" ppl={losses[ppl_k]:.0f}"
-            if uniq_k in losses:
+            if ema_active_k in losses:
+                s += f" ema_codes={losses[ema_active_k]}"
+            elif uniq_k in losses:
                 s += f" codes={losses[uniq_k]}"
+            if ema_ppl_k in losses:
+                s += f" ema_ppl={losses[ema_ppl_k]:.0f}"
+            elif ppl_k in losses:
+                s += f" ppl={losses[ppl_k]:.0f}"
             parts.append(f"{stage}[{s}]")
 
     for stage in ('top', 'mid', 'bot'):
@@ -553,7 +615,12 @@ def run_sequential(model, cfg, args):
 
         if phase_type == 'encoder':
             csv_fields = ['step', 'global_step', f'mse_{stage}', f'vq_{stage}',
-                          f'unique_{stage}', f'ppl_{stage}', 'time_s']
+                          f'unique_{stage}', f'ppl_{stage}',
+                          f'ema_active_{stage}', f'ema_ppl_{stage}', 'time_s']
+            if stage == 'top':
+                csv_fields.insert(-1, 'z_top_mean')
+                csv_fields.insert(-1, 'z_top_std')
+                csv_fields.insert(-1, 'z_top_sign_balance')
         else:
             csv_fields = ['step', 'global_step', f'ce_{stage}', 'time_s']
 
@@ -561,6 +628,12 @@ def run_sequential(model, cfg, args):
         csv_file = open(csv_path, 'w', newline='')
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
         csv_writer.writeheader()
+
+        # EMA codebook tracker for encoder phases
+        cb_tracker = None
+        if phase_type == 'encoder':
+            codebook_size = {'bot': cfg.K_bot, 'mid': cfg.K_mid, 'top': cfg.K_top}[stage]
+            cb_tracker = CodebookUsageTracker(codebook_size, decay=0.99)
 
         model.train()
         phase_t0 = time.time()
@@ -580,6 +653,15 @@ def run_sequential(model, cfg, args):
             t0 = time.time()
             if phase_type == 'encoder':
                 losses = train_step_encoder_stage(model, batch, optimizer, stage, cfg)
+                # Update EMA tracker
+                if cb_tracker is not None:
+                    with torch.no_grad():
+                        enc_for_track = model.encoder(
+                            batch.reshape(-1, 3, batch.shape[3], batch.shape[4]))
+                        cb_tracker.update(enc_for_track[f'idx_{stage}'])
+                    ema_stats = cb_tracker.get_stats()
+                    losses[f'ema_active_{stage}'] = ema_stats['active_codes']
+                    losses[f'ema_ppl_{stage}'] = ema_stats['ema_perplexity']
             else:
                 losses = train_step_predictor_stage(model, batch, optimizer, stage, cfg)
             dt = time.time() - t0
@@ -780,6 +862,13 @@ def main():
     parser.add_argument('--cache_batches', type=int, default=0,
                         help='Pre-generate N batches to disk (0 = on-the-fly)')
 
+    # Predictor mode
+    parser.add_argument('--predictor_mode', type=str, default='vanilla',
+                        choices=['vanilla', 'ebt'],
+                        help='Predictor type: vanilla (one-shot) or ebt (MCMC refinement)')
+    parser.add_argument('--ebt_mcmc_steps', type=int, default=5,
+                        help='Number of MCMC refinement steps for EBT predictor')
+
     args = parser.parse_args()
 
     print(f"Device: {args.device}")
@@ -789,7 +878,9 @@ def main():
     print(f"Log dir: {args.log_dir}")
     os.makedirs(args.log_dir, exist_ok=True)
 
-    cfg = FreshHVQVAEConfig(max_T=args.T + 1)
+    cfg = FreshHVQVAEConfig(max_T=args.T + 1,
+                            predictor_mode=args.predictor_mode,
+                            ebt_mcmc_num_steps=args.ebt_mcmc_steps)
 
     skip_predictors = args.mode in ('encoder_only', 'sequential')
     if args.mode == 'sequential':
