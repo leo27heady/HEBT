@@ -3,16 +3,17 @@ Unified End-to-End Hierarchical VQ-VAE Experiment.
 
 Key differences from FreshHVQVAE:
 - No detach between encoder stages (full end-to-end gradient flow)
-- Standard VQ (embedding + commitment loss) instead of LFQ
+- Supports both standard VQ and LFQ (selectable via config)
 - No per-stage decoders; single decoder head from bot predictions → RGB
 - Predictor and encoder trained jointly (single backward pass)
 - Losses: VQ per stage + CE per stage + MSE on final RGB prediction
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .predictor import TransformerBlock
 from .masks import (
@@ -20,6 +21,7 @@ from .masks import (
     build_cross_attn_mask_top_to_mid,
     build_cross_attn_mask_mid_to_bot,
 )
+from .soft_lookup import build_lfq_codebook_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -34,18 +36,30 @@ class UnifiedConfig:
     C_mid: int = 128
     C_top: int = 256
 
-    # VQ embedding dims (what goes into the codebook)
+    # VQ type: 'standard' or 'lfq'
+    vq_type: str = 'lfq'
+
+    # VQ embedding dims (used for standard VQ)
     D_bot: int = 32
     D_mid: int = 64
     D_top: int = 128
 
-    # Codebook sizes
+    # LFQ dims (= log2(K), used when vq_type='lfq')
+    lfq_dim_bot: int = 9
+    lfq_dim_mid: int = 9
+    lfq_dim_top: int = 9
+
+    # Codebook sizes (for standard VQ; for LFQ this is 2^lfq_dim)
     K_bot: int = 512
     K_mid: int = 512
     K_top: int = 512
 
-    # VQ
+    # Standard VQ
     commitment_cost: float = 0.25
+
+    # LFQ
+    entropy_loss_weight: float = 0.1
+    diversity_gamma: float = 1.0
 
     # Predictor
     pred_n_heads: int = 8
@@ -73,6 +87,11 @@ class UnifiedConfig:
     # Training
     lr: float = 3e-4
     max_grad_norm: float = 1.0
+
+    def get_lfq_codebook_size(self, stage: str) -> int:
+        """Get effective codebook size for a stage (2^lfq_dim)."""
+        dim = getattr(self, f'lfq_dim_{stage}')
+        return 2 ** dim
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +155,44 @@ class VectorQuantizer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# LFQ Wrapper (consistent interface with VectorQuantizer)
+# ---------------------------------------------------------------------------
+
+class LFQWrapper(nn.Module):
+    """Wraps vector_quantize_pytorch.LFQ with same interface as VectorQuantizer."""
+
+    def __init__(self, codebook_size: int, dim: int, entropy_loss_weight: float = 0.1,
+                 diversity_gamma: float = 1.0):
+        super().__init__()
+        from vector_quantize_pytorch import LFQ
+        self.codebook_size = codebook_size
+        self.dim = dim  # = log2(codebook_size)
+        self.lfq = LFQ(
+            codebook_size=codebook_size,
+            dim=dim,
+            entropy_loss_weight=entropy_loss_weight,
+            diversity_gamma=diversity_gamma,
+            channel_first=True,
+        )
+        # Pre-build the codebook matrix for soft-lookup
+        self.register_buffer('codebook_weights', build_lfq_codebook_matrix(dim))
+
+    def forward(self, z: torch.Tensor):
+        """
+        Args:
+            z: (B, D, H, W) — continuous latent features (channel-first)
+
+        Returns:
+            quantized: (B, D, H, W) — quantized with STE
+            indices: (B, H, W) — codebook indices
+            loss: scalar — entropy loss
+        """
+        quantized, indices, loss = self.lfq(z)
+        # LFQ indices shape: (B, H, W) already
+        return quantized, indices, loss
+
+
+# ---------------------------------------------------------------------------
 # Encoder (bottom-up, NO detach between stages)
 # ---------------------------------------------------------------------------
 
@@ -164,6 +221,7 @@ class UnifiedEncoder(nn.Module):
     """
     Bottom-up encoder with VQ taps at 3 resolutions.
     NO DETACH between stages — full gradient flow.
+    Supports both standard VQ and LFQ.
 
     Input: (B, 3, 64, 64)
     Outputs: quantized features + indices + losses at each stage.
@@ -171,33 +229,54 @@ class UnifiedEncoder(nn.Module):
 
     def __init__(self, cfg: UnifiedConfig):
         super().__init__()
+        self.cfg = cfg
+
+        # Determine VQ dims based on type
+        if cfg.vq_type == 'lfq':
+            vq_dim_bot = cfg.lfq_dim_bot
+            vq_dim_mid = cfg.lfq_dim_mid
+            vq_dim_top = cfg.lfq_dim_top
+        else:
+            vq_dim_bot = cfg.D_bot
+            vq_dim_mid = cfg.D_mid
+            vq_dim_top = cfg.D_top
 
         # Stage 1: 64→16
         self.enc_to_bot = nn.Sequential(
             ResBlock(3, 64, stride=2),       # 64→32
             ResBlock(64, cfg.C_bot, stride=2),  # 32→16
         )
-        self.bot_to_vq = nn.Conv2d(cfg.C_bot, cfg.D_bot, 1)
-        self.bot_from_vq = nn.Conv2d(cfg.D_bot, cfg.C_bot, 1)
-        self.vq_bot = VectorQuantizer(cfg.K_bot, cfg.D_bot, cfg.commitment_cost)
+        self.bot_to_vq = nn.Conv2d(cfg.C_bot, vq_dim_bot, 1)
+        self.bot_from_vq = nn.Conv2d(vq_dim_bot, cfg.C_bot, 1)
 
         # Stage 2: 16→4 (NO DETACH from bot)
         self.enc_bot_to_mid = nn.Sequential(
             ResBlock(cfg.C_bot, cfg.C_mid, stride=2),  # 16→8
             ResBlock(cfg.C_mid, cfg.C_mid, stride=2),  # 8→4
         )
-        self.mid_to_vq = nn.Conv2d(cfg.C_mid, cfg.D_mid, 1)
-        self.mid_from_vq = nn.Conv2d(cfg.D_mid, cfg.C_mid, 1)
-        self.vq_mid = VectorQuantizer(cfg.K_mid, cfg.D_mid, cfg.commitment_cost)
+        self.mid_to_vq = nn.Conv2d(cfg.C_mid, vq_dim_mid, 1)
+        self.mid_from_vq = nn.Conv2d(vq_dim_mid, cfg.C_mid, 1)
 
         # Stage 3: 4→1 (NO DETACH from mid)
         self.enc_mid_to_top = nn.Sequential(
             ResBlock(cfg.C_mid, cfg.C_top, stride=2),  # 4→2
             ResBlock(cfg.C_top, cfg.C_top, stride=2),  # 2→1
         )
-        self.top_to_vq = nn.Conv2d(cfg.C_top, cfg.D_top, 1)
-        self.top_from_vq = nn.Conv2d(cfg.D_top, cfg.C_top, 1)
-        self.vq_top = VectorQuantizer(cfg.K_top, cfg.D_top, cfg.commitment_cost)
+        self.top_to_vq = nn.Conv2d(cfg.C_top, vq_dim_top, 1)
+        self.top_from_vq = nn.Conv2d(vq_dim_top, cfg.C_top, 1)
+
+        # Create VQ modules
+        if cfg.vq_type == 'lfq':
+            self.vq_bot = LFQWrapper(cfg.get_lfq_codebook_size('bot'), vq_dim_bot,
+                                     cfg.entropy_loss_weight, cfg.diversity_gamma)
+            self.vq_mid = LFQWrapper(cfg.get_lfq_codebook_size('mid'), vq_dim_mid,
+                                     cfg.entropy_loss_weight, cfg.diversity_gamma)
+            self.vq_top = LFQWrapper(cfg.get_lfq_codebook_size('top'), vq_dim_top,
+                                     cfg.entropy_loss_weight, cfg.diversity_gamma)
+        else:
+            self.vq_bot = VectorQuantizer(cfg.K_bot, vq_dim_bot, cfg.commitment_cost)
+            self.vq_mid = VectorQuantizer(cfg.K_mid, vq_dim_mid, cfg.commitment_cost)
+            self.vq_top = VectorQuantizer(cfg.K_top, vq_dim_top, cfg.commitment_cost)
 
     def forward(self, x: torch.Tensor) -> dict:
         """
@@ -387,25 +466,53 @@ class UnifiedModel(nn.Module):
         # Decoder head (bot features → RGB)
         self.decoder_head = DecoderHead(cfg.C_bot)
 
+        # Determine codebook sizes and embedding dims for predictors
+        if cfg.vq_type == 'lfq':
+            K_top = cfg.get_lfq_codebook_size('top')
+            K_mid = cfg.get_lfq_codebook_size('mid')
+            K_bot = cfg.get_lfq_codebook_size('bot')
+            emb_dim_top = cfg.lfq_dim_top
+            emb_dim_mid = cfg.lfq_dim_mid
+            emb_dim_bot = cfg.lfq_dim_bot
+        else:
+            K_top, K_mid, K_bot = cfg.K_top, cfg.K_mid, cfg.K_bot
+            emb_dim_top = cfg.D_top
+            emb_dim_mid = cfg.D_mid
+            emb_dim_bot = cfg.D_bot
+
         # Predictors (top-down)
         self.predictor_top = UnifiedPredictorStage(
             dim=cfg.pred_dim_top, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-            codebook_size=cfg.K_top, embedding_dim=cfg.D_top,
+            codebook_size=K_top, embedding_dim=emb_dim_top,
             spatial_size=1, temporal_window=cfg.window_top,
             has_parent=False, max_T=cfg.max_T,
         )
         self.predictor_mid = UnifiedPredictorStage(
             dim=cfg.pred_dim_mid, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-            codebook_size=cfg.K_mid, embedding_dim=cfg.D_mid,
+            codebook_size=K_mid, embedding_dim=emb_dim_mid,
             spatial_size=16, temporal_window=cfg.window_mid,
             has_parent=True, parent_dim=cfg.pred_dim_top, max_T=cfg.max_T,
         )
         self.predictor_bot = UnifiedPredictorStage(
             dim=cfg.pred_dim_bot, n_heads=cfg.pred_n_heads, n_layers=cfg.pred_n_layers,
-            codebook_size=cfg.K_bot, embedding_dim=cfg.D_bot,
+            codebook_size=K_bot, embedding_dim=emb_dim_bot,
             spatial_size=256, temporal_window=cfg.window_bot,
             has_parent=True, parent_dim=cfg.pred_dim_mid, max_T=cfg.max_T,
         )
+
+    def _get_codebook_weights(self, vq_module) -> torch.Tensor:
+        """Get codebook weight matrix from either VectorQuantizer or LFQWrapper."""
+        if isinstance(vq_module, LFQWrapper):
+            return vq_module.codebook_weights  # (K, lfq_dim) — fixed binary codes
+        else:
+            return vq_module.embedding.weight  # (K, D_emb) — learned embeddings
+
+    def _get_vq_dim(self, stage: str) -> int:
+        """Get the VQ embedding dim for a stage."""
+        if self.cfg.vq_type == 'lfq':
+            return getattr(self.cfg, f'lfq_dim_{stage}')
+        else:
+            return getattr(self.cfg, f'D_{stage}')
 
     def encode(self, video: torch.Tensor) -> dict:
         """
@@ -446,19 +553,19 @@ class UnifiedModel(nn.Module):
 
         # Top predictor (no parent)
         logits_top, feat_top = self.predictor_top(
-            ctx_top, codebook_weights=self.encoder.vq_top.embedding.weight,
+            ctx_top, codebook_weights=self._get_codebook_weights(self.encoder.vq_top),
             T=T, temperature=cfg.temperature,
         )
 
         # Mid predictor (parent = top predictions)
         logits_mid, feat_mid = self.predictor_mid(
-            ctx_mid, codebook_weights=self.encoder.vq_mid.embedding.weight,
+            ctx_mid, codebook_weights=self._get_codebook_weights(self.encoder.vq_mid),
             parent_features=feat_top, T=T, temperature=cfg.temperature,
         )
 
         # Bot predictor (parent = mid predictions)
         logits_bot, feat_bot = self.predictor_bot(
-            ctx_bot, codebook_weights=self.encoder.vq_bot.embedding.weight,
+            ctx_bot, codebook_weights=self._get_codebook_weights(self.encoder.vq_bot),
             parent_features=feat_mid, T=T, temperature=cfg.temperature,
         )
 
@@ -481,13 +588,13 @@ class UnifiedModel(nn.Module):
         logits_bot = pred['logits_bot']  # (B, T*256, K_bot)
         probs = F.softmax(logits_bot / cfg.temperature, dim=-1)   # (B, T*256, K_bot)
         # Lookup in codebook: (B, T*256, D_bot)
-        soft_codes = probs @ self.encoder.vq_bot.embedding.weight  # (B, T*256, D_bot)
+        codebook_weights = self._get_codebook_weights(self.encoder.vq_bot)
+        soft_codes = probs @ codebook_weights  # (B, T*256, vq_dim_bot)
 
-        # Project D_bot → C_bot and reshape to spatial
-        # Use the encoder's bot_from_vq for the projection (D_bot → C_bot)
-        soft_codes_spatial = soft_codes.reshape(B * T, 256, cfg.D_bot)
-        soft_codes_spatial = soft_codes_spatial.reshape(B * T, 16, 16, cfg.D_bot)
-        soft_codes_spatial = soft_codes_spatial.permute(0, 3, 1, 2)  # (B*T, D_bot, 16, 16)
+        # Reshape to spatial and project to channel space
+        vq_dim_bot = self._get_vq_dim('bot')
+        soft_codes_spatial = soft_codes.reshape(B * T, 16, 16, vq_dim_bot)
+        soft_codes_spatial = soft_codes_spatial.permute(0, 3, 1, 2)  # (B*T, vq_dim_bot, 16, 16)
 
         # Project to channel space and decode
         features = self.encoder.bot_from_vq(soft_codes_spatial)  # (B*T, C_bot, 16, 16)
@@ -525,9 +632,13 @@ class UnifiedModel(nn.Module):
         tgt_mid = enc['idx_mid'][:, 1:].reshape(B * T * 16)      # (B*T*16,)
         tgt_bot = enc['idx_bot'][:, 1:].reshape(B * T * 256)     # (B*T*256,)
 
-        ce_top = F.cross_entropy(pred['logits_top'].reshape(-1, cfg.K_top), tgt_top)
-        ce_mid = F.cross_entropy(pred['logits_mid'].reshape(-1, cfg.K_mid), tgt_mid)
-        ce_bot = F.cross_entropy(pred['logits_bot'].reshape(-1, cfg.K_bot), tgt_bot)
+        K_top = pred['logits_top'].shape[-1]
+        K_mid = pred['logits_mid'].shape[-1]
+        K_bot = pred['logits_bot'].shape[-1]
+
+        ce_top = F.cross_entropy(pred['logits_top'].reshape(-1, K_top), tgt_top)
+        ce_mid = F.cross_entropy(pred['logits_mid'].reshape(-1, K_mid), tgt_mid)
+        ce_bot = F.cross_entropy(pred['logits_bot'].reshape(-1, K_bot), tgt_bot)
         ce_loss = ce_top + ce_mid + ce_bot
 
         # MSE loss (predicted RGB vs ground truth frames 1..T)

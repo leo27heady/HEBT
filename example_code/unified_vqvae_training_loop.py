@@ -146,7 +146,11 @@ def compute_codebook_usage(model, video):
     for name, key in [('bot', 'idx_bot'), ('mid', 'idx_mid'), ('top', 'idx_top')]:
         indices = enc[key].reshape(-1)
         unique = indices.unique().numel()
-        total = getattr(model.cfg, f'K_{name}')
+        vq_module = getattr(model.encoder, f'vq_{name}')
+        if hasattr(vq_module, 'codebook_size'):
+            total = vq_module.codebook_size
+        else:
+            total = vq_module.num_embeddings
         usage[f'usage_{name}'] = unique
         usage[f'usage_{name}_pct'] = 100.0 * unique / total
     return usage
@@ -162,6 +166,7 @@ def train(args):
 
     # Config
     cfg = UnifiedConfig(
+        vq_type=args.vq_type,
         max_T=args.T + 1,
         lr=args.lr,
         lambda_ce=args.lambda_ce,
@@ -329,6 +334,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--T', type=int, default=4)
     parser.add_argument('--data_source', type=str, default='shapes', choices=['simple', 'shapes'])
+    parser.add_argument('--vq_type', type=str, default='lfq', choices=['standard', 'lfq'],
+                        help='VQ implementation: standard (embedding) or lfq (lookup-free)')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--lambda_ce', type=float, default=1.0)
     parser.add_argument('--lambda_vq', type=float, default=1.0)
