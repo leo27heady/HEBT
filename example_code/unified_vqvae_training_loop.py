@@ -6,6 +6,7 @@ Trains encoder + predictors + decoder head jointly.
 
 Usage:
     python example_code/unified_vqvae_training_loop.py --log_dir logs/unified_test --steps 2000
+    python example_code/unified_vqvae_training_loop.py --data_source shapes --epochs 50 --dataset_size 500
     python example_code/unified_vqvae_training_loop.py --data_source shapes --steps 5000 --T 4
 """
 
@@ -16,8 +17,11 @@ import time
 import csv
 import json
 
+import math
+
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from torch.optim import Adam
 from torchvision.utils import save_image
@@ -83,42 +87,51 @@ def make_batch(data_source: str, B: int, T: int, H: int = 64, W: int = 64, devic
 
 
 # ---------------------------------------------------------------------------
-# Dataset caching
+# Dataset (generates once, caches to folder, loads with DataLoader)
 # ---------------------------------------------------------------------------
 
-def cache_dataset(data_source: str, num_batches: int, B: int, T: int, cache_dir: str):
-    """Pre-generate batches and save to disk."""
-    os.makedirs(cache_dir, exist_ok=True)
-    meta_path = os.path.join(cache_dir, 'meta.json')
+class CachedVideoDataset(Dataset):
+    """Dataset that generates samples once and caches them as .pt files in a folder."""
 
-    if os.path.isfile(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        if (meta.get('num_batches') == num_batches and
-                meta.get('batch_size') == B and
-                meta.get('T') == T and
-                meta.get('data_source') == data_source):
-            print(f"Using existing cache at {cache_dir} ({num_batches} batches)")
-            return
-        print(f"Cache config mismatch, regenerating...")
+    def __init__(self, data_source: str, dataset_size: int, T: int, cache_dir: str):
+        self.cache_dir = cache_dir
+        self.dataset_size = dataset_size
+        self.T = T
+        self.data_source = data_source
+        os.makedirs(cache_dir, exist_ok=True)
+        self._ensure_cached()
 
-    print(f"Pre-generating {num_batches} batches to {cache_dir}...")
-    t0 = time.time()
-    for i in range(num_batches):
-        batch = make_batch(data_source, B, T, device='cpu')
-        torch.save(batch, os.path.join(cache_dir, f'batch_{i:06d}.pt'))
-        if (i + 1) % 50 == 0:
-            print(f"  [{i+1}/{num_batches}]")
-    with open(meta_path, 'w') as f:
-        json.dump({'num_batches': num_batches, 'batch_size': B, 'T': T,
-                   'data_source': data_source}, f)
-    print(f"Done in {time.time()-t0:.1f}s")
+    def _ensure_cached(self):
+        meta_path = os.path.join(self.cache_dir, 'meta.json')
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if (meta.get('dataset_size') == self.dataset_size and
+                    meta.get('T') == self.T and
+                    meta.get('data_source') == self.data_source):
+                print(f"Using existing dataset cache at {self.cache_dir} ({self.dataset_size} samples)")
+                return
+            print(f"Cache config mismatch, regenerating...")
 
+        print(f"Generating {self.dataset_size} samples to {self.cache_dir}...")
+        t0 = time.time()
+        for i in range(self.dataset_size):
+            sample = make_batch(self.data_source, 1, self.T, device='cpu')  # (1, T+1, 3, 64, 64)
+            sample = sample.squeeze(0)  # (T+1, 3, 64, 64)
+            torch.save(sample, os.path.join(self.cache_dir, f'sample_{i:06d}.pt'))
+            if (i + 1) % 100 == 0:
+                print(f"  [{i+1}/{self.dataset_size}]")
+        with open(meta_path, 'w') as f:
+            json.dump({'dataset_size': self.dataset_size, 'T': self.T,
+                       'data_source': self.data_source}, f)
+        print(f"Done in {time.time()-t0:.1f}s")
 
-def load_cached_batch(cache_dir: str, step: int, num_batches: int, device: str):
-    idx = (step - 1) % num_batches
-    return torch.load(os.path.join(cache_dir, f'batch_{idx:06d}.pt'),
-                      map_location=device, weights_only=True)
+    def __len__(self):
+        return self.dataset_size
+
+    def __getitem__(self, idx):
+        path = os.path.join(self.cache_dir, f'sample_{idx:06d}.pt')
+        return torch.load(path, map_location='cpu', weights_only=True)  # (T+1, 3, 64, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +181,27 @@ def train(args):
     # Optimizer (single for everything)
     optimizer = Adam(model.parameters(), lr=cfg.lr)
 
-    # Dataset caching
-    cache_dir = os.path.join(args.log_dir, 'batch_cache')
-    num_batches = max(args.steps, 200)
-    cache_dataset(args.data_source, num_batches, args.batch_size, args.T, cache_dir)
+    # Dataset + DataLoader
+    cache_dir = os.path.join(args.log_dir, 'dataset_cache')
+    dataset = CachedVideoDataset(args.data_source, args.dataset_size, args.T, cache_dir)
+    dataloader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=(device != 'cpu'),
+        drop_last=True, persistent_workers=(args.num_workers > 0),
+    )
+
+    # Determine total steps
+    steps_per_epoch = len(dataloader)
+    if args.epochs is not None:
+        total_steps = args.epochs * steps_per_epoch
+        total_epochs = args.epochs
+    else:
+        total_steps = args.steps
+        total_epochs = math.ceil(args.steps / steps_per_epoch)
 
     # CSV logger
     csv_path = os.path.join(args.log_dir, 'metrics.csv')
-    csv_fields = ['step', 'loss', 'mse', 'ce_top', 'ce_mid', 'ce_bot', 'ce_total',
+    csv_fields = ['step', 'epoch', 'loss', 'mse', 'ce_top', 'ce_mid', 'ce_bot', 'ce_total',
                   'vq_bot', 'vq_mid', 'vq_top', 'vq_total',
                   'usage_bot', 'usage_mid', 'usage_top', 'time_per_step']
     csv_file = open(csv_path, 'w', newline='')
@@ -186,89 +212,100 @@ def train(args):
     with open(os.path.join(args.log_dir, 'config.json'), 'w') as f:
         json.dump(vars(args) | vars(cfg), f, indent=2, default=str)
 
-    print(f"\nStarting training for {args.steps} steps...")
-    print(f"  data_source={args.data_source}, B={args.batch_size}, T={args.T}")
+    print(f"\nStarting training: {total_steps} steps ({total_epochs} epochs, {steps_per_epoch} steps/epoch)")
+    print(f"  dataset_size={args.dataset_size}, batch_size={args.batch_size}, workers={args.num_workers}")
+    print(f"  data_source={args.data_source}, T={args.T}")
     print(f"  lr={cfg.lr}, λ_ce={cfg.lambda_ce}, λ_vq={cfg.lambda_vq}")
     print(f"  log_dir={args.log_dir}\n")
 
     model.train()
     t0 = time.time()
+    step = 0
 
-    for step in range(1, args.steps + 1):
-        step_start = time.time()
+    for epoch in range(1, total_epochs + 1):
+        for video in dataloader:
+            step += 1
+            if step > total_steps:
+                break
 
-        # Load batch
-        video = load_cached_batch(cache_dir, step, num_batches, device)  # (B, T+1, 3, 64, 64)
+            step_start = time.time()
+            video = video.to(device)  # (B, T+1, 3, 64, 64)
 
-        # Forward
-        out = model(video)
+            # Forward
+            out = model(video)
 
-        # Backward
-        optimizer.zero_grad()
-        out['loss'].backward()
-        if cfg.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-        optimizer.step()
+            # Backward
+            optimizer.zero_grad()
+            out['loss'].backward()
+            if cfg.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            optimizer.step()
 
-        step_time = time.time() - step_start
+            step_time = time.time() - step_start
 
-        # Logging
-        if step % args.log_every == 0 or step == 1:
-            usage = compute_codebook_usage(model, video)
-            row = {
-                'step': step,
-                'loss': f"{out['loss'].item():.5f}",
-                'mse': f"{out['mse'].item():.5f}",
-                'ce_top': f"{out['ce_top'].item():.4f}",
-                'ce_mid': f"{out['ce_mid'].item():.4f}",
-                'ce_bot': f"{out['ce_bot'].item():.4f}",
-                'ce_total': f"{out['ce_total'].item():.4f}",
-                'vq_bot': f"{out['vq_bot'].item():.5f}",
-                'vq_mid': f"{out['vq_mid'].item():.5f}",
-                'vq_top': f"{out['vq_top'].item():.5f}",
-                'vq_total': f"{out['vq_total'].item():.5f}",
-                'usage_bot': usage['usage_bot'],
-                'usage_mid': usage['usage_mid'],
-                'usage_top': usage['usage_top'],
-                'time_per_step': f"{step_time:.3f}",
-            }
-            csv_writer.writerow(row)
-            csv_file.flush()
+            # Logging
+            if step % args.log_every == 0 or step == 1:
+                usage = compute_codebook_usage(model, video)
+                row = {
+                    'step': step,
+                    'epoch': epoch,
+                    'loss': f"{out['loss'].item():.5f}",
+                    'mse': f"{out['mse'].item():.5f}",
+                    'ce_top': f"{out['ce_top'].item():.4f}",
+                    'ce_mid': f"{out['ce_mid'].item():.4f}",
+                    'ce_bot': f"{out['ce_bot'].item():.4f}",
+                    'ce_total': f"{out['ce_total'].item():.4f}",
+                    'vq_bot': f"{out['vq_bot'].item():.5f}",
+                    'vq_mid': f"{out['vq_mid'].item():.5f}",
+                    'vq_top': f"{out['vq_top'].item():.5f}",
+                    'vq_total': f"{out['vq_total'].item():.5f}",
+                    'usage_bot': usage['usage_bot'],
+                    'usage_mid': usage['usage_mid'],
+                    'usage_top': usage['usage_top'],
+                    'time_per_step': f"{step_time:.3f}",
+                }
+                csv_writer.writerow(row)
+                csv_file.flush()
 
-            print(f"[{step:5d}/{args.steps}] "
-                  f"loss={out['loss'].item():.4f} "
-                  f"mse={out['mse'].item():.4f} "
-                  f"ce={out['ce_total'].item():.3f}(t{out['ce_top'].item():.2f}/m{out['ce_mid'].item():.2f}/b{out['ce_bot'].item():.2f}) "
-                  f"vq={out['vq_total'].item():.4f} "
-                  f"usage={usage['usage_bot']}/{usage['usage_mid']}/{usage['usage_top']} "
-                  f"({step_time:.2f}s)")
+                print(f"[{step:5d}/{total_steps} ep{epoch}] "
+                      f"loss={out['loss'].item():.4f} "
+                      f"mse={out['mse'].item():.4f} "
+                      f"ce={out['ce_total'].item():.3f}(t{out['ce_top'].item():.2f}/m{out['ce_mid'].item():.2f}/b{out['ce_bot'].item():.2f}) "
+                      f"vq={out['vq_total'].item():.4f} "
+                      f"usage={usage['usage_bot']}/{usage['usage_mid']}/{usage['usage_top']} "
+                      f"({step_time:.2f}s)")
 
-        # Visualization
-        if step % args.vis_every == 0 or step == 1:
-            model.eval()
-            vis = model.build_visualization(video)
-            vis_path = os.path.join(args.log_dir, f'vis_step_{step:06d}.png')
-            save_image(vis, vis_path)
-            model.train()
+            # Visualization
+            if step % args.vis_every == 0 or step == 1:
+                model.eval()
+                vis = model.build_visualization(video)
+                vis_path = os.path.join(args.log_dir, f'vis_step_{step:06d}.png')
+                save_image(vis, vis_path)
+                model.train()
 
-        # Checkpoint
-        if step % args.save_every == 0:
-            ckpt_path = os.path.join(args.log_dir, f'checkpoint_step_{step:06d}.pt')
-            torch.save({
-                'step': step,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': out['loss'].item(),
-            }, ckpt_path)
-            print(f"  Saved checkpoint → {ckpt_path}")
+            # Checkpoint
+            if step % args.save_every == 0:
+                ckpt_path = os.path.join(args.log_dir, f'checkpoint_step_{step:06d}.pt')
+                torch.save({
+                    'step': step,
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': out['loss'].item(),
+                }, ckpt_path)
+                print(f"  Saved checkpoint → {ckpt_path}")
+
+        if step >= total_steps:
+            break
 
     # Final save
     total_time = time.time() - t0
-    print(f"\nTraining complete in {total_time:.1f}s ({total_time/args.steps:.2f}s/step avg)")
+    print(f"\nTraining complete in {total_time:.1f}s ({total_time/step:.2f}s/step avg)")
 
     final_path = os.path.join(args.log_dir, 'final_model.pt')
     torch.save({
-        'step': args.steps,
+        'step': step,
+        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'config': vars(cfg),
@@ -285,8 +322,11 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Unified VQ-VAE Training")
     parser.add_argument('--log_dir', type=str, default='logs/unified_test')
-    parser.add_argument('--steps', type=int, default=2000)
+    parser.add_argument('--steps', type=int, default=2000, help='Max training steps (ignored if --epochs is set)')
+    parser.add_argument('--epochs', type=int, default=None, help='Train for N epochs (overrides --steps)')
+    parser.add_argument('--dataset_size', type=int, default=500, help='Number of unique samples to generate/cache')
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--T', type=int, default=4)
     parser.add_argument('--data_source', type=str, default='shapes', choices=['simple', 'shapes'])
     parser.add_argument('--lr', type=float, default=3e-4)
