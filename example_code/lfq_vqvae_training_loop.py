@@ -128,6 +128,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vq_loss_weight", type=float, default=1.0)
     p.add_argument("--recon_loss", type=str, default="mse", choices=["mse", "l1"])
 
+    p.add_argument(
+        "--quantization_mode",
+        type=str,
+        default="bottleneck",
+        choices=["bottleneck", "hierarchical"],
+    )
+    p.add_argument(
+        "--stage_codebook_sizes",
+        type=int,
+        nargs="+",
+        default=[64, 512, 4096],
+        help="Hierarchical: bot, mid, top codebook sizes.",
+    )
+    p.add_argument(
+        "--stage_lfq_dims",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Hierarchical LFQ dims (default: log2 of stage_codebook_sizes).",
+    )
+    p.add_argument(
+        "--fusion",
+        type=str,
+        default="conv",
+        choices=["concat", "conv", "gamma"],
+        help="Hierarchical skip fusion mode.",
+    )
+    p.add_argument("--lambda_prior_ce", type=float, default=1.0)
+    p.add_argument(
+        "--prior_ce_weights",
+        type=str,
+        default="spatial",
+        choices=["spatial", "uniform"],
+    )
+    p.add_argument("--gamma_l2", type=float, default=0.0)
+
     p.add_argument("--dataset_size", type=int, default=2000)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=4)
@@ -155,22 +191,40 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    stage_lfq_dims = args.stage_lfq_dims
+    if stage_lfq_dims is None:
+        import math
+        stage_lfq_dims = [
+            int(math.log2(k)) for k in args.stage_codebook_sizes
+        ]
+
     cfg = LFQVAEConfig(
         image_size=args.image_size,
+        quantization_mode=args.quantization_mode,
         stage_sizes=tuple(args.stage_sizes),
         stage_channels=tuple(args.stage_channels),
         codebook_size=args.codebook_size,
         lfq_dim=args.lfq_dim,
+        stage_codebook_sizes=tuple(args.stage_codebook_sizes),
+        stage_lfq_dims=tuple(stage_lfq_dims),
         entropy_loss_weight=args.entropy_loss_weight,
         diversity_gamma=args.diversity_gamma,
         vq_loss_weight=args.vq_loss_weight,
         recon_loss=args.recon_loss,
+        fusion=args.fusion,
+        lambda_prior_ce=args.lambda_prior_ce,
+        prior_ce_weights=args.prior_ce_weights,
+        gamma_l2=args.gamma_l2,
     )
     model = LFQVAE(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
+    print(f"Mode: {cfg.quantization_mode}  fusion: {cfg.fusion}")
     print(f"Stages: {cfg.spatial_sizes_descending()}  channels: {cfg.stage_channels}")
-    print(f"Codebook: K={cfg.codebook_size}  lfq_dim={cfg.lfq_dim}")
+    if cfg.quantization_mode == "hierarchical":
+        print(f"Codebooks: {cfg.stage_codebook_sizes}  lfq_dims: {cfg.stage_lfq_dims}")
+    else:
+        print(f"Codebook: K={cfg.codebook_size}  lfq_dim={cfg.lfq_dim}")
 
     if args.load_ckpt:
         ckpt = torch.load(args.load_ckpt, map_location=device, weights_only=False)
@@ -227,11 +281,23 @@ def main() -> None:
                     "vq": metrics["vq"].item(),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
+                if "prior_ce" in metrics:
+                    row["prior_ce"] = metrics["prior_ce"].item()
+                    row["vq_bot"] = metrics["vq_bot"].item()
+                    row["vq_mid"] = metrics["vq_mid"].item()
+                    row["vq_top"] = metrics["vq_top"].item()
+                if "gamma_abs" in metrics:
+                    row["gamma_abs"] = float(metrics["gamma_abs"])
                 logger.log(row)
-                print(
+                msg = (
                     f"  step {global_step:5d} | loss {row['loss']:.4f}  "
                     f"recon {row['recon']:.4f}  vq {row['vq']:.4f}"
                 )
+                if "prior_ce" in row:
+                    msg += f"  prior_ce {row['prior_ce']:.4f}"
+                if "gamma_abs" in row:
+                    msg += f"  gamma {row['gamma_abs']:.4f}"
+                print(msg)
 
             if args.viz_every > 0 and global_step % args.viz_every == 0:
                 save_recon_panel(

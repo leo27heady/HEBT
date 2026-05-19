@@ -4,6 +4,8 @@ from .config import LFQVAEConfig
 from .model import LFQVAE
 from .encoder import LFQEncoder
 from .decoder import LFQDecoder
+from .hierarchical_encoder import LFQHierarchicalEncoder
+from .hierarchical_decoder import LFQHierarchicalDecoder
 from .blocks import ResBlock
 
 __all__ = [
@@ -11,5 +13,7 @@ __all__ = [
     "LFQVAE",
     "LFQEncoder",
     "LFQDecoder",
+    "LFQHierarchicalEncoder",
+    "LFQHierarchicalDecoder",
     "ResBlock",
 ]
