@@ -2,8 +2,8 @@
 Hierarchical Video EBT (HVEBT) - single-stage Phase 1 implementation.
 
 Design (Phase 1, single stage at a fixed spatial resolution H x W):
-  Input per clip (B, T+1, 3, Hi, Wi) is encoded by frozen MobileCLIP stage features
-  of shape (B, T+1, C_clip, H, W). We use frames [0..T-1] as "real context" and
+  Input per clip (B, T+1, 3, 64, 64) is encoded by the lightweight CNN into
+  features of shape (B, T+1, C, H, W). We use frames [0..T-1] as "real context" and
   frames [1..T] as prediction targets. At each time step t, the transformer sees
   a token with channel-wise concat of (real_t, predicted_{t+1}) projected to D.
 
@@ -15,7 +15,7 @@ Design (Phase 1, single stage at a fixed spatial resolution H x W):
   Per-token scalar energy -> sum -> autograd wrt x_pred (NOT wrt the transformer
   weights during MCMC) -> alpha * step -> repeat for K MCMC steps.
 
-  Loss = reconstruction(pred_final, clip_features_{1..T}) at this stage's feature
+  Loss = reconstruction(pred_final, encoder_features_{1..T}) at this stage's feature
   space. Gradient flows through MCMC unroll (create_graph during train).
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.vid.hvebt.clip_encoder import MobileClipMultiStageEncoder
+from model.vid.hvebt.lightweight_encoder import LightweightMultiStageEncoder
 from model.vid.hvebt.cross_attention import (
     CrossAttention3DRoPE,
     build_cross_attn_mask,
@@ -43,10 +43,10 @@ from model.vid.hvebt.positional import RoPE3DCache, apply_rope3d, build_rope3d
 
 @dataclass
 class HVEBTStageConfig:
-    clip_stage_name: str = "final"      # which MobileCLIP stage to condition on / target
-    clip_channels: int = 1024            # C of that stage
-    H: int = 8                           # spatial H at this stage (1 for pooled)
-    W: int = 8                           # spatial W (1 for pooled)
+    stage_name: str = "16x16"            # encoder stage key (16x16, 4x4, 1x1)
+    channels: int = 64                   # C of that stage
+    H: int = 16                          # spatial H at this stage
+    W: int = 16                          # spatial W
     embed_dim: int = 256                 # transformer hidden D (must be divisible by n_heads and yield even head_dim)
     n_heads: int = 4
     n_layers: int = 4
@@ -179,21 +179,21 @@ class Block(nn.Module):
 
 class HVEBTStage(nn.Module):
     """
-    Single stage of the hierarchical EBT. Given real clip features and current
+    Single stage of the hierarchical EBT. Given real encoder features and current
     predicted features (both same shape), outputs a per-token scalar energy.
 
     Optionally accepts `parent_context` from a coarser (upper) stage. When
     enabled (`parent_channels` is not None), every transformer block adds a
-    cross-attention layer that lets each child token attend to its
-    corresponding parent at (y//2, x//2) at the same time step. The parent KV
+    cross-attention layer that lets each child token attend to its spatial
+    parent at the same time step (see `build_cross_attn_mask`). The parent KV
     is pre-projected inside this module from `parent_channels` -> `embed_dim`
     and is expected to be detached by the caller (so gradient does NOT flow
     into the parent stage's parameters during this stage's MCMC / loss).
 
-    NOTE: The prediction tower is top-down (coarse→fine). The CLIP encoder
-    provides features bottom-up but the MCMC stages process from apex (coarsest)
-    to base (finest), with each finer stage receiving parent context from the
-    coarser stage above.
+    NOTE: The prediction tower is top-down (coarse→fine). The encoder provides
+    features bottom-up but the MCMC stages process from apex (coarsest) to base
+    (finest), with each finer stage receiving parent context from the coarser
+    stage above.
     """
 
     def __init__(
@@ -220,7 +220,7 @@ class HVEBTStage(nn.Module):
         else:
             self.parent_HW = None
         # channel-wise concat of (real_t, pred_{t+1}) -> D
-        self.input_proj = nn.Linear(2 * cfg.clip_channels, cfg.embed_dim, bias=True)
+        self.input_proj = nn.Linear(2 * cfg.channels, cfg.embed_dim, bias=True)
         self.blocks = nn.ModuleList([
             Block(cfg, cross_attn_dim=(cfg.embed_dim if self.use_cross_attn else None))
             for _ in range(cfg.n_layers)
@@ -299,9 +299,9 @@ class HVEBTStage(nn.Module):
         B, T, C, H, W = real_feats.shape
         if pred_feats.shape != real_feats.shape:
             raise ValueError("real_feats and pred_feats must have same shape")
-        if (C, H, W) != (self.cfg.clip_channels, self.cfg.H, self.cfg.W):
+        if (C, H, W) != (self.cfg.channels, self.cfg.H, self.cfg.W):
             raise ValueError(
-                f"Expected features (C={self.cfg.clip_channels}, H={self.cfg.H}, W={self.cfg.W}), "
+                f"Expected features (C={self.cfg.channels}, H={self.cfg.H}, W={self.cfg.W}), "
                 f"got ({C}, {H}, {W})"
             )
         if self.use_cross_attn and parent_context is None:
@@ -359,18 +359,16 @@ class HVEBTConfig:
     denoising_init: str = "zeros"        # "zeros" | "random_noise" | "real_current"
     truncate_mcmc: bool = False
     clamp_grad_max: float = 0.0          # 0 -> no clamp
-    weights_path: str = "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
 
 
 class HVEBT(nn.Module):
-    """Single-stage HVEBT for Phase 1. Wraps frozen encoder + one HVEBTStage."""
+    """Single-stage HVEBT for Phase 1. Wraps lightweight encoder + one HVEBTStage."""
 
     def __init__(self, cfg: HVEBTConfig):
         super().__init__()
         self.cfg = cfg
-        self.encoder = MobileClipMultiStageEncoder(
-            weights_path=cfg.weights_path,
-            return_stages=(cfg.stage.clip_stage_name,),
+        self.encoder = LightweightMultiStageEncoder(
+            return_stages=(cfg.stage.stage_name,),
         )
         self.stage = HVEBTStage(cfg.stage)
         self.alpha = nn.Parameter(
@@ -381,13 +379,12 @@ class HVEBT(nn.Module):
 
     # ---- feature extraction ------------------------------------------------ #
 
-    @torch.no_grad()
     def encode(self, video: torch.Tensor) -> torch.Tensor:
         """
-        Args: video (B, T+1, 3, Hi, Wi) in [0, 1].
+        Args: video (B, T+1, 3, 64, 64) in [0, 1].
         Returns stage feats (B, T+1, C, H, W).
         """
-        feats = self.encoder.encode_video(video)[self.cfg.stage.clip_stage_name]
+        feats = self.encoder.encode_video(video)[self.cfg.stage.stage_name]
         return feats.float()
 
     # ---- initial prediction ------------------------------------------------ #

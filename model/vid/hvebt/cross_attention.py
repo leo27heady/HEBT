@@ -6,14 +6,14 @@ finer stage cross-attends to the coarser stage's **detached** predicted
 features (parent → child conditioning) with two restrictions:
 
   1. Same time step:    a child at frame tc may only attend keys at frame tc.
-  2. Spatial parent:    a child at spatial position (yc, xc) may only attend
-                        the parent at (yc // 2, xc // 2).
+  2. Spatial parent:    a child at (yc, xc) may only attend the mapped parent
+                        cell at the same time (see `build_cross_attn_mask`:
+                        floor division for general ratios, e.g. 16x16 -> 4x4).
 
-This gives each child token exactly 1 parent key (many-to-one: 4 children
-share the same parent). The parent provides abstract context that the child
-specializes into finer detail.
+Each child token has exactly one allowed parent key. The parent provides
+abstract context that the child specializes into finer detail.
 
-The CLIP encoder is bottom-up (fine→coarse), the prediction tower is top-down
+The encoder is bottom-up (fine→coarse); the prediction tower is top-down
 (coarse→fine).
 """
 from __future__ import annotations
@@ -31,7 +31,8 @@ def build_child_to_parent_mask(
     T: int, Hp: int, Wp: int, device: torch.device
 ) -> torch.Tensor:
     """
-    Additive cross-attention mask of shape (T*Hc*Wc, T*Hp*Wp) with Hc=2*Hp, Wc=2*Wp.
+    Additive cross-attention mask of shape (T*Hc*Wc, T*Hp*Wp) with Hc=2*Hp, Wc=2*Wp
+    (2x downsampling only — use `build_cross_attn_mask` for general ratios).
 
     Queries are from the child (finer) grid, keys are from the parent (coarser) grid.
     A child at (yc, xc, tc) attends to the parent at (yc//2, xc//2, tc).

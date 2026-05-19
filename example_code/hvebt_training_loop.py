@@ -1,7 +1,7 @@
 """
-HVEBT Phase 1 — minimal training loop on VIDShapeSyntheticDataset at 256x256.
+HVEBT Phase 1 — minimal training loop on VIDShapeSyntheticDataset at 64x64.
 
-Trains the single-stage HVEBT (MobileCLIP 'final' features at 8x8) on rotating
+Trains the single-stage HVEBT (16x16 encoder features) on rotating
 2D triangles. Logs per-step loss, energies, reconstruction, gradient norm, and
 (every N steps) running averages + simple stability checks.
 
@@ -65,9 +65,9 @@ def make_hparams(args) -> SimpleNamespace:
 
 def make_model(args, device: torch.device) -> HVEBT:
     stage_cfg = HVEBTStageConfig(
-        clip_stage_name="final",
-        clip_channels=1024,
-        H=8, W=8,
+        stage_name="16x16",
+        channels=64,
+        H=16, W=16,
         embed_dim=args.embed_dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -211,7 +211,7 @@ def train(args):
 def parse_args():
     ap = argparse.ArgumentParser()
     # data
-    ap.add_argument("--image_size", type=int, default=256)
+    ap.add_argument("--image_size", type=int, default=64)
     ap.add_argument("--context_length", type=int, default=8)
     ap.add_argument("--dataset_size", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=1)

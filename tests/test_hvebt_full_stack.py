@@ -57,15 +57,15 @@ def _full_5stage_cfg(
     """
     tw = temporal_windows or [None, None, None, None, None]
     stages = [
-        HVEBTStageConfig(clip_stage_name="s0", clip_channels=8, H=8, W=8,
+        HVEBTStageConfig(stage_name="s0", channels=8, H=8, W=8,
                          embed_dim=16, n_heads=2, n_layers=n_layers, temporal_window=tw[0]),
-        HVEBTStageConfig(clip_stage_name="s1", clip_channels=8, H=4, W=4,
+        HVEBTStageConfig(stage_name="s1", channels=8, H=4, W=4,
                          embed_dim=16, n_heads=2, n_layers=n_layers, temporal_window=tw[1]),
-        HVEBTStageConfig(clip_stage_name="s2", clip_channels=12, H=2, W=2,
+        HVEBTStageConfig(stage_name="s2", channels=12, H=2, W=2,
                          embed_dim=16, n_heads=2, n_layers=n_layers, temporal_window=tw[2]),
-        HVEBTStageConfig(clip_stage_name="s3", clip_channels=16, H=2, W=2,
+        HVEBTStageConfig(stage_name="s3", channels=16, H=2, W=2,
                          embed_dim=16, n_heads=2, n_layers=n_layers, temporal_window=tw[3]),
-        HVEBTStageConfig(clip_stage_name="pooled", clip_channels=20, H=1, W=1,
+        HVEBTStageConfig(stage_name="pooled", channels=20, H=1, W=1,
                          embed_dim=16, n_heads=2, n_layers=n_layers, temporal_window=tw[4]),
     ]
     return HierarchicalHVEBTConfig(
@@ -76,7 +76,6 @@ def _full_5stage_cfg(
         progressive=progressive,
         progressive_steps_per_stage=progressive_steps_per_stage,
         detach_kv=True,
-        weights_path="",
     )
 
 
@@ -98,7 +97,7 @@ def _make_model_no_encoder(cfg: HierarchicalHVEBTConfig) -> HierarchicalHVEBT:
             stages.append(HVEBTStage(sc))
         else:
             parent_sc = cfg.stages[i + 1]
-            stages.append(HVEBTStage(sc, parent_channels=parent_sc.clip_channels,
+            stages.append(HVEBTStage(sc, parent_channels=parent_sc.channels,
                                      parent_HW=(parent_sc.H, parent_sc.W)))
     model.stages = nn.ModuleList(stages)
     model.alphas = nn.ParameterList([
@@ -111,7 +110,7 @@ def _make_model_no_encoder(cfg: HierarchicalHVEBTConfig) -> HierarchicalHVEBT:
     if cfg.decoder_enabled:
         base_sc = cfg.stages[0]
         model.decoder = PixelDecoder(
-            in_channels=base_sc.clip_channels,
+            in_channels=base_sc.channels,
             in_HW=(base_sc.H, base_sc.W),
             out_size=cfg.decoder_out_size,
         )
@@ -122,7 +121,7 @@ def _fake_feats(cfg: HierarchicalHVEBTConfig, B: int = 2, T_plus_1: int = 3):
     """Generate fake feature dicts for all stages."""
     d = {}
     for sc in cfg.stages:
-        d[sc.clip_stage_name] = torch.randn(B, T_plus_1, sc.clip_channels, sc.H, sc.W)
+        d[sc.stage_name] = torch.randn(B, T_plus_1, sc.channels, sc.H, sc.W)
     return d
 
 
@@ -161,8 +160,8 @@ class TestFull5StageForwardBackward:
         for i, s in enumerate(per_stage):
             assert s is not None, f"Stage {i} output is None"
             sc = cfg.stages[i]
-            assert s["final_pred"].shape == (2, 2, sc.clip_channels, sc.H, sc.W)
-            assert s["real_gt"].shape == (2, 2, sc.clip_channels, sc.H, sc.W)
+            assert s["final_pred"].shape == (2, 2, sc.channels, sc.H, sc.W)
+            assert s["real_gt"].shape == (2, 2, sc.channels, sc.H, sc.W)
             assert torch.isfinite(s["loss"])
             assert torch.isfinite(s["final_pred"]).all()
 
@@ -176,7 +175,7 @@ class TestFull5StageForwardBackward:
         for i, stage in enumerate(model.stages):
             has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                            for p in stage.parameters())
-            assert has_grad, f"Stage {i} ({cfg.stages[i].clip_stage_name}) has no gradient"
+            assert has_grad, f"Stage {i} ({cfg.stages[i].stage_name}) has no gradient"
 
     def test_no_nan_in_gradients(self):
         cfg = _full_5stage_cfg(mcmc_steps=4)
@@ -420,7 +419,7 @@ class TestTemporalWindowing:
         """With window=1, changing a different frame's input should NOT affect
         the current frame's energy output (no cross-time info)."""
         cfg_w1 = HVEBTStageConfig(
-            clip_stage_name="s1", clip_channels=8, H=2, W=2,
+            stage_name="s1", channels=8, H=2, W=2,
             embed_dim=16, n_heads=2, n_layers=1, temporal_window=1,
         )
         stage = HVEBTStage(cfg_w1)
@@ -670,7 +669,7 @@ class TestMCMCChaining:
     def test_cross_attn_with_vector_parent_forward(self):
         """Stage s3 (2x2) cross-attending to pooled (1x1) should work."""
         stage_cfg = HVEBTStageConfig(
-            clip_stage_name="s3", clip_channels=16, H=2, W=2,
+            stage_name="s3", channels=16, H=2, W=2,
             embed_dim=16, n_heads=2, n_layers=1,
         )
         stage = HVEBTStage(stage_cfg, parent_channels=20, parent_HW=(1, 1))
@@ -691,18 +690,6 @@ class TestMCMCChaining:
         assert torch.isfinite(out["loss_total"])
         for i in range(5):
             assert out["per_stage"][i] is not None
-
-    def test_3d_pooled_features_auto_unsqueeze(self):
-        """3D features (B,T,C) for pooled stage are auto-unsqueezed."""
-        cfg = _full_5stage_cfg(mcmc_steps=2)
-        model = _make_model_no_encoder(cfg)
-        feats = _fake_feats(cfg, B=2, T_plus_1=3)
-        # Make pooled 3D
-        feats["pooled"] = feats["pooled"].squeeze(-1).squeeze(-1)
-        assert feats["pooled"].dim() == 3
-        out = _forward(model, feats)
-        assert torch.isfinite(out["loss_total"])
-
 
 # =========================================================================== #
 # 7. Energy decrease over MCMC steps
@@ -859,7 +846,7 @@ class TestRobustness:
         model = _make_model_no_encoder(cfg)
         feats = {}
         for sc in cfg.stages:
-            feats[sc.clip_stage_name] = torch.zeros(2, 3, sc.clip_channels, sc.H, sc.W)
+            feats[sc.stage_name] = torch.zeros(2, 3, sc.channels, sc.H, sc.W)
         out = _forward(model, feats)
         assert torch.isfinite(out["loss_total"])
 
@@ -988,7 +975,7 @@ class TestPerStageOutputs:
 
         for i, sc in enumerate(cfg.stages):
             s = out["per_stage"][i]
-            expected = (2, 2, sc.clip_channels, sc.H, sc.W)
+            expected = (2, 2, sc.channels, sc.H, sc.W)
             assert s["final_pred"].shape == expected, \
                 f"Stage {i}: pred shape {s['final_pred'].shape} != expected {expected}"
             assert s["real_gt"].shape == expected
@@ -1023,45 +1010,42 @@ class TestConstructionValidation:
 
     def test_empty_stages_raises(self):
         with pytest.raises(ValueError, match="at least one stage"):
-            cfg = HierarchicalHVEBTConfig(stages=[], weights_path="")
+            cfg = HierarchicalHVEBTConfig(stages=[])
             HierarchicalHVEBT(cfg)
 
     def test_child_smaller_than_parent_raises(self):
-        """Child spatial must be >= parent."""
+        """Child spatial must be >= parent (finer stage listed first)."""
         cfg = HierarchicalHVEBTConfig(
             stages=[
-                HVEBTStageConfig(clip_stage_name="s1", clip_channels=8, H=2, W=2,
+                HVEBTStageConfig(stage_name="4x4", channels=128, H=4, W=4,
                                  embed_dim=16, n_heads=2, n_layers=1),
-                HVEBTStageConfig(clip_stage_name="s2", clip_channels=16, H=4, W=4,
+                HVEBTStageConfig(stage_name="16x16", channels=64, H=16, W=16,
                                  embed_dim=16, n_heads=2, n_layers=1),
             ],
-            weights_path="",
         )
         with pytest.raises(ValueError, match="must be >="):
             HierarchicalHVEBT(cfg)
 
     def test_valid_non_2x_geometry_accepted(self):
-        """Non-2x geometry (e.g., 8x8 -> 1x1) should be accepted."""
+        """Non-2x geometry (e.g., 8x8 -> 1x1) accepted when using fake features."""
         cfg = HierarchicalHVEBTConfig(
             stages=[
-                HVEBTStageConfig(clip_stage_name="s3", clip_channels=16, H=8, W=8,
+                HVEBTStageConfig(stage_name="fine", channels=16, H=8, W=8,
                                  embed_dim=16, n_heads=2, n_layers=1),
-                HVEBTStageConfig(clip_stage_name="pooled", clip_channels=20, H=1, W=1,
+                HVEBTStageConfig(stage_name="apex1", channels=20, H=1, W=1,
                                  embed_dim=16, n_heads=2, n_layers=1),
             ],
-            weights_path="",
         )
-        model = HierarchicalHVEBT(cfg)
+        model = _make_model_no_encoder(cfg)
         assert len(model.stages) == 2
 
     def test_single_stage_config(self):
         """A single-stage config (apex only) should work."""
         cfg = HierarchicalHVEBTConfig(
             stages=[
-                HVEBTStageConfig(clip_stage_name="pooled", clip_channels=20, H=1, W=1,
+                HVEBTStageConfig(stage_name="1x1", channels=256, H=1, W=1,
                                  embed_dim=16, n_heads=2, n_layers=1),
             ],
-            weights_path="",
         )
         model = HierarchicalHVEBT(cfg)
         assert len(model.stages) == 1

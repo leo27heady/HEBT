@@ -1,11 +1,10 @@
 """
-Tests for Hierarchical Video EBT Phase 0 (CLIP encoder) + Phase 1 (single-stage EBT).
+Tests for Hierarchical Video EBT lightweight encoder + Phase 1 (single-stage EBT).
 
 Run with venv activated:
     python tests/test_hvebt.py
 
-All tests run on CPU with tiny shapes for speed, except the encoder shape test
-which uses 256x256 (matching planned training resolution).
+All tests run on CPU with tiny shapes for speed.
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from model.vid.hvebt.clip_encoder import MobileClipMultiStageEncoder  # noqa: E402
+from model.vid.hvebt.lightweight_encoder import LightweightMultiStageEncoder  # noqa: E402
 from model.vid.hvebt.hvebt import (  # noqa: E402
     HVEBT,
     HVEBTConfig,
@@ -137,8 +136,8 @@ def test_block_causal_mask():
 
 def _tiny_stage_cfg():
     return HVEBTStageConfig(
-        clip_stage_name="final",
-        clip_channels=16,
+        stage_name="16x16",
+        channels=16,
         H=4, W=4,
         embed_dim=48,    # head_dim=12, splits (4,4,4) all even
         n_heads=4,
@@ -153,8 +152,8 @@ def test_stage_forward_shape():
     cfg = _tiny_stage_cfg()
     stage = HVEBTStage(cfg)
     B, T = 2, 3
-    real = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
-    pred = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
+    real = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
+    pred = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
     e = stage(real, pred)
     assert e.shape == (B, T * cfg.H * cfg.W), e.shape
 
@@ -169,9 +168,9 @@ def test_stage_energy_nonzero_after_perturb():
         stage.energy_head.weight.normal_(0, 0.02)
         stage.energy_head.bias.normal_(0, 0.02)
     B, T = 2, 3
-    real = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
-    p1 = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
-    p2 = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
+    real = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
+    p1 = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
+    p2 = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
     e1 = stage(real, p1)
     e2 = stage(real, p2)
     assert not torch.allclose(e1, e2), "energy should depend on pred"
@@ -186,11 +185,11 @@ def test_stage_causality():
     with torch.no_grad():
         stage.energy_head.weight.normal_(0, 0.1)
     B, T = 1, 4
-    real = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
-    pred_a = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
+    real = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
+    pred_a = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
     pred_b = pred_a.clone()
     # Change ONLY the last frame's predicted features
-    pred_b[:, -1] = torch.randn(B, cfg.clip_channels, cfg.H, cfg.W)
+    pred_b[:, -1] = torch.randn(B, cfg.channels, cfg.H, cfg.W)
 
     e_a = stage(real, pred_a).reshape(B, T, cfg.H * cfg.W)
     e_b = stage(real, pred_b).reshape(B, T, cfg.H * cfg.W)
@@ -211,11 +210,11 @@ def test_stage_context_causality():
         # Also bump input_proj so there's a real dependency on real_ctx
         stage.input_proj.weight.normal_(0, 0.1)
     B, T = 1, 4
-    real_a = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
+    real_a = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
     real_b = real_a.clone()
-    pred = torch.randn(B, T, cfg.clip_channels, cfg.H, cfg.W)
+    pred = torch.randn(B, T, cfg.channels, cfg.H, cfg.W)
     # perturb real at frame 2 only
-    real_b[:, 2] = torch.randn(B, cfg.clip_channels, cfg.H, cfg.W)
+    real_b[:, 2] = torch.randn(B, cfg.channels, cfg.H, cfg.W)
     e_a = stage(real_a, pred).reshape(B, T, cfg.H * cfg.W)
     e_b = stage(real_b, pred).reshape(B, T, cfg.H * cfg.W)
     # Frames 0,1 must be unaffected. Frames 2,3 may differ.
@@ -275,7 +274,7 @@ def test_mcmc_energy_decreases():
 
     B, T = 2, 3
     scfg = cfg.stage
-    real = torch.randn(B, T, scfg.clip_channels, scfg.H, scfg.W)
+    real = torch.randn(B, T, scfg.channels, scfg.H, scfg.W)
     init = torch.randn_like(real)
     preds, energies = model.mcmc(real, init, learning=False)
     e = torch.stack([en.mean() for en in energies]).detach()
@@ -292,7 +291,7 @@ def test_mcmc_alpha_grad():
         model.stage.energy_head.weight.normal_(0, 0.1)
     B, T = 1, 2
     scfg = cfg.stage
-    real = torch.randn(B, T, scfg.clip_channels, scfg.H, scfg.W)
+    real = torch.randn(B, T, scfg.channels, scfg.H, scfg.W)
     init = torch.randn_like(real)
     preds, _ = model.mcmc(real, init, learning=True)
     loss = preds[-1].pow(2).mean()
@@ -317,8 +316,8 @@ def test_overfit_tiny():
 
     B, T = 2, 3
     scfg = cfg.stage
-    real_ctx = torch.randn(B, T, scfg.clip_channels, scfg.H, scfg.W)
-    real_gt = torch.randn(B, T, scfg.clip_channels, scfg.H, scfg.W)
+    real_ctx = torch.randn(B, T, scfg.channels, scfg.H, scfg.W)
+    real_gt = torch.randn(B, T, scfg.channels, scfg.H, scfg.W)
 
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -353,8 +352,8 @@ def test_grad_flow_layers():
 
     B, T = 2, 3
     scfg = cfg.stage
-    real_ctx = torch.randn(B, T, scfg.clip_channels, scfg.H, scfg.W)
-    real_gt = torch.randn(B, T, scfg.clip_channels, scfg.H, scfg.W)
+    real_ctx = torch.randn(B, T, scfg.channels, scfg.H, scfg.W)
+    real_gt = torch.randn(B, T, scfg.channels, scfg.H, scfg.W)
     init_pred = torch.zeros_like(real_gt)
     preds, _ = model.mcmc(real_ctx, init_pred, learning=True)
     loss = sum(torch.nn.functional.smooth_l1_loss(p, real_gt) for p in preds) / len(preds)
@@ -378,34 +377,22 @@ def test_grad_flow_layers():
     assert max_norm < 1e3, f"grad norm explosion: {max_norm}"
 
 
-@_case("Frozen encoder: parameters have requires_grad=False")
-def test_encoder_frozen():
-    import open_clip  # noqa: F401  - ensures available
-    try:
-        enc = MobileClipMultiStageEncoder()
-    except FileNotFoundError as e:
-        raise AssertionError(f"weights missing: {e}")
-    n_total = sum(1 for _ in enc.parameters())
-    n_frozen = sum(1 for p in enc.parameters() if not p.requires_grad)
-    assert n_total == n_frozen, f"{n_total - n_frozen} params still trainable"
-    # eval mode sticky
-    enc.train(True)
-    assert not enc.training, "encoder must stay in eval mode"
+@_case("Lightweight encoder is trainable by default")
+def test_encoder_trainable():
+    enc = LightweightMultiStageEncoder()
+    n_trainable = sum(1 for p in enc.parameters() if p.requires_grad)
+    assert n_trainable > 0
 
 
-@_case("Encoder produces expected stage shapes at 256x256")
-def test_encoder_shapes_256():
-    enc = MobileClipMultiStageEncoder()
-    x = torch.rand(1, 3, 256, 256)
+@_case("Encoder produces expected stage shapes at 64x64")
+def test_encoder_shapes_64():
+    enc = LightweightMultiStageEncoder()
+    x = torch.rand(1, 3, 64, 64)
     feats = enc(x)
     expected = {
-        "stem": (1, 64, 64, 64),
-        "s0":   (1, 64, 64, 64),
-        "s1":   (1, 128, 32, 32),
-        "s2":   (1, 256, 16, 16),
-        "s3":   (1, 512, 8, 8),
-        "final": (1, 1024, 8, 8),
-        "pooled": (1, 512),
+        "16x16": (1, 64, 16, 16),
+        "4x4":   (1, 128, 4, 4),
+        "1x1":   (1, 256, 1, 1),
     }
     for k, shape in expected.items():
         assert k in feats, f"missing {k}"
@@ -414,21 +401,22 @@ def test_encoder_shapes_256():
 
 @_case("Encoder is deterministic (same input -> same output)")
 def test_encoder_deterministic():
-    enc = MobileClipMultiStageEncoder(return_stages=("final",))
-    x = torch.rand(1, 3, 256, 256)
-    a = enc(x)["final"]
-    b = enc(x)["final"]
+    enc = LightweightMultiStageEncoder(return_stages=("16x16",))
+    enc.eval()
+    x = torch.rand(1, 3, 64, 64)
+    with torch.no_grad():
+        a = enc(x)["16x16"]
+        b = enc(x)["16x16"]
     assert torch.allclose(a, b), "encoder not deterministic"
 
 
-@_case("End-to-end: HVEBT.forward_loss runs on fake 64x64 video (small resolution)")
+@_case("End-to-end: HVEBT.forward_loss runs on 64x64 video")
 def test_full_model_forward_small():
-    # Use 64x64 video so the encoder runs faster. Real training would use 256.
     cfg = HVEBTConfig(
         stage=HVEBTStageConfig(
-            clip_stage_name="final",
-            clip_channels=1024,
-            H=2, W=2,    # stride 32 on 64x64 input -> 2x2
+            stage_name="16x16",
+            channels=64,
+            H=16, W=16,
             embed_dim=64,
             n_heads=4,
             n_layers=2,
@@ -443,14 +431,16 @@ def test_full_model_forward_small():
     loss = out["loss"]
     assert torch.isfinite(loss), "loss not finite"
     loss.backward()
-    any_grad = any(
+    any_stage_grad = any(
         (p.grad is not None and p.grad.abs().sum().item() > 0)
         for p in model.stage.parameters()
     )
-    assert any_grad, "stage received no gradient"
-    # Encoder must have zero grads
-    for p in model.encoder.parameters():
-        assert p.grad is None or p.grad.abs().sum().item() == 0.0, "encoder got grad"
+    assert any_stage_grad, "stage received no gradient"
+    any_enc_grad = any(
+        (p.grad is not None and p.grad.abs().sum().item() > 0)
+        for p in model.encoder.parameters()
+    )
+    assert any_enc_grad, "encoder received no gradient"
 
 
 # --------------------------------------------------------------------------- #
@@ -477,9 +467,9 @@ def main():
         test_mcmc_alpha_grad,
         test_overfit_tiny,
         test_grad_flow_layers,
-        # encoder (requires weights)
-        test_encoder_frozen,
-        test_encoder_shapes_256,
+        # encoder
+        test_encoder_trainable,
+        test_encoder_shapes_64,
         test_encoder_deterministic,
         test_full_model_forward_small,
     ]

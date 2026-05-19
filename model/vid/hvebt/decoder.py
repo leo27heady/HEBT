@@ -1,7 +1,7 @@
 """
 Optional pixel decoder for HVEBT.
 
-Takes the **finest** stage's final MCMC prediction (in CLIP feature space at
+Takes the **finest** stage's final MCMC prediction (in encoder feature space at
 H_low x W_low spatial resolution) and decodes to (3, out_size, out_size) RGB
 in [0, 1] via a stack of stride-2 transpose-convs. This decoder is trained
 **independently** of the energy hierarchy: callers must `.detach()` the
@@ -34,7 +34,7 @@ class PixelDecoder(nn.Module):
     out: (B, T, 3, S,   S)    or (N, 3, S,   S)   in [0, 1]
 
     `out_size` must be a power-of-2 multiple of `in_HW[0]==in_HW[1]`.
-    The decoder deconvolves (transpose-conv) from the low-res CLIP feature
+    The decoder deconvolves (transpose-conv) from the low-res encoder feature
     space up to the full target resolution. The target is never modified.
     """
 

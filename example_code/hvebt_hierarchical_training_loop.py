@@ -1,24 +1,19 @@
 """
 HVEBT Phase 2/3 + decoder — hierarchical training loop on
-VIDShapeSyntheticDataset at 256x256.
+VIDShapeSyntheticDataset at 64x64.
 
-Trains a 2- or 3-stage HVEBT (CLIP s1 -> s2 -> s3) with strict 2x2 parent-child
+Trains a 2- or 3-stage HVEBT (16x16 -> 4x4 -> 1x1) with 4x parent-child
 cross-attention and detached KV between stages. Optionally trains a pixel
 decoder on top of the finest stage's prediction (detached) and dumps
 side-by-side comparison grids of (real | decoded) frames every N steps.
 
-Logs per-stage init/final reconstruction, per-stage energy gap, per-stage
-gradient norm, alpha values, and a copy-last-frame baseline at every stage.
-
 Run examples:
     .\\venv\\Scripts\\Activate.ps1
-    # 2-stage smoke (s1 + s2), no decoder:
     python example_code\\hvebt_hierarchical_training_loop.py \\
-        --stages s1 s2 --max_steps 30 --dataset_size 32 --context_length 4
+        --stages 16x16 4x4 --max_steps 30 --dataset_size 32 --context_length 4
 
-    # 3-stage with decoder + frame dumps:
     python example_code\\hvebt_hierarchical_training_loop.py \\
-        --stages s1 s2 s3 --max_steps 60 --dataset_size 32 --context_length 4 \\
+        --stages 16x16 4x4 1x1 --max_steps 60 --dataset_size 32 --context_length 4 \\
         --decoder --decoder_save_every 10
 """
 from __future__ import annotations
@@ -32,12 +27,10 @@ from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.vid.preprocessed_clip_dataset import PreprocessedCLIPDataset  # noqa: E402
 from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset  # noqa: E402
 from model.vid.hvebt import (  # noqa: E402
     HierarchicalHVEBT,
@@ -51,15 +44,10 @@ _IMNET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
 _IMNET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
 
 
-# Mapping from clip stage name -> (channels, H, W) at 256x256 input.
 _STAGE_INFO: Dict[str, Tuple[int, int, int]] = {
-    "stem":   (64,  64, 64),
-    "s0":     (64,  64, 64),
-    "s1":     (128, 32, 32),
-    "s2":     (256, 16, 16),
-    "s3":     (512, 8,  8),
-    "final":  (1024, 8, 8),
-    "pooled": (512, 1,  1),
+    "16x16": (64,  16, 16),
+    "4x4":   (128,  4,  4),
+    "1x1":   (256,  1,  1),
 }
 
 
@@ -76,8 +64,8 @@ def make_hparams(args) -> SimpleNamespace:
         shape_scene_type="DIM_2",
         shape_min_cubes=2,
         shape_max_cubes=6,
-        shape_angle_min=5,
-        shape_angle_max=20,
+        shape_angle_min=15,
+        shape_angle_max=45,
         shape_temporal_patterns=[],
         shape_pattern_combining=False,
         shape_accel_min=3,
@@ -97,29 +85,23 @@ def build_stage_configs(args) -> List[HVEBTStageConfig]:
         if name not in _STAGE_INFO:
             raise ValueError(f"Unknown stage '{name}'; choose from {list(_STAGE_INFO)}")
         c, h, w = _STAGE_INFO[name]
-        # Per-stage embed_dim: --embed_dim_per_stage list, else default args.embed_dim.
         if args.embed_dim_per_stage and len(args.embed_dim_per_stage) == len(args.stages):
             d = args.embed_dim_per_stage[i]
         else:
             d = args.embed_dim
 
-        # Temporal window: coarsest (last) = full causal (None), finest (0) = self-frame only (1).
-        # Intermediate stages linearly interpolate the window size.
-        tw = None  # default: full causal
+        tw = None
         if args.temporal_window:
             if N == 1:
-                tw = None  # single stage: full causal
+                tw = None
             else:
-                # i=0 is finest, i=N-1 is coarsest
-                # finest gets window=1, coarsest gets None (full).
                 if i == N - 1:
-                    tw = None   # apex: full causal
+                    tw = None
                 else:
-                    # linear: window = 1 + i * (context_length - 1) / (N - 1)
                     tw = max(1, 1 + int(i * (args.context_length - 1) / (N - 1)))
 
         cfgs.append(HVEBTStageConfig(
-            clip_stage_name=name, clip_channels=c, H=h, W=w,
+            stage_name=name, channels=c, H=h, W=w,
             embed_dim=d, n_heads=args.n_heads, n_layers=args.n_layers,
             temporal_window=tw,
         ))
@@ -128,21 +110,11 @@ def build_stage_configs(args) -> List[HVEBTStageConfig]:
 
 def make_model(args, device: torch.device) -> HierarchicalHVEBT:
     stage_cfgs = build_stage_configs(args)
-    weights = "" if args.preprocessed_dir else "clip/MobileCLIP2-S0/mobileclip2_s0.pt"
 
-    # bottom_up_loss implies decoder + no_detach_kv
     if args.bottom_up_loss:
         args.decoder = True
         args.no_detach_kv = True
         args.truncate_mcmc = True
-
-    # train_encoder is incompatible with preprocessed features
-    if args.train_encoder and args.preprocessed_dir:
-        raise ValueError(
-            "--train_encoder is incompatible with --preprocessed_dir. "
-            "When training the encoder, raw video must be passed through the "
-            "encoder every step (features change)."
-        )
 
     cfg = HierarchicalHVEBTConfig(
         stages=stage_cfgs,
@@ -163,8 +135,7 @@ def make_model(args, device: torch.device) -> HierarchicalHVEBT:
         decoder_enabled=args.decoder,
         decoder_out_size=args.image_size,
         decoder_loss_weight=args.decoder_loss_weight,
-        weights_path=weights,
-        train_encoder=args.train_encoder,
+        input_size=args.image_size,
     )
     return HierarchicalHVEBT(cfg).to(device)
 
@@ -174,7 +145,8 @@ def _per_stage_grad_norms(model: HierarchicalHVEBT) -> List[float]:
     for stage in model.stages:
         gs = [p.grad for p in stage.parameters() if p.grad is not None]
         if not gs:
-            norms.append(0.0); continue
+            norms.append(0.0)
+            continue
         norms.append(math.sqrt(sum((g.detach() ** 2).sum().item() for g in gs)))
     return norms
 
@@ -200,28 +172,20 @@ def train(args):
     if args.progressive:
         print(f"[hvebt-h] Progressive training: {args.progressive_steps} steps per stage")
     if args.bottom_up_loss:
-        print("[hvebt-h] BOTTOM-UP LOSS: decoder pixel loss drives all stages. "
-              "Upper stages are learned latents (no own feature loss).")
+        print("[hvebt-h] BOTTOM-UP LOSS: decoder pixel loss drives all stages.")
     if args.adaptive_mcmc:
-        print(f"[hvebt-h] ADAPTIVE MCMC: converge until tol={args.adaptive_mcmc_tol}, "
-              f"max={args.adaptive_mcmc_max_steps}, patience={args.adaptive_mcmc_patience}"
-              + (f", step_penalty={args.adaptive_mcmc_step_penalty}"
-                 if args.adaptive_mcmc_step_penalty > 0 else ""))
+        print(f"[hvebt-h] ADAPTIVE MCMC: tol={args.adaptive_mcmc_tol}, "
+              f"max={args.adaptive_mcmc_max_steps}")
     if args.temporal_window:
         stage_cfgs = build_stage_configs(args)
         tw_info = ", ".join(
-            f"{s.clip_stage_name}={'full' if s.temporal_window is None else s.temporal_window}"
+            f"{s.stage_name}={'full' if s.temporal_window is None else s.temporal_window}"
             for s in stage_cfgs
         )
         print(f"[hvebt-h] Temporal windows: {tw_info}")
-    use_preprocessed = args.preprocessed_dir is not None
 
-    if use_preprocessed:
-        dataset = PreprocessedCLIPDataset(args.preprocessed_dir, stages=args.stages)
-        print(f"[hvebt-h] Using preprocessed features from: {args.preprocessed_dir}")
-    else:
-        hparams = make_hparams(args)
-        dataset = VIDShapeSyntheticDataset(hparams, size=args.dataset_size)
+    hparams = make_hparams(args)
+    dataset = VIDShapeSyntheticDataset(hparams, size=args.dataset_size)
 
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -231,10 +195,8 @@ def train(args):
     model = make_model(args, device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
-    print(f"[hvebt-h] trainable params: {n_trainable/1e6:.2f}M")
-    if args.train_encoder:
-        n_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-        print(f"[hvebt-h] encoder trainable: {n_enc/1e6:.2f}M (included in total)")
+    n_enc = sum(p.numel() for p in model.encoder.parameters())
+    print(f"[hvebt-h] trainable params: {n_trainable/1e6:.2f}M (encoder {n_enc/1e6:.2f}M)")
 
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -266,23 +228,15 @@ def train(args):
         for batch in loader:
             t0 = time.time()
 
-            # Progressive training: activate stages one by one.
             newly_activated = model.update_progressive(step)
             if newly_activated is not None:
                 stage_name = args.stages[newly_activated]
                 print(f"[hvebt-h] step {step}: activated stage {newly_activated} "
                       f"({stage_name}) — now {model.num_active_stages}/{len(args.stages)} active")
 
-            if use_preprocessed:
-                # batch is dict {stage_name: (B, T, C, H, W), "video": (B, T, 3, H, W)}
-                video = batch["video"].to(device, non_blocking=True)
-                feats_dict = {k: v.to(device, non_blocking=True)
-                              for k, v in batch.items() if k != "video"}
-                out = model.forward_loss(video, features=feats_dict, learning=True)
-            else:
-                batch = batch.to(device, non_blocking=True)
-                video01 = denormalize_imnet(batch)
-                out = model.forward_loss(video01, learning=True)
+            batch = batch.to(device, non_blocking=True)
+            video01 = denormalize_imnet(batch)
+            out = model.forward_loss(video01, learning=True)
             loss_total = out["loss_total"]
 
             opt.zero_grad(set_to_none=True)
@@ -299,7 +253,6 @@ def train(args):
 
             dt = time.time() - t0
 
-            # CSV
             row: List[str] = [str(step), f"{loss_total.item():.6f}", f"{out['loss_energy'].item():.6f}"]
             if args.decoder:
                 dl = out.get('loss_decoder')
@@ -314,14 +267,13 @@ def train(args):
                         f"{s['alpha'].item():.4f}", f"{stage_norms[i]:.6f}",
                     ]
                 else:
-                    row += [""] * 8  # inactive stage
+                    row += [""] * 8
             if args.decoder:
                 row += [f"{dec_norm:.6f}"]
             row += [f"{dt:.3f}"]
             log_f.write(",".join(row) + "\n")
             log_f.flush()
 
-            # Console
             if step % args.log_every == 0:
                 pieces = [f"[step {step:5d}] L={loss_total.item():.3f}"]
                 if args.decoder and 'loss_decoder' in out:
@@ -329,7 +281,7 @@ def train(args):
                                f"Ld={out['loss_decoder'].item():.3f}"]
                 for i, s in enumerate(out["per_stage"]):
                     if s is None:
-                        continue  # inactive stage
+                        continue
                     name = args.stages[i]
                     fr = s['final_recon'].item()
                     base = s['baseline_copy_last'].item()
@@ -346,9 +298,7 @@ def train(args):
                 pieces.append(f"dt={dt:.2f}s")
                 print(" ".join(pieces))
 
-            # Decoder image dumps
             if args.decoder and 'decoded_rgb' in out and args.decoder_save_every > 0 and step % args.decoder_save_every == 0:
-                # `decoded_rgb` and `target_rgb` come from forward_loss when decoder is enabled.
                 save_recon_grid(
                     real_rgb=out["target_rgb"].cpu(),
                     pred_rgb=out["decoded_rgb"].cpu(),
@@ -369,67 +319,34 @@ def train(args):
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    # data
-    ap.add_argument("--image_size", type=int, default=256)
+    ap.add_argument("--image_size", type=int, default=64)
     ap.add_argument("--context_length", type=int, default=8)
     ap.add_argument("--dataset_size", type=int, default=128)
     ap.add_argument("--batch_size", type=int, default=1)
-    ap.add_argument("--preprocessed_dir", type=str, default=None,
-                    help="Path to preprocessed CLIP features (from preprocess_clip_features.py). "
-                         "If set, skips CLIP encoder during training.")
-    # stages
-    ap.add_argument("--stages", nargs="+", default=["s1", "s2"],
-                    help="Ordered list of MobileCLIP stages from finest to coarsest, e.g. 's1 s2 s3'.")
-    ap.add_argument("--embed_dim", type=int, default=128, help="Default per-stage embed_dim.")
-    ap.add_argument("--embed_dim_per_stage", type=int, nargs="+", default=None,
-                    help="Optional per-stage override (must match #stages).")
+    ap.add_argument("--stages", nargs="+", default=["16x16", "4x4", "1x1"],
+                    help="Encoder stages finest to coarsest, e.g. '16x16 4x4 1x1'.")
+    ap.add_argument("--embed_dim", type=int, default=128)
+    ap.add_argument("--embed_dim_per_stage", type=int, nargs="+", default=None)
     ap.add_argument("--n_heads", type=int, default=4)
     ap.add_argument("--n_layers", type=int, default=2)
-    ap.add_argument("--temporal_window", action="store_true",
-                    help="Enable per-stage temporal windowing: apex gets full causal, "
-                         "finest stage gets self-frame only, intermediate stages interpolate.")
-    # mcmc
-    ap.add_argument("--mcmc_steps", type=int, default=2)
+    ap.add_argument("--temporal_window", action="store_true")
+    ap.add_argument("--mcmc_steps", type=int, default=8)
     ap.add_argument("--mcmc_step_size", type=float, default=1000.0)
     ap.add_argument("--denoising_init", type=str, default="zeros",
                     choices=["zeros", "random_noise", "real_current"])
-    ap.add_argument("--adaptive_mcmc", action="store_true",
-                    help="Run MCMC until convergence instead of fixed steps. "
-                         "Overrides --mcmc_steps as max_steps fallback.")
-    ap.add_argument("--adaptive_mcmc_max_steps", type=int, default=50,
-                    help="Hard upper bound on adaptive MCMC iterations.")
-    ap.add_argument("--adaptive_mcmc_tol", type=float, default=1e-3,
-                    help="Relative energy-change threshold for convergence.")
-    ap.add_argument("--adaptive_mcmc_patience", type=int, default=3,
-                    help="Consecutive energy increases before halving step size.")
-    ap.add_argument("--adaptive_mcmc_step_penalty", type=float, default=0.0,
-                    help="Penalty weight for num_steps/max_steps (encourages fewer steps).")
-    # ablation
-    ap.add_argument("--disable_cross_attn", action="store_true",
-                    help="Ablation: disable parent KV conditioning between stages. "
-                         "Each stage runs independent MCMC without top-down signal.")
-    ap.add_argument("--no_detach_kv", action="store_true",
-                    help="Allow gradients to flow through cross-attn KV "
-                         "(default: KV is detached).")
-    ap.add_argument("--progressive", action="store_true",
-                    help="Progressive training: start with apex stage only, "
-                         "activate finer stages one by one (StyleGAN-like).")
-    ap.add_argument("--progressive_steps", type=int, default=500,
-                    help="Steps per stage before activating the next finer stage.")
-    ap.add_argument("--bottom_up_loss", action="store_true",
-                    help="Bottom-up loss: only finest stage (or decoder) has loss. "
-                         "Gradient flows upward through non-detached KV. "
-                         "Upper stages become learned latents. "
-                         "Implies --decoder, --no_detach_kv, truncate_mcmc=True.")
-    # encoder
-    ap.add_argument("--train_encoder", action="store_true",
-                    help="Unfreeze the CLIP encoder and train it jointly. "
-                         "Incompatible with --preprocessed_dir.")
-    # decoder
+    ap.add_argument("--adaptive_mcmc", action="store_true")
+    ap.add_argument("--adaptive_mcmc_max_steps", type=int, default=50)
+    ap.add_argument("--adaptive_mcmc_tol", type=float, default=1e-3)
+    ap.add_argument("--adaptive_mcmc_patience", type=int, default=3)
+    ap.add_argument("--adaptive_mcmc_step_penalty", type=float, default=0.0)
+    ap.add_argument("--disable_cross_attn", action="store_true")
+    ap.add_argument("--no_detach_kv", action="store_true")
+    ap.add_argument("--progressive", action="store_true")
+    ap.add_argument("--progressive_steps", type=int, default=500)
+    ap.add_argument("--bottom_up_loss", action="store_true")
     ap.add_argument("--decoder", action="store_true")
     ap.add_argument("--decoder_loss_weight", type=float, default=1.0)
     ap.add_argument("--decoder_save_every", type=int, default=20)
-    # optimization
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--grad_clip", type=float, default=5.0)

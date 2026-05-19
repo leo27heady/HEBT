@@ -1,4 +1,3 @@
-from model.vid.hvebt.clip_encoder import MobileClipMultiStageEncoder
 from model.vid.hvebt.cross_attention import (
     CrossAttention3DRoPE,
     build_child_to_parent_mask,
@@ -11,9 +10,12 @@ from model.vid.hvebt.hierarchical import (
     default_3stage_configs,
 )
 from model.vid.hvebt.hvebt import HVEBT, HVEBTConfig, HVEBTStage, HVEBTStageConfig
+from model.vid.hvebt.lightweight_encoder import (
+    LightweightMultiStageEncoder,
+)
 
 __all__ = [
-    "MobileClipMultiStageEncoder",
+    "LightweightMultiStageEncoder",
     "HVEBT",
     "HVEBTConfig",
     "HVEBTStage",
