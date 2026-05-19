@@ -29,20 +29,22 @@ import csv
 import os
 import sys
 import time
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Dict
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torchvision.utils import save_image
 
 # ---- project root on path ------------------------------------------------- #
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset  # noqa: E402
 from model.vid.shr_vqvae import SHRVQVAEConfig, SHRVQVAEModel              # noqa: E402
+from shr_vqvae_viz import (                                               # noqa: E402
+    save_labeled_prediction_panel,
+    save_labeled_reconstruction_panel,
+)
 
 
 # =========================================================================== #
@@ -110,7 +112,7 @@ class CSVLogger:
 
     def log(self, row: Dict) -> None:
         write_header = not self._header_written
-        with open(self.path, "a", newline="") as f:
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
             if write_header:
                 writer.writeheader()
@@ -137,75 +139,20 @@ def save_checkpoint(
         },
         path,
     )
-    print(f"  [ckpt] saved → {path}")
+    print(f"  [ckpt] saved -> {path}")
 
 
 def load_checkpoint(model: SHRVQVAEModel, path: str) -> None:
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state"])
-    print(f"  [ckpt] loaded ← {path}  (stage {ckpt.get('stage')}, epoch {ckpt.get('epoch')})")
+    print(f"  [ckpt] loaded <- {path}  (stage {ckpt.get('stage')}, epoch {ckpt.get('epoch')})")
 
 
 @torch.no_grad()
-def save_reconstruction_grid(
-    model: SHRVQVAEModel,
-    batch: torch.Tensor,
-    step: int,
-    log_dir: str,
-    device: torch.device,
-    tag: str = "recon",
-) -> None:
-    """Save a side-by-side grid of input vs reconstructed frames."""
-    model.eval()
-    B, TS, C, H, W = batch.shape
-    n = min(4, B)
-    frames = batch[:n].reshape(n * TS, C, H, W).to(device)
-
-    z = model.encode(frames)
-    e_C_st, _, _ = model.quantize(z)
-    recon = model.decode(e_C_st)                      # (n*TS, 3, H, W)
-
-    # Interleave original and reconstruction
-    grid = torch.stack([frames, recon], dim=1).reshape(n * TS * 2, C, H, W)
-    out_dir = os.path.join(log_dir, "viz")
-    os.makedirs(out_dir, exist_ok=True)
-    save_image(grid, os.path.join(out_dir, f"{tag}_step{step:06d}.png"), nrow=TS * 2)
-    model.train()
-
-
-@torch.no_grad()
-def save_prediction_grid(
-    model: SHRVQVAEModel,
-    batch: torch.Tensor,
-    step: int,
-    log_dir: str,
-    device: torch.device,
-    num_future: int = 3,
-) -> None:
-    """Save context frames + ground-truth future + generated future."""
-    model.eval()
-    cfg = model.cfg
-    B, TS, C, H, W = batch.shape
-    n = min(2, B)
-    x_seq = batch[:n].to(device)                      # (n, T+S, 3, H, W)
-
-    context = x_seq[:, : cfg.T]                       # (n, T, 3, H, W)
-    gt_future = x_seq[:, cfg.T : cfg.T + num_future]  # (n, num_future, 3, H, W)
-
-    gen_future = model.generate(context, num_future=num_future, temperature=1.0)
-
-    # Row: [context | gt | generated]
-    rows = []
-    for b in range(n):
-        rows.append(context[b])                       # (T, 3, H, W)
-        rows.append(gt_future[b])                     # (num_future, 3, H, W)
-        rows.append(gen_future[b])                    # (num_future, 3, H, W)
-    grid = torch.cat(rows, dim=0)                     # (n*(T+2*num_future), 3, H, W)
-    out_dir = os.path.join(log_dir, "viz")
-    os.makedirs(out_dir, exist_ok=True)
-    nrow = cfg.T + 2 * num_future
-    save_image(grid, os.path.join(out_dir, f"pred_step{step:06d}.png"), nrow=nrow)
-    model.train()
+def resolve_viz_num_future(args: argparse.Namespace, cfg: SHRVQVAEConfig) -> int:
+    if args.viz_num_future <= 0:
+        return cfg.S
+    return min(args.viz_num_future, cfg.S)
 
 
 # =========================================================================== #
@@ -238,9 +185,11 @@ def train_stage1(
     logger = CSVLogger(os.path.join(log_dir, "stage1.csv"))
 
     global_step = 0
+    last_batch: torch.Tensor | None = None
     for epoch in range(1, args.stage1_epochs + 1):
         epoch_t0 = time.time()
         for batch in loader:
+            last_batch = batch
             # Flatten all frames in the sequence into a single batch of images
             B, TS, C, H, W = batch.shape
             frames = batch.reshape(B * TS, C, H, W).to(device)
@@ -269,7 +218,9 @@ def train_stage1(
                 )
 
             if args.viz_every > 0 and global_step % args.viz_every == 0:
-                save_reconstruction_grid(model, batch, global_step, log_dir, device)
+                save_labeled_reconstruction_panel(
+                    model, batch, global_step, log_dir, device, tag="recon_panel"
+                )
 
         ep_time = time.time() - epoch_t0
         print(f"  epoch {epoch}/{args.stage1_epochs}  ({ep_time:.1f}s)")
@@ -277,6 +228,20 @@ def train_stage1(
         if epoch % args.save_every == 0 or epoch == args.stage1_epochs:
             save_checkpoint(model, stage=1, epoch=epoch, log_dir=log_dir,
                             suffix="_final" if epoch == args.stage1_epochs else "")
+
+        if (
+            args.viz_end_of_stage
+            and epoch == args.stage1_epochs
+            and last_batch is not None
+        ):
+            save_labeled_reconstruction_panel(
+                model,
+                last_batch,
+                global_step,
+                log_dir,
+                device,
+                tag="recon_panel_stage1_final",
+            )
 
 
 def train_stage2(
@@ -305,9 +270,11 @@ def train_stage2(
     logger = CSVLogger(os.path.join(log_dir, "stage2.csv"))
 
     global_step = 0
+    last_batch: torch.Tensor | None = None
     for epoch in range(1, args.stage2_epochs + 1):
         epoch_t0 = time.time()
         for batch in loader:
+            last_batch = batch
             x_seq = batch.to(device)   # (B, T+S, 3, H, W)
 
             optimizer.zero_grad()
@@ -339,6 +306,22 @@ def train_stage2(
             save_checkpoint(model, stage=2, epoch=epoch, log_dir=log_dir,
                             suffix="_final" if epoch == args.stage2_epochs else "")
 
+        if (
+            args.viz_end_of_stage
+            and epoch == args.stage2_epochs
+            and last_batch is not None
+        ):
+            save_labeled_prediction_panel(
+                model=model,
+                batch=last_batch,
+                step=global_step,
+                log_dir=log_dir,
+                device=device,
+                num_future=resolve_viz_num_future(args, model.cfg),
+                show_indices=args.viz_show_indices,
+                tag="pred_panel_stage2_final",
+            )
+
 
 def train_stage3(
     model: SHRVQVAEModel,
@@ -365,9 +348,11 @@ def train_stage3(
     logger = CSVLogger(os.path.join(log_dir, "stage3.csv"))
 
     global_step = 0
+    last_batch: torch.Tensor | None = None
     for epoch in range(1, args.stage3_epochs + 1):
         epoch_t0 = time.time()
         for batch in loader:
+            last_batch = batch
             x_seq = batch.to(device)   # (B, T+S, 3, H, W)
 
             optimizer.zero_grad()
@@ -394,13 +379,18 @@ def train_stage3(
                 )
 
             if args.viz_every > 0 and global_step % args.viz_every == 0:
-                # Predict a few future frames (slow — keep num_future small)
                 try:
-                    save_prediction_grid(
-                        model, batch, global_step, log_dir, device,
-                        num_future=min(2, model.cfg.S),
+                    save_labeled_prediction_panel(
+                        model=model,
+                        batch=batch,
+                        step=global_step,
+                        log_dir=log_dir,
+                        device=device,
+                        num_future=resolve_viz_num_future(args, model.cfg),
+                        show_indices=args.viz_show_indices,
+                        tag="pred_panel",
                     )
-                except Exception as e:
+                except (RuntimeError, ValueError, OSError) as e:
                     print(f"  [viz] prediction grid skipped: {e}")
 
         ep_time = time.time() - epoch_t0
@@ -409,6 +399,22 @@ def train_stage3(
         if epoch % args.save_every == 0 or epoch == args.stage3_epochs:
             save_checkpoint(model, stage=3, epoch=epoch, log_dir=log_dir,
                             suffix="_final" if epoch == args.stage3_epochs else "")
+
+        if (
+            args.viz_end_of_stage
+            and epoch == args.stage3_epochs
+            and last_batch is not None
+        ):
+            save_labeled_prediction_panel(
+                model=model,
+                batch=last_batch,
+                step=global_step,
+                log_dir=log_dir,
+                device=device,
+                num_future=resolve_viz_num_future(args, model.cfg),
+                show_indices=args.viz_show_indices,
+                tag="pred_panel_stage3_final",
+            )
 
 
 # =========================================================================== #
@@ -448,9 +454,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
 
     # ---- Stages ---- #
-    p.add_argument("--stage1_epochs", type=int, default=30)
-    p.add_argument("--stage2_epochs", type=int, default=30)
-    p.add_argument("--stage3_epochs", type=int, default=15)
+    p.add_argument("--stage1_epochs", type=int, default=5)
+    p.add_argument("--stage2_epochs", type=int, default=5)
+    p.add_argument("--stage3_epochs", type=int, default=5)
     p.add_argument("--start_stage",   type=int, default=1,
                    choices=[1, 2, 3], help="Resume from this stage.")
     p.add_argument("--load_ckpt",     type=str, default="",
@@ -461,6 +467,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--viz_every", type=int, default=100,
                    help="Save visualisations every N steps (0 = disabled).")
+    p.add_argument(
+        "--viz_end_of_stage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save one labeled visualization panel at the end of each stage.",
+    )
+    p.add_argument(
+        "--viz_num_future",
+        type=int,
+        default=-1,
+        help="Future frames to visualize (-1 means full S).",
+    )
+    p.add_argument(
+        "--viz_show_indices",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include per-layer latent-index heatmaps in prediction panels.",
+    )
     p.add_argument("--save_every", type=int, default=10,
                    help="Save checkpoint every N epochs.")
 

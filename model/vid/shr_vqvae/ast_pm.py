@@ -19,9 +19,35 @@ AST_PM modules (one per VQ layer), each predicting that layer's local index.
 """
 from __future__ import annotations
 
+import json
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _append_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    run_id: str,
+) -> None:
+    payload = {
+        "sessionId": "394538",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open("debug-394538.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 
 class CausalConv3d(nn.Conv3d):
@@ -86,6 +112,8 @@ class CausalBlock(nn.Module):
 
     def __init__(self, mask_type: str, channels: int, num_heads: int) -> None:
         super().__init__()
+        self.mask_type = mask_type
+        self._dbg_logged = False
         self.conv = CausalConv3d(
             mask_type,
             channels,
@@ -104,12 +132,36 @@ class CausalBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T, H, W = x.shape
+        if not self._dbg_logged:
+            center_mask_val = float(
+                self.conv.mask[0, 0, self.conv.mask.shape[2] // 2, self.conv.mask.shape[3] // 2, self.conv.mask.shape[4] // 2]
+                .detach()
+                .cpu()
+                .item()
+            )
+            # #region agent log
+            _append_debug_log(
+                hypothesis_id="H1",
+                location="ast_pm.py:CausalBlock.forward",
+                message="Mask type and residual-path diagnostic",
+                data={
+                    "mask_type": self.mask_type,
+                    "center_mask_value": center_mask_val,
+                    "uses_identity_residual": self.mask_type != "A",
+                    "shape": [int(B), int(C), int(T), int(H), int(W)],
+                },
+                run_id="post-fix",
+            )
+            # #endregion
+            self._dbg_logged = True
 
         # ---- Causal conv residual ---- #
         h = self.conv(x)
         h = h[:, :, :-1, :-1, :-1]        # crop extra border from padding
         h = self.elu(self.norm_conv(h))
-        x = x + h
+        # Do not pass current-token identity path through mask-A block.
+        # Otherwise, input==target training can leak the current token.
+        x = h if self.mask_type == "A" else (x + h)
 
         # ---- Causal self-attention residual ---- #
         N = T * H * W

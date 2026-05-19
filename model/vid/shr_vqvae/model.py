@@ -18,6 +18,8 @@ Parameter groups for Stage-specific optimizers
 """
 from __future__ import annotations
 
+import json
+import time
 from typing import Dict, List, Tuple
 
 import torch
@@ -30,12 +32,38 @@ from .encoder_decoder import ConvDecoder, ConvEncoder
 from .hr_quantizer import HR_Quantizer
 
 
+def _append_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Dict,
+    run_id: str,
+) -> None:
+    """Write one NDJSON debug line for session 394538."""
+    payload = {
+        "sessionId": "394538",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open("debug-394538.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
 class SHRVQVAEModel(nn.Module):
     """Sequential Hierarchical Residual Learning VQ-VAE (arXiv 2307.06701)."""
 
     def __init__(self, cfg: SHRVQVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self._dbg_stage2_calls = 0
+        self._dbg_stage3_calls = 0
 
         self.encoder = ConvEncoder(cfg)
         self.quantizer = HR_Quantizer(
@@ -140,6 +168,11 @@ class SHRVQVAEModel(nn.Module):
         h, w = indices_list[0].shape[1:]
         return [idx.view(B, T_total, h, w) for idx in indices_list]
 
+    @torch.no_grad()
+    def extract_indices(self, x_seq: torch.Tensor) -> List[torch.Tensor]:
+        """Public wrapper for per-layer local index extraction."""
+        return self._extract_indices(x_seq)
+
     def stage2_loss(
         self, x_seq: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -158,12 +191,50 @@ class SHRVQVAEModel(nn.Module):
         """
         indices = self._extract_indices(x_seq)  # list of [B, T+S, h, w]
 
+        if not hasattr(self, "_dbg_stage2_calls"):
+            self._dbg_stage2_calls = 0
+        self._dbg_stage2_calls += 1
+
         total_ce: torch.Tensor = x_seq.new_zeros(())
         for ast_pm, idx in zip(self.ast_pms, indices):
             # PixelCNN-style: input = target = full index sequence.
             # The mask-A first block ensures no self-information leakage.
             logits = ast_pm(idx)    # (B, M, T+S, h, w)
-            total_ce = total_ce + F.cross_entropy(logits, idx)
+            T = self.cfg.T
+            logits_fut = logits[:, :, T:, :, :]
+            idx_fut = idx[:, T:, :, :]
+            layer_ce_all = F.cross_entropy(logits, idx)
+            layer_ce_fut = F.cross_entropy(logits_fut, idx_fut)
+            total_ce = total_ce + layer_ce_fut
+
+            if self._dbg_stage2_calls <= 5:
+                with torch.no_grad():
+                    pred = logits.argmax(dim=1)
+                    acc_all = (pred == idx).float().mean()
+                    acc_ctx = (pred[:, :T] == idx[:, :T]).float().mean()
+                    acc_fut = (pred[:, T:] == idx[:, T:]).float().mean()
+                    ce_fut = layer_ce_fut
+                    ce_ctx = F.cross_entropy(logits[:, :, :T, :, :], idx[:, :T, :, :])
+                    # #region agent log
+                    _append_debug_log(
+                        hypothesis_id="H1-H2",
+                        location="model.py:stage2_loss",
+                        message="Stage2 token-copy and CE split diagnostics",
+                        data={
+                            "call": int(self._dbg_stage2_calls),
+                            "layer_ce_all": float(layer_ce_all.item()),
+                            "layer_ce_ctx": float(ce_ctx.item()),
+                            "layer_ce_fut": float(ce_fut.item()),
+                            "acc_all": float(acc_all.item()),
+                            "acc_ctx": float(acc_ctx.item()),
+                            "acc_fut": float(acc_fut.item()),
+                            "stage2_loss_scope": "future_only",
+                            "T": int(T),
+                            "S": int(self.cfg.S),
+                        },
+                        run_id="post-fix",
+                    )
+                    # #endregion
 
         total_ce = total_ce / self.cfg.num_vq_layers
         return total_ce, {"loss": total_ce, "ce": total_ce}
@@ -195,6 +266,26 @@ class SHRVQVAEModel(nn.Module):
         B, TS, C, H, W = x_seq.shape
         T, S = cfg.T, cfg.S
         assert TS == T + S, f"Expected {T + S} frames, got {TS}."
+
+        if not hasattr(self, "_dbg_stage3_calls"):
+            self._dbg_stage3_calls = 0
+        self._dbg_stage3_calls += 1
+        if self._dbg_stage3_calls <= 3:
+            # #region agent log
+            _append_debug_log(
+                hypothesis_id="H3",
+                location="model.py:stage3_loss",
+                message="Stage3 input path confirmation",
+                data={
+                    "call": int(self._dbg_stage3_calls),
+                    "astpm_input_uses_full_gt_sequence": True,
+                    "ce_computed_on_future_only": True,
+                    "T": int(T),
+                    "S": int(S),
+                },
+                run_id="post-fix",
+            )
+            # #endregion
 
         indices = self._extract_indices(x_seq)  # list of [B, T+S, h, w]
         h, w = indices[0].shape[2:]
@@ -241,7 +332,8 @@ class SHRVQVAEModel(nn.Module):
         context: torch.Tensor,
         num_future: int,
         temperature: float = 1.0,
-    ) -> torch.Tensor:
+        return_indices: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, List[torch.Tensor]]:
         """Autoregressively generate future frames from context.
 
         Generation is pixel-by-pixel in raster-scan order (time → h → w).
@@ -252,9 +344,14 @@ class SHRVQVAEModel(nn.Module):
             context    : (B, T_ctx, 3, H, W) observed frames in [0, 1].
             num_future : number of future frames to generate.
             temperature: sampling temperature (0 = argmax / greedy).
+            return_indices: if True, also return predicted local indices per
+                VQ layer as a list of tensors [(B, num_future, h, w), ...].
 
         Returns:
-            (B, num_future, 3, H, W) predicted frames in [0, 1].
+            If return_indices is False:
+                (B, num_future, 3, H, W) predicted frames in [0, 1].
+            If return_indices is True:
+                tuple(predicted_frames, predicted_indices_per_layer)
         """
         cfg = self.cfg
         B, T_ctx, C, H, W = context.shape
@@ -271,6 +368,9 @@ class SHRVQVAEModel(nn.Module):
         ]
 
         generated_frames: List[torch.Tensor] = []
+        generated_indices_per_layer: List[List[torch.Tensor]] = [
+            [] for _ in range(cfg.num_vq_layers)
+        ]
 
         for _step in range(num_future):
             # new_frame_idx[layer]: (B, h, w) — will be filled position by position
@@ -310,6 +410,8 @@ class SHRVQVAEModel(nn.Module):
             e_C = self.quantizer.decode_indices(new_frame_idx)   # (B, E, h, w)
             frame = self.decode(e_C)                              # (B, 3, H, W)
             generated_frames.append(frame)
+            for layer_i in range(cfg.num_vq_layers):
+                generated_indices_per_layer[layer_i].append(new_frame_idx[layer_i])
 
             # Append generated frame indices to buffers for the next step
             for layer_i in range(cfg.num_vq_layers):
@@ -318,4 +420,10 @@ class SHRVQVAEModel(nn.Module):
                     dim=1,
                 )
 
-        return torch.stack(generated_frames, dim=1)  # (B, num_future, 3, H, W)
+        pred_frames = torch.stack(generated_frames, dim=1)  # (B, num_future, 3, H, W)
+        if not return_indices:
+            return pred_frames
+        pred_indices = [
+            torch.stack(layer_steps, dim=1) for layer_steps in generated_indices_per_layer
+        ]
+        return pred_frames, pred_indices

@@ -10,6 +10,7 @@ Usage:
     python example_code/unified_vqvae_training_loop.py --data_source shapes --steps 5000 --T 4
 """
 
+import uuid
 import sys
 import os
 import argparse
@@ -187,7 +188,9 @@ def train(args):
     optimizer = Adam(model.parameters(), lr=cfg.lr)
 
     # Dataset + DataLoader
-    cache_dir = os.path.join(args.log_dir, 'dataset_cache')
+    cache_dir = f"data/vid/shape_cache/{uuid.uuid4().hex}"
+    cache_dir = args.dataset_cache_dir if args.dataset_cache_dir else cache_dir
+    print("Cache dir", cache_dir)
     dataset = CachedVideoDataset(args.data_source, args.dataset_size, args.T, cache_dir)
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -327,6 +330,7 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Unified VQ-VAE Training")
     parser.add_argument('--log_dir', type=str, default='logs/unified_test')
+    parser.add_argument('--dataset_cache_dir', type=str, default=None)
     parser.add_argument('--steps', type=int, default=2000, help='Max training steps (ignored if --epochs is set)')
     parser.add_argument('--epochs', type=int, default=None, help='Train for N epochs (overrides --steps)')
     parser.add_argument('--dataset_size', type=int, default=500, help='Number of unique samples to generate/cache')
