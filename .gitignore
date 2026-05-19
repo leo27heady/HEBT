@@ -159,3 +159,4 @@ data/vid/shape_cache/**
 data/vid/clip_features/**
 data/vid/vq/**
 clip/*
+exp/*
