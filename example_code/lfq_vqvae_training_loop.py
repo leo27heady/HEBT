@@ -1,7 +1,7 @@
 """LFQ VQ-VAE training loop on VIDShapeSyntheticDataset.
 
 Supports bottleneck or hierarchical VQ-VAE, plus optional video predictor
-(recon_only / disjoint / joint).
+(recon_only / progressive / disjoint / joint).
 
 Usage
 -----
@@ -40,6 +40,15 @@ Activate the project environment first, then install the VQ dependency if needed
         --dataset_size 200 --batch_size 8 --num_workers 0 ^
         --epochs 3 --log_every 10 --viz_every 50 ^
         --log_dir logs/lfq_vqvae_smoke
+
+5) Progressive hierarchical reconstruction (top -> mid -> bot):
+
+    python example_code/lfq_vqvae_training_loop.py ^
+        --quantization_mode hierarchical --train_mode progressive ^
+        --progressive_steps_per_stage 5000 --progressive_freeze_parents ^
+        --dataset_size 2000 --batch_size 16 --context_length 1 ^
+        --epochs 500 --viz_every 100 ^
+        --log_dir logs/lfq_vqvae_recon_progressive
 """
 from __future__ import annotations
 
@@ -149,6 +158,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--codebook_size", type=int, default=2**12)
     p.add_argument("--lfq_dim", type=int, default=12)
     p.add_argument("--entropy_loss_weight", type=float, default=0.1)
+    p.add_argument(
+        "--entropy_decay_start_step",
+        type=int,
+        default=0,
+        help="Step to begin linear decay of entropy_loss_weight (0 = disabled).",
+    )
+    p.add_argument(
+        "--entropy_decay_steps",
+        type=int,
+        default=3000,
+        help="Steps over which entropy_loss_weight decays to entropy_weight_end.",
+    )
+    p.add_argument(
+        "--entropy_weight_end",
+        type=float,
+        default=0.0,
+        help="Final entropy_loss_weight after decay (often 0 for late-stage stability).",
+    )
     p.add_argument("--diversity_gamma", type=float, default=1.0)
     p.add_argument("--vq_loss_weight", type=float, default=1.0)
     p.add_argument("--recon_loss", type=str, default="mse", choices=["mse", "l1"])
@@ -193,8 +220,26 @@ def parse_args() -> argparse.Namespace:
         "--train_mode",
         type=str,
         default="recon_only",
-        choices=["recon_only", "disjoint", "joint"],
-        help="recon_only: VQ-VAE only, disjoint: predictor only, joint: all losses end-to-end.",
+        choices=["recon_only", "progressive", "disjoint", "joint"],
+        help="recon_only/progressive: VQ-VAE only, disjoint: selected predictor/decoder tail, joint: end-to-end video.",
+    )
+    p.add_argument(
+        "--progressive_steps_per_stage",
+        type=int,
+        default=5000,
+        help="Progressive mode: steps to train before activating the next stage.",
+    )
+    p.add_argument(
+        "--progressive_freeze_parents",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Progressive mode: freeze previously trained parent stages after each transition.",
+    )
+    p.add_argument(
+        "--progressive_prior_ce",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Progressive mode: include top prior CE during depth-1 stage.",
     )
     p.add_argument("--pred_n_heads", type=int, default=8)
     p.add_argument("--pred_n_layers", type=int, default=4)
@@ -251,6 +296,21 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _scheduled_entropy_weight(
+    step: int,
+    w_start: float,
+    w_end: float,
+    decay_start: int,
+    decay_steps: int,
+) -> float:
+    if decay_start <= 0 or step < decay_start:
+        return w_start
+    if decay_steps <= 0:
+        return w_end
+    progress = min(1.0, (step - decay_start) / decay_steps)
+    return w_start + (w_end - w_start) * progress
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.log_dir, exist_ok=True)
@@ -287,6 +347,9 @@ def main() -> None:
         enable_video_predictor=args.enable_video_predictor,
         predictor_mode="vanilla",
         train_mode=args.train_mode,
+        progressive_steps_per_stage=args.progressive_steps_per_stage,
+        progressive_freeze_parents=args.progressive_freeze_parents,
+        progressive_prior_ce=args.progressive_prior_ce,
         pred_n_heads=args.pred_n_heads,
         pred_n_layers=args.pred_n_layers,
         pred_dim_top=args.pred_dim_top,
@@ -331,9 +394,17 @@ def main() -> None:
         )
     if args.train_mode == "recon_only" and cfg.enable_video_predictor:
         print("Warning: recon_only does not train predictor losses; predictor modules stay unused.")
+    if args.train_mode == "progressive" and cfg.enable_video_predictor:
+        print("Warning: progressive mode trains reconstruction only; predictor modules stay unused.")
+    if args.train_mode == "progressive" and cfg.quantization_mode != "hierarchical":
+        raise ValueError("train_mode progressive requires --quantization_mode hierarchical")
 
     trainable: list[torch.nn.Parameter]
-    if args.train_mode == "disjoint":
+    if args.train_mode == "progressive":
+        model.set_progressive_depth(1)
+        trainable = model.apply_progressive_freeze(args.progressive_freeze_parents)
+        model.train()
+    elif args.train_mode == "disjoint":
         for p in model.parameters():
             p.requires_grad_(False)
         if args.disjoint_target == "predictor_only":
@@ -407,6 +478,7 @@ def main() -> None:
 
     global_step = 0
     last_batch = None
+    best_recon = float("inf")
     for epoch in range(1, args.epochs + 1):
         epoch_t0 = time.time()
         for batch in loader:
@@ -421,8 +493,33 @@ def main() -> None:
             frames = frames.to(device)
             batch_video = batch.to(device) if batch.dim() == 5 else None
 
+            if args.train_mode == "progressive":
+                new_depth = model.update_progressive(global_step)
+                if new_depth is not None:
+                    trainable = model.apply_progressive_freeze(args.progressive_freeze_parents)
+                    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer,
+                        T_max=max(1, (args.epochs * len(loader)) - global_step),
+                        eta_min=1e-5,
+                    )
+                    print(
+                        f"  [progressive] activated depth={new_depth} "
+                        f"(freeze_parents={args.progressive_freeze_parents})"
+                    )
+
+            ent_w = _scheduled_entropy_weight(
+                global_step + 1,
+                args.entropy_loss_weight,
+                args.entropy_weight_end,
+                args.entropy_decay_start_step,
+                args.entropy_decay_steps,
+            )
+            if cfg.quantization_mode == "hierarchical":
+                model.set_entropy_loss_weight(ent_w)
+
             optimizer.zero_grad()
-            if args.train_mode == "recon_only":
+            if args.train_mode in ("recon_only", "progressive"):
                 loss, metrics = model.loss(frames)
             else:
                 assert batch_video is not None
@@ -440,6 +537,8 @@ def main() -> None:
                     "loss": metrics["loss"].item(),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
+                if args.train_mode == "progressive":
+                    row["progressive_depth"] = model.progressive_depth
                 if "recon" in metrics:
                     row["recon"] = metrics["recon"].item()
                 if "vq" in metrics:
@@ -457,7 +556,18 @@ def main() -> None:
                     row["pred_mse"] = metrics["pred_mse"].item()
                 if "gamma_abs" in metrics:
                     row["gamma_abs"] = float(metrics["gamma_abs"])
+                if args.entropy_decay_start_step > 0:
+                    row["entropy_w"] = ent_w
                 logger.log(row)
+                if "recon" in row and row["recon"] < best_recon:
+                    best_recon = row["recon"]
+                    save_checkpoint(
+                        model,
+                        epoch=epoch,
+                        step=global_step,
+                        log_dir=os.path.join(args.log_dir, "checkpoints"),
+                        suffix="_best_recon",
+                    )
                 msg = f"  step {global_step:5d} | loss {row['loss']:.4f}"
                 if "recon" in row:
                     msg += f"  recon {row['recon']:.4f}"
@@ -469,6 +579,8 @@ def main() -> None:
                     msg += f"  ce {row['ce']:.4f}  pred_mse {row['pred_mse']:.4f}"
                 if "gamma_abs" in row:
                     msg += f"  gamma {row['gamma_abs']:.4f}"
+                if "progressive_depth" in row:
+                    msg += f"  depth {row['progressive_depth']}"
                 print(msg)
 
             if args.viz_every > 0 and global_step % args.viz_every == 0:

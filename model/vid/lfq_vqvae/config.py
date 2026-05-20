@@ -50,7 +50,10 @@ class LFQVAEConfig:
     # Video predictor
     enable_video_predictor: bool = False
     predictor_mode: Literal["vanilla"] = "vanilla"
-    train_mode: Literal["recon_only", "disjoint", "joint"] = "recon_only"
+    train_mode: Literal["recon_only", "disjoint", "joint", "progressive"] = "recon_only"
+    progressive_steps_per_stage: int = 5000
+    progressive_freeze_parents: bool = True
+    progressive_prior_ce: bool = False
     pred_n_heads: int = 8
     pred_n_layers: int = 4
     pred_dim_top: int = 256
@@ -90,9 +93,13 @@ class LFQVAEConfig:
             )
         if self.predictor_mode != "vanilla":
             raise ValueError(f"predictor_mode must be 'vanilla', got {self.predictor_mode!r}")
-        if self.train_mode not in ("recon_only", "disjoint", "joint"):
+        if self.train_mode not in ("recon_only", "disjoint", "joint", "progressive"):
             raise ValueError(
-                f"train_mode must be one of recon_only/disjoint/joint, got {self.train_mode!r}"
+                f"train_mode must be one of recon_only/disjoint/joint/progressive, got {self.train_mode!r}"
+            )
+        if self.progressive_steps_per_stage < 1:
+            raise ValueError(
+                f"progressive_steps_per_stage must be >= 1, got {self.progressive_steps_per_stage}"
             )
 
         if len(self.stage_sizes) != len(self.stage_channels):
@@ -167,6 +174,9 @@ class LFQVAEConfig:
                     "pred_dim_bot must match bot stage channel size "
                     f"({self.pred_dim_bot} vs {self.stage_channels[0]})"
                 )
+
+        if self.train_mode == "progressive" and self.quantization_mode != "hierarchical":
+            raise ValueError("train_mode='progressive' requires quantization_mode='hierarchical'")
 
     @property
     def bottleneck_channels(self) -> int:

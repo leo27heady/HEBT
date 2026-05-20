@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,12 @@ class LFQVAE(nn.Module):
         self.pred_to_quant_top: nn.Module = nn.Identity()
         self.pred_to_quant_mid: nn.Module = nn.Identity()
         self.pred_to_quant_bot: nn.Module = nn.Identity()
+        if self.is_hierarchical and cfg.train_mode == "progressive":
+            self._progressive_depth = 1
+        elif self.is_hierarchical:
+            self._progressive_depth = len(cfg.stage_sizes)
+        else:
+            self._progressive_depth = 1
 
         if cfg.enable_video_predictor:
             self._build_video_predictors()
@@ -98,6 +104,36 @@ class LFQVAE(nn.Module):
     def has_video_predictor(self) -> bool:
         return self.predictor_top is not None and self.predictor_mid is not None and self.predictor_bot is not None
 
+    @property
+    def progressive_depth(self) -> int:
+        return self._progressive_depth
+
+    def set_progressive_depth(self, depth: int) -> None:
+        if not self.is_hierarchical:
+            raise RuntimeError("Progressive depth is supported only in hierarchical mode.")
+        self._progressive_depth = max(1, min(depth, len(self.cfg.stage_sizes)))
+
+    def update_progressive(self, step: int) -> Optional[int]:
+        if not self.is_hierarchical or self.cfg.train_mode != "progressive":
+            return None
+        desired = min(
+            len(self.cfg.stage_sizes),
+            1 + (step // max(1, self.cfg.progressive_steps_per_stage)),
+        )
+        if desired > self._progressive_depth:
+            self._progressive_depth = desired
+            return desired
+        return None
+
+    def _active_stage_names(self) -> List[str]:
+        if not self.is_hierarchical:
+            return ["top"]
+        if self._progressive_depth == 1:
+            return ["top"]
+        if self._progressive_depth == 2:
+            return ["top", "mid"]
+        return ["top", "mid", "bot"]
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Continuous bottleneck features (bottleneck) or quant_top (hierarchical)."""
         if self.is_hierarchical:
@@ -121,14 +157,24 @@ class LFQVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         enc = self.encoder(x)
         if self.is_hierarchical:
-            x_hat, prior_ces = self.decoder(enc)
+            depth = self._progressive_depth if self.cfg.train_mode == "progressive" else 3
+            x_hat, prior_ces = self.decoder(enc, depth=depth)
+            if self.cfg.train_mode == "progressive":
+                vq_parts = [enc["vq_loss_top"]]
+                if depth >= 2:
+                    vq_parts.append(enc["vq_loss_mid"])
+                if depth >= 3:
+                    vq_parts.append(enc["vq_loss_bot"])
+                vq_loss = sum(vq_parts)
+            else:
+                vq_loss = enc["vq_loss"]
             return {
                 "x_hat": x_hat,
                 "indices": enc["indices"],
                 "idx_bot": enc["idx_bot"],
                 "idx_mid": enc["idx_mid"],
                 "idx_top": enc["idx_top"],
-                "vq_loss": enc["vq_loss"],
+                "vq_loss": vq_loss,
                 "vq_loss_bot": enc["vq_loss_bot"],
                 "vq_loss_mid": enc["vq_loss_mid"],
                 "vq_loss_top": enc["vq_loss_top"],
@@ -182,9 +228,16 @@ class LFQVAE(nn.Module):
         }
 
         if self.is_hierarchical:
-            prior_ce = self._weighted_prior_ce(out["prior_ces"])
-            total = total + self.cfg.lambda_prior_ce * prior_ce
-            metrics["prior_ce"] = prior_ce
+            prior_ces = out["prior_ces"]
+            if self.cfg.train_mode == "progressive":
+                if self._progressive_depth == 1 and not self.cfg.progressive_prior_ce:
+                    prior_ces = []
+                else:
+                    prior_ces = prior_ces[: self._progressive_depth]
+            if prior_ces:
+                prior_ce = self._weighted_prior_ce(prior_ces)
+                total = total + self.cfg.lambda_prior_ce * prior_ce
+                metrics["prior_ce"] = prior_ce
             metrics["vq_bot"] = out["vq_loss_bot"]
             metrics["vq_mid"] = out["vq_loss_mid"]
             metrics["vq_top"] = out["vq_loss_top"]
@@ -407,6 +460,64 @@ class LFQVAE(nn.Module):
                 else:
                     metrics[key] = total.new_tensor(value)
         return total, metrics
+
+    def set_entropy_loss_weight(self, weight: float) -> None:
+        """Update LFQ entropy regularization weight on all quantizers (runtime)."""
+        enc = self.encoder
+        if self.is_hierarchical:
+            for stage in (enc.vq_bot, enc.vq_mid, enc.vq_top):
+                stage.vq.entropy_loss_weight = weight
+        else:
+            enc.vq.entropy_loss_weight = weight
+
+    def progressive_param_groups(self) -> Dict[str, List[nn.Parameter]]:
+        if not self.is_hierarchical:
+            return {"top": list(self.parameters()), "mid": [], "bot": []}
+        return {
+            "top": (
+                list(self.encoder.enc_mid_to_top.parameters())
+                + list(self.encoder.vq_top.parameters())
+                + list(self.decoder.stem.parameters())
+                + list(self.decoder.top_only_tail.parameters())
+            ),
+            "mid": (
+                list(self.encoder.enc_bot_to_mid.parameters())
+                + list(self.encoder.vq_mid.parameters())
+                + list(self.decoder.block_mid.parameters())
+                + list(self.decoder.mid_only_tail.parameters())
+            ),
+            "bot": (
+                list(self.encoder.enc_to_bot.parameters())
+                + list(self.encoder.vq_bot.parameters())
+                + list(self.decoder.block_bot.parameters())
+                + list(self.decoder.image_tail.parameters())
+            ),
+        }
+
+    def apply_progressive_freeze(self, freeze_parents: bool) -> List[nn.Parameter]:
+        if not self.is_hierarchical:
+            params = list(self.parameters())
+            for p in params:
+                p.requires_grad_(True)
+            return params
+
+        groups = self.progressive_param_groups()
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        if self._progressive_depth == 1:
+            active_groups = ["top"]
+        elif self._progressive_depth == 2:
+            active_groups = ["mid"] if freeze_parents else ["top", "mid"]
+        else:
+            active_groups = ["bot"] if freeze_parents else ["top", "mid", "bot"]
+
+        trainable: List[nn.Parameter] = []
+        for name in active_groups:
+            for p in groups[name]:
+                p.requires_grad_(True)
+            trainable.extend(groups[name])
+        return trainable
 
     def encoder_params(self) -> List[nn.Parameter]:
         return list(self.encoder.parameters())

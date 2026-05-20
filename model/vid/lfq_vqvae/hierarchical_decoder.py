@@ -117,6 +117,40 @@ class DecoderImageTail(nn.Module):
         return self.head(self.up_to_image(h))
 
 
+class DecoderTopOnlyPath(nn.Module):
+    """Bottleneck-style decode from top quantized stage only."""
+
+    def __init__(self, channels_top: int, channels_out: int, image_c: int, image_size: int) -> None:
+        super().__init__()
+        self.up = _build_upsample_stage(channels_top, channels_out, 1, image_size)
+        self.head = nn.Sequential(
+            nn.Conv2d(channels_out, channels_out // 2, 3, padding=1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(channels_out // 2, image_c, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, top: torch.Tensor) -> torch.Tensor:
+        return self.head(self.up(top))
+
+
+class DecoderMidOnlyPath(nn.Module):
+    """Decode from top->mid progressive path (without bot fusion)."""
+
+    def __init__(self, channels_mid: int, channels_out: int, from_spatial: int, image_c: int, image_size: int) -> None:
+        super().__init__()
+        self.up = _build_upsample_stage(channels_mid, channels_out, from_spatial, image_size)
+        self.head = nn.Sequential(
+            nn.Conv2d(channels_out, channels_out // 2, 3, padding=1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(channels_out // 2, image_c, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, mid: torch.Tensor) -> torch.Tensor:
+        return self.head(self.up(mid))
+
+
 class LFQHierarchicalDecoder(nn.Module):
     """
     Top-down decoder with notebook-style CE priors and fusion at each scale.
@@ -153,15 +187,38 @@ class LFQHierarchicalDecoder(nn.Module):
             nn.Sigmoid(),
         )
         self.image_tail = DecoderImageTail(self.up_to_image, self.head)
+        self.top_only_tail = DecoderTopOnlyPath(
+            channels_top=c_top,
+            channels_out=c_bot,
+            image_c=cfg.image_c,
+            image_size=cfg.image_size,
+        )
+        self.mid_only_tail = DecoderMidOnlyPath(
+            channels_mid=c_mid,
+            channels_out=c_bot,
+            from_spatial=s_mid,
+            image_c=cfg.image_c,
+            image_size=cfg.image_size,
+        )
 
-    def forward(self, enc: dict) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def forward(
+        self,
+        enc: dict,
+        depth: int = 3,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        if depth < 1 or depth > 3:
+            raise ValueError(f"depth must be in [1,3], got {depth}")
         prior_ces: List[torch.Tensor] = []
 
         h, ce = self.stem(enc["quant_top"], enc["idx_top"])
         prior_ces.append(ce)
+        if depth == 1:
+            return self.top_only_tail(h), prior_ces
 
         h, ce = self.block_mid(h, enc["quant_mid"], enc["idx_mid"])
         prior_ces.append(ce)
+        if depth == 2:
+            return self.mid_only_tail(h), prior_ces
 
         h, ce = self.block_bot(h, enc["quant_bot"], enc["idx_bot"])
         prior_ces.append(ce)

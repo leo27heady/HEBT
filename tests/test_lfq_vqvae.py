@@ -37,6 +37,20 @@ def _small_hierarchical_cfg(fusion: str = "conv") -> LFQVAEConfig:
     )
 
 
+def _small_progressive_cfg(fusion: str = "conv") -> LFQVAEConfig:
+    return LFQVAEConfig(
+        quantization_mode="hierarchical",
+        train_mode="progressive",
+        stage_channels=(32, 64, 128),
+        stage_codebook_sizes=(32, 512, 4096),
+        stage_lfq_dims=(5, 9, 12),
+        fusion=fusion,  # type: ignore[arg-type]
+        progressive_steps_per_stage=2,
+        progressive_freeze_parents=True,
+        progressive_prior_ce=False,
+    )
+
+
 def _small_video_cfg(train_mode: str = "joint") -> LFQVAEConfig:
     return LFQVAEConfig(
         quantization_mode="hierarchical",
@@ -87,6 +101,11 @@ def test_config_rejects_video_predictor_on_bottleneck():
         LFQVAEConfig(enable_video_predictor=True, quantization_mode="bottleneck")
 
 
+def test_config_rejects_progressive_on_bottleneck():
+    with pytest.raises(ValueError, match="progressive"):
+        LFQVAEConfig(train_mode="progressive", quantization_mode="bottleneck")
+
+
 def test_config_rejects_predictor_dim_mismatch():
     with pytest.raises(ValueError, match="pred_dim_top"):
         LFQVAEConfig(
@@ -118,6 +137,15 @@ def test_forward_shapes_hierarchical():
     assert out["idx_mid"].shape == (2, 4, 4)
     assert out["idx_top"].shape == (2, 1, 1)
     assert out["vq_loss"].dim() == 0
+
+
+def test_progressive_forward_shapes():
+    model = LFQVAE(_small_progressive_cfg())
+    x = torch.randn(2, 3, 64, 64)
+    for depth in (1, 2, 3):
+        model.set_progressive_depth(depth)
+        out = model(x)
+        assert out["x_hat"].shape == (2, 3, 64, 64)
 
 
 @pytest.mark.parametrize("fusion", ["concat", "conv", "gamma"])
@@ -257,6 +285,41 @@ def test_video_loss_disjoint_backward():
     loss.backward()
     assert torch.isfinite(loss)
     assert "ce" in metrics and "pred_mse" in metrics
+
+
+def test_progressive_depth_schedule():
+    model = LFQVAE(_small_progressive_cfg())
+    assert model.progressive_depth == 1
+    assert model.update_progressive(0) is None
+    assert model.progressive_depth == 1
+    assert model.update_progressive(2) == 2
+    assert model.progressive_depth == 2
+    assert model.update_progressive(4) == 3
+    assert model.progressive_depth == 3
+
+
+def test_progressive_freeze_parents():
+    model = LFQVAE(_small_progressive_cfg())
+    model.set_progressive_depth(2)
+    trainable = model.apply_progressive_freeze(True)
+    top_group = model.progressive_param_groups()["top"]
+    assert all(not p.requires_grad for p in top_group)
+    assert all(p.requires_grad for p in trainable)
+
+
+def test_progressive_loss_only_active_vq():
+    model = LFQVAE(_small_progressive_cfg())
+    model.set_progressive_depth(1)
+    x = torch.randn(2, 3, 64, 64)
+    loss, metrics = model.loss(x)
+    loss.backward()
+
+    top_grads = [p.grad for p in model.encoder.vq_top.parameters()]
+    mid_grads = [p.grad for p in model.encoder.vq_mid.parameters()]
+    bot_grads = [p.grad for p in model.encoder.vq_bot.parameters()]
+    assert any(g is not None for g in top_grads)
+    assert all(g is None for g in mid_grads)
+    assert all(g is None for g in bot_grads)
 
 
 def test_disjoint_decoder_tail_only_gradients():
