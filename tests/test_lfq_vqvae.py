@@ -10,7 +10,13 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model.vid.lfq_vqvae import LFQVAE, LFQVAEConfig
+from model.vid.lfq_vqvae import (
+    LFQVAE,
+    LFQVAEConfig,
+    build_cross_attn_mask_mid_to_bot,
+    build_cross_attn_mask_top_to_mid,
+    build_temporal_window_mask,
+)
 
 
 def _small_bottleneck_cfg() -> LFQVAEConfig:
@@ -28,6 +34,23 @@ def _small_hierarchical_cfg(fusion: str = "conv") -> LFQVAEConfig:
         stage_codebook_sizes=(32, 512, 4096),
         stage_lfq_dims=(5, 9, 12),
         fusion=fusion,  # type: ignore[arg-type]
+    )
+
+
+def _small_video_cfg(train_mode: str = "joint") -> LFQVAEConfig:
+    return LFQVAEConfig(
+        quantization_mode="hierarchical",
+        stage_channels=(32, 64, 128),
+        stage_codebook_sizes=(32, 512, 4096),
+        stage_lfq_dims=(5, 9, 12),
+        enable_video_predictor=True,
+        train_mode=train_mode,  # type: ignore[arg-type]
+        pred_n_heads=4,
+        pred_n_layers=2,
+        pred_dim_top=128,
+        pred_dim_mid=64,
+        pred_dim_bot=32,
+        max_T=8,
     )
 
 
@@ -56,6 +79,21 @@ def test_config_hierarchical_rejects_mismatched_codebooks():
             quantization_mode="hierarchical",
             stage_codebook_sizes=(32, 512),
             stage_lfq_dims=(5, 9, 12),
+        )
+
+
+def test_config_rejects_video_predictor_on_bottleneck():
+    with pytest.raises(ValueError, match="requires quantization_mode='hierarchical'"):
+        LFQVAEConfig(enable_video_predictor=True, quantization_mode="bottleneck")
+
+
+def test_config_rejects_predictor_dim_mismatch():
+    with pytest.raises(ValueError, match="pred_dim_top"):
+        LFQVAEConfig(
+            quantization_mode="hierarchical",
+            enable_video_predictor=True,
+            pred_dim_top=64,
+            stage_channels=(32, 64, 128),
         )
 
 
@@ -132,3 +170,110 @@ def test_hierarchical_encode_indices():
     indices = model.encode_indices(x)
     assert isinstance(indices, dict)
     assert indices["idx_top"].shape == (2, 1, 1)
+
+
+def test_temporal_window_masks():
+    m_top = build_temporal_window_mask(T=3, S=1, temporal_window=-1, device=torch.device("cpu"))
+    m_mid = build_temporal_window_mask(T=3, S=16, temporal_window=2, device=torch.device("cpu"))
+    m_bot = build_temporal_window_mask(T=3, S=256, temporal_window=1, device=torch.device("cpu"))
+    assert m_top.shape == (3, 3)
+    assert m_mid.shape == (48, 48)
+    assert m_bot.shape == (768, 768)
+    # bot window=1 should block previous frame
+    assert not bool(m_bot[256, 0])
+    # but allow same-frame token
+    assert bool(m_bot[256, 256])
+
+
+def test_cross_attention_masks():
+    t = 4
+    m_tm = build_cross_attn_mask_top_to_mid(t, torch.device("cpu"))
+    m_mb = build_cross_attn_mask_mid_to_bot(t, torch.device("cpu"))
+    assert m_tm.shape == (t * 16, t * 1)
+    assert m_mb.shape == (t * 256, t * 16)
+
+
+def test_encode_video_shapes():
+    model = LFQVAE(_small_video_cfg(train_mode="joint"))
+    video = torch.randn(2, 4, 3, 64, 64)
+    enc = model.encode_video(video)
+    assert enc["quant_bot"].shape == (2, 4, 32, 16, 16)
+    assert enc["quant_mid"].shape == (2, 4, 64, 4, 4)
+    assert enc["quant_top"].shape == (2, 4, 128, 1, 1)
+    assert enc["idx_bot"].shape == (2, 4, 16, 16)
+
+
+def test_predict_video_shapes():
+    model = LFQVAE(_small_video_cfg(train_mode="joint"))
+    video = torch.randn(2, 4, 3, 64, 64)
+    enc = model.encode_video(video)
+    pred = model.predict_video(enc, T=3)
+    assert pred["logits_top"].shape == (2, 3, 4096)
+    assert pred["logits_mid"].shape == (2, 48, 512)
+    assert pred["logits_bot"].shape == (2, 768, 32)
+
+
+def test_predict_video_rejects_t_exceeding_max_t():
+    model = LFQVAE(_small_video_cfg(train_mode="joint"))
+    video = torch.randn(2, 11, 3, 64, 64)
+    enc = model.encode_video(video)
+    with pytest.raises(ValueError, match="exceeds max_T"):
+        model.predict_video(enc, T=10)
+
+
+def test_stage_token_flatten_roundtrip_order():
+    x = torch.arange(2 * 3 * 4 * 2 * 2, dtype=torch.float32).reshape(2, 3, 4, 2, 2)
+    flat = LFQVAE._flatten_stage_tokens(x)
+    rec = LFQVAE._unflatten_stage_tokens(flat, B=2, T=3, S=2, C=4).reshape(2, 3, 4, 2, 2)
+    assert torch.equal(x, rec)
+
+
+def test_video_loss_joint_backward():
+    model = LFQVAE(_small_video_cfg(train_mode="joint"))
+    video = torch.randn(2, 4, 3, 64, 64)
+    loss, metrics = model.video_loss(video, train_mode="joint")
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert "recon" in metrics and "ce" in metrics
+
+
+def test_predictor_ce_uses_spatial_weights():
+    """Weighted predictor CE should match prior_ce scale, not raw stage sum."""
+    model = LFQVAE(_small_video_cfg(train_mode="joint"))
+    video = torch.randn(2, 4, 3, 64, 64)
+    _, metrics = model.video_loss(video, train_mode="joint")
+    ce_sum = metrics["ce_top"] + metrics["ce_mid"] + metrics["ce_bot"]
+    assert metrics["ce"] < ce_sum
+    assert metrics["ce"].item() < ce_sum.item() * 0.1
+
+
+def test_video_loss_disjoint_backward():
+    model = LFQVAE(_small_video_cfg(train_mode="disjoint"))
+    # mimic disjoint mode: freeze VQ-VAE stack
+    for p in model.vqvae_params():
+        p.requires_grad_(False)
+    video = torch.randn(2, 4, 3, 64, 64)
+    loss, metrics = model.video_loss(video, train_mode="disjoint")
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert "ce" in metrics and "pred_mse" in metrics
+
+
+def test_disjoint_decoder_tail_only_gradients():
+    cfg = _small_video_cfg(train_mode="disjoint")
+    cfg.lambda_pred_mse = 1.0
+    model = LFQVAE(cfg)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in model.decoder_image_params():
+        p.requires_grad_(True)
+
+    video = torch.randn(2, 4, 3, 64, 64)
+    loss, _ = model.video_loss(video, train_mode="disjoint")
+    loss.backward()
+
+    tail_grads = [p.grad for p in model.decoder_image_params()]
+    assert any(g is not None for g in tail_grads)
+
+    frozen_groups = model.encoder_params() + model.decoder_prior_params() + model.predictor_params()
+    assert all(p.grad is None for p in frozen_groups if not p.requires_grad)

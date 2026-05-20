@@ -8,8 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import ResBlock
-from .config import LFQVAEConfig, _log2_int
+from .config import LFQVAEConfig
 from .decoder import _build_upsample_stage
 
 
@@ -78,6 +77,10 @@ class HierarchicalDecoderBlock(nn.Module):
         h = self.fusion(h, quant_skip)
         return h, prior_ce
 
+    def forward_no_ce(self, h: torch.Tensor, quant_skip: torch.Tensor) -> torch.Tensor:
+        h = self.up(h)
+        return self.fusion(h, quant_skip)
+
 
 class DecoderStem(nn.Module):
     """Top level: start from quant_top; CE from learned prior vs idx_top."""
@@ -97,6 +100,21 @@ class DecoderStem(nn.Module):
         logits = self.to_prior(prior)
         prior_ce = F.cross_entropy(logits, idx_top.long(), reduction="mean")
         return quant_top, prior_ce
+
+    def forward_no_ce(self, quant_top: torch.Tensor) -> torch.Tensor:
+        return quant_top
+
+
+class DecoderImageTail(nn.Module):
+    """Final image-space tail after hierarchical stage fusion."""
+
+    def __init__(self, up_to_image: nn.Module, head: nn.Module) -> None:
+        super().__init__()
+        self.up_to_image = up_to_image
+        self.head = head
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.head(self.up_to_image(h))
 
 
 class LFQHierarchicalDecoder(nn.Module):
@@ -134,6 +152,7 @@ class LFQHierarchicalDecoder(nn.Module):
             nn.Conv2d(c_bot // 2, cfg.image_c, 3, padding=1),
             nn.Sigmoid(),
         )
+        self.image_tail = DecoderImageTail(self.up_to_image, self.head)
 
     def forward(self, enc: dict) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         prior_ces: List[torch.Tensor] = []
@@ -147,9 +166,20 @@ class LFQHierarchicalDecoder(nn.Module):
         h, ce = self.block_bot(h, enc["quant_bot"], enc["idx_bot"])
         prior_ces.append(ce)
 
-        h = self.up_to_image(h)
-        x_hat = self.head(h)
+        x_hat = self.image_tail(h)
         return x_hat, prior_ces
+
+    def decode_from_stages(
+        self,
+        quant_top: torch.Tensor,
+        quant_mid: torch.Tensor,
+        quant_bot: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode from provided stage features without prior CE terms."""
+        h = self.stem.forward_no_ce(quant_top)
+        h = self.block_mid.forward_no_ce(h, quant_mid)
+        h = self.block_bot.forward_no_ce(h, quant_bot)
+        return self.image_tail(h)
 
     def gamma_values(self) -> List[float]:
         """Collect learnable gamma scalars when fusion='gamma'."""

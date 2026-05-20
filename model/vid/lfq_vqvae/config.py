@@ -1,4 +1,4 @@
-"""Configuration for simple LFQ VQ-VAE (encode-decode only)."""
+"""Configuration for LFQ VQ-VAE (reconstruction + optional video predictor)."""
 
 from __future__ import annotations
 
@@ -19,11 +19,10 @@ def _log2_int(n: int) -> int:
 
 @dataclass
 class LFQVAEConfig:
-    """VQ-VAE with LFQ (bottleneck or hierarchical multi-stage quantization)."""
+    """VQ-VAE with LFQ (bottleneck or hierarchical), plus optional video predictor."""
 
     image_size: int = 64
     image_c: int = 3
-
     quantization_mode: Literal["bottleneck", "hierarchical"] = "bottleneck"
 
     # Spatial sizes after each encoder stage (bot -> mid -> top)
@@ -35,17 +34,41 @@ class LFQVAEConfig:
     lfq_dim: int = 12
 
     # Hierarchical mode: per-stage LFQ (bot, mid, top)
-    stage_codebook_sizes: tuple[int, ...] = (64, 512, 4096)
-    stage_lfq_dims: tuple[int, ...] = (6, 9, 12)
+    stage_codebook_sizes: tuple[int, ...] = (32, 512, 4096)
+    stage_lfq_dims: tuple[int, ...] = (5, 9, 12)
 
+    # LFQ regularization
     entropy_loss_weight: float = 0.1
     diversity_gamma: float = 1.0
 
-    # Hierarchical decoder
+    # Hierarchical decoder (reconstruction prior CE)
     fusion: Literal["concat", "conv", "gamma"] = "conv"
     lambda_prior_ce: float = 1.0
     prior_ce_weights: Literal["spatial", "uniform"] = "spatial"
     gamma_l2: float = 0.0
+
+    # Video predictor
+    enable_video_predictor: bool = False
+    predictor_mode: Literal["vanilla"] = "vanilla"
+    train_mode: Literal["recon_only", "disjoint", "joint"] = "recon_only"
+    pred_n_heads: int = 8
+    pred_n_layers: int = 4
+    pred_dim_top: int = 256
+    pred_dim_mid: int = 128
+    pred_dim_bot: int = 64
+    window_top: int = -1
+    window_mid: int = 2
+    window_bot: int = 1
+    soft_lookup_temperature: float = 1.0
+    use_gumbel_softmax: bool = False
+    gumbel_tau: float = 1.0
+    max_T: int = 16
+    detach_encoder_for_predictor: bool = True
+    detach_parent_features: bool = True
+
+    # Video losses
+    lambda_ce: float = 1.0
+    lambda_pred_mse: float = 0.0
 
     # Loss
     recon_loss: str = "mse"  # "mse" | "l1"
@@ -57,15 +80,19 @@ class LFQVAEConfig:
     def validate(self) -> None:
         if self.quantization_mode not in ("bottleneck", "hierarchical"):
             raise ValueError(
-                f"quantization_mode must be 'bottleneck' or 'hierarchical', "
-                f"got {self.quantization_mode!r}"
+                f"quantization_mode must be 'bottleneck' or 'hierarchical', got {self.quantization_mode!r}"
             )
         if self.fusion not in ("concat", "conv", "gamma"):
             raise ValueError(f"fusion must be 'concat', 'conv', or 'gamma', got {self.fusion!r}")
         if self.prior_ce_weights not in ("spatial", "uniform"):
             raise ValueError(
-                f"prior_ce_weights must be 'spatial' or 'uniform', "
-                f"got {self.prior_ce_weights!r}"
+                f"prior_ce_weights must be 'spatial' or 'uniform', got {self.prior_ce_weights!r}"
+            )
+        if self.predictor_mode != "vanilla":
+            raise ValueError(f"predictor_mode must be 'vanilla', got {self.predictor_mode!r}")
+        if self.train_mode not in ("recon_only", "disjoint", "joint"):
+            raise ValueError(
+                f"train_mode must be one of recon_only/disjoint/joint, got {self.train_mode!r}"
             )
 
         if len(self.stage_sizes) != len(self.stage_channels):
@@ -75,24 +102,17 @@ class LFQVAEConfig:
             )
         if len(self.stage_sizes) < 1:
             raise ValueError("At least one encoder stage is required")
-
         if self.stage_sizes[-1] != 1:
-            raise ValueError(
-                f"Final stage spatial size must be 1, got {self.stage_sizes[-1]}"
-            )
+            raise ValueError(f"Final stage spatial size must be 1, got {self.stage_sizes[-1]}")
 
         sizes = (self.image_size,) + tuple(self.stage_sizes)
         for i in range(len(sizes) - 1):
             from_s, to_s = sizes[i], sizes[i + 1]
             if from_s <= to_s:
-                raise ValueError(
-                    f"Stage sizes must strictly decrease: {from_s} -> {to_s}"
-                )
+                raise ValueError(f"Stage sizes must strictly decrease: {from_s} -> {to_s}")
             factor = from_s // to_s
             if factor * to_s != from_s or not _is_power_of_two(factor):
-                raise ValueError(
-                    f"Downsample factor {from_s}/{to_s} must be a power of 2"
-                )
+                raise ValueError(f"Downsample factor {from_s}/{to_s} must be a power of 2")
 
         if self.quantization_mode == "hierarchical":
             if len(self.stage_codebook_sizes) != len(self.stage_sizes):
@@ -105,28 +125,48 @@ class LFQVAEConfig:
                     "stage_lfq_dims must match stage_sizes length "
                     f"({len(self.stage_lfq_dims)} vs {len(self.stage_sizes)})"
                 )
-            for i, (k, d) in enumerate(
-                zip(self.stage_codebook_sizes, self.stage_lfq_dims)
-            ):
+            for i, (k, d) in enumerate(zip(self.stage_codebook_sizes, self.stage_lfq_dims)):
                 if not _is_power_of_two(k):
                     raise ValueError(f"stage {i} codebook_size must be power of 2, got {k}")
                 if 2**d != k:
-                    raise ValueError(
-                        f"stage {i}: lfq_dim={d} requires codebook_size={2**d}, got {k}"
-                    )
+                    raise ValueError(f"stage {i}: lfq_dim={d} requires codebook_size={2**d}, got {k}")
         else:
             if not _is_power_of_two(self.codebook_size):
-                raise ValueError(
-                    f"codebook_size must be a power of 2, got {self.codebook_size}"
-                )
+                raise ValueError(f"codebook_size must be a power of 2, got {self.codebook_size}")
             if 2**self.lfq_dim != self.codebook_size:
                 raise ValueError(
-                    f"lfq_dim={self.lfq_dim} requires codebook_size={2**self.lfq_dim}, "
-                    f"got {self.codebook_size}"
+                    f"lfq_dim={self.lfq_dim} requires codebook_size={2**self.lfq_dim}, got {self.codebook_size}"
                 )
 
         if self.recon_loss not in ("mse", "l1"):
             raise ValueError(f"recon_loss must be 'mse' or 'l1', got {self.recon_loss!r}")
+        if self.max_T < 1:
+            raise ValueError(f"max_T must be >= 1, got {self.max_T}")
+
+        if self.enable_video_predictor:
+            if self.quantization_mode != "hierarchical":
+                raise ValueError("Video predictor requires quantization_mode='hierarchical'")
+            if len(self.stage_sizes) != 3:
+                raise ValueError("Video predictor v1 expects exactly 3 stages (16, 4, 1)")
+            if tuple(self.stage_sizes) != (16, 4, 1):
+                raise ValueError(
+                    f"Video predictor v1 expects stage_sizes=(16, 4, 1), got {self.stage_sizes}"
+                )
+            if self.pred_dim_top != self.stage_channels[2]:
+                raise ValueError(
+                    "pred_dim_top must match top stage channel size "
+                    f"({self.pred_dim_top} vs {self.stage_channels[2]})"
+                )
+            if self.pred_dim_mid != self.stage_channels[1]:
+                raise ValueError(
+                    "pred_dim_mid must match mid stage channel size "
+                    f"({self.pred_dim_mid} vs {self.stage_channels[1]})"
+                )
+            if self.pred_dim_bot != self.stage_channels[0]:
+                raise ValueError(
+                    "pred_dim_bot must match bot stage channel size "
+                    f"({self.pred_dim_bot} vs {self.stage_channels[0]})"
+                )
 
     @property
     def bottleneck_channels(self) -> int:
