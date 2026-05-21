@@ -34,8 +34,8 @@ class LFQVAEConfig:
     lfq_dim: int = 12
 
     # Hierarchical mode: per-stage LFQ (bot, mid, top)
-    stage_codebook_sizes: tuple[int, ...] = (32, 512, 4096)
-    stage_lfq_dims: tuple[int, ...] = (5, 9, 12)
+    stage_codebook_sizes: tuple[int, ...] = (8, 32, 128)
+    stage_lfq_dims: tuple[int, ...] = (3, 5, 7)
 
     # LFQ regularization
     entropy_loss_weight: float = 0.1
@@ -51,7 +51,8 @@ class LFQVAEConfig:
     enable_video_predictor: bool = False
     predictor_mode: Literal["vanilla"] = "vanilla"
     train_mode: Literal["recon_only", "disjoint", "joint", "progressive"] = "recon_only"
-    progressive_steps_per_stage: int = 5000
+    progressive_stage_steps: tuple[int, ...] = (8000, 8000, 8000)
+    progressive_steps_per_stage: int | None = None
     progressive_freeze_parents: bool = True
     progressive_prior_ce: bool = False
     pred_n_heads: int = 8
@@ -78,6 +79,15 @@ class LFQVAEConfig:
     vq_loss_weight: float = 1.0
 
     def __post_init__(self) -> None:
+        if self.progressive_steps_per_stage is not None:
+            if self.progressive_steps_per_stage < 1:
+                raise ValueError(
+                    "progressive_steps_per_stage must be >= 1, got "
+                    f"{self.progressive_steps_per_stage}"
+                )
+            if self.progressive_stage_steps == (8000, 8000, 8000):
+                steps = self.progressive_steps_per_stage
+                self.progressive_stage_steps = (steps, steps, steps)
         self.validate()
 
     def validate(self) -> None:
@@ -97,10 +107,14 @@ class LFQVAEConfig:
             raise ValueError(
                 f"train_mode must be one of recon_only/disjoint/joint/progressive, got {self.train_mode!r}"
             )
-        if self.progressive_steps_per_stage < 1:
+        if len(self.progressive_stage_steps) != len(self.stage_sizes):
             raise ValueError(
-                f"progressive_steps_per_stage must be >= 1, got {self.progressive_steps_per_stage}"
+                "progressive_stage_steps must match stage_sizes length "
+                f"({len(self.progressive_stage_steps)} vs {len(self.stage_sizes)})"
             )
+        for i, steps in enumerate(self.progressive_stage_steps):
+            if steps < 1:
+                raise ValueError(f"progressive stage {i} steps must be >= 1, got {steps}")
 
         if len(self.stage_sizes) != len(self.stage_channels):
             raise ValueError(

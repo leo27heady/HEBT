@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from example_code.lfq_vqvae_viz import flatten_video_batch
 from model.vid.lfq_vqvae import (
     LFQVAE,
     LFQVAEConfig,
@@ -31,8 +32,8 @@ def _small_hierarchical_cfg(fusion: str = "conv") -> LFQVAEConfig:
     return LFQVAEConfig(
         quantization_mode="hierarchical",
         stage_channels=(32, 64, 128),
-        stage_codebook_sizes=(32, 512, 4096),
-        stage_lfq_dims=(5, 9, 12),
+        stage_codebook_sizes=(8, 32, 128),
+        stage_lfq_dims=(3, 5, 7),
         fusion=fusion,  # type: ignore[arg-type]
     )
 
@@ -42,10 +43,10 @@ def _small_progressive_cfg(fusion: str = "conv") -> LFQVAEConfig:
         quantization_mode="hierarchical",
         train_mode="progressive",
         stage_channels=(32, 64, 128),
-        stage_codebook_sizes=(32, 512, 4096),
-        stage_lfq_dims=(5, 9, 12),
+        stage_codebook_sizes=(8, 32, 128),
+        stage_lfq_dims=(3, 5, 7),
         fusion=fusion,  # type: ignore[arg-type]
-        progressive_steps_per_stage=2,
+        progressive_stage_steps=(2, 3, 4),
         progressive_freeze_parents=True,
         progressive_prior_ce=False,
     )
@@ -55,8 +56,8 @@ def _small_video_cfg(train_mode: str = "joint") -> LFQVAEConfig:
     return LFQVAEConfig(
         quantization_mode="hierarchical",
         stage_channels=(32, 64, 128),
-        stage_codebook_sizes=(32, 512, 4096),
-        stage_lfq_dims=(5, 9, 12),
+        stage_codebook_sizes=(8, 32, 128),
+        stage_lfq_dims=(3, 5, 7),
         enable_video_predictor=True,
         train_mode=train_mode,  # type: ignore[arg-type]
         pred_n_heads=4,
@@ -104,6 +105,15 @@ def test_config_rejects_video_predictor_on_bottleneck():
 def test_config_rejects_progressive_on_bottleneck():
     with pytest.raises(ValueError, match="progressive"):
         LFQVAEConfig(train_mode="progressive", quantization_mode="bottleneck")
+
+
+def test_config_rejects_bad_progressive_stage_steps_length():
+    with pytest.raises(ValueError, match="progressive_stage_steps"):
+        LFQVAEConfig(
+            quantization_mode="hierarchical",
+            train_mode="progressive",
+            progressive_stage_steps=(2, 3),
+        )
 
 
 def test_config_rejects_predictor_dim_mismatch():
@@ -236,9 +246,9 @@ def test_predict_video_shapes():
     video = torch.randn(2, 4, 3, 64, 64)
     enc = model.encode_video(video)
     pred = model.predict_video(enc, T=3)
-    assert pred["logits_top"].shape == (2, 3, 4096)
-    assert pred["logits_mid"].shape == (2, 48, 512)
-    assert pred["logits_bot"].shape == (2, 768, 32)
+    assert pred["logits_top"].shape == (2, 3, 128)
+    assert pred["logits_mid"].shape == (2, 48, 32)
+    assert pred["logits_bot"].shape == (2, 768, 8)
 
 
 def test_predict_video_rejects_t_exceeding_max_t():
@@ -247,6 +257,23 @@ def test_predict_video_rejects_t_exceeding_max_t():
     enc = model.encode_video(video)
     with pytest.raises(ValueError, match="exceeds max_T"):
         model.predict_video(enc, T=10)
+
+
+def test_flatten_video_batch_shape():
+    batch = torch.randn(4, 5, 3, 64, 64)
+    flat = flatten_video_batch(batch)
+    assert flat.shape == (20, 3, 64, 64)
+
+
+def test_progressive_recon_depth_matches_forward_not_full_decoder():
+    model = LFQVAE(_small_progressive_cfg())
+    model.set_progressive_depth(1)
+    x = torch.randn(5, 3, 64, 64)
+    via_forward = model(x)["x_hat"]
+    enc = model.encoder(x)
+    via_full_decoder, _ = model.decoder(enc, depth=3)
+    assert via_forward.shape == via_full_decoder.shape
+    assert not torch.allclose(via_forward, via_full_decoder)
 
 
 def test_stage_token_flatten_roundtrip_order():
@@ -294,7 +321,7 @@ def test_progressive_depth_schedule():
     assert model.progressive_depth == 1
     assert model.update_progressive(2) == 2
     assert model.progressive_depth == 2
-    assert model.update_progressive(4) == 3
+    assert model.update_progressive(5) == 3
     assert model.progressive_depth == 3
 
 
@@ -340,3 +367,24 @@ def test_disjoint_decoder_tail_only_gradients():
 
     frozen_groups = model.encoder_params() + model.decoder_prior_params() + model.predictor_params()
     assert all(p.grad is None for p in frozen_groups if not p.requires_grad)
+
+
+@pytest.mark.parametrize("detach_parents", [False, True])
+def test_decode_predicted_bot_only_shape_and_detach(detach_parents: bool):
+    cfg = _small_video_cfg(train_mode="joint")
+    cfg.detach_parent_features = detach_parents
+    model = LFQVAE(cfg)
+    B, T = 2, 3
+    feat_bot = torch.randn(B, T * 16 * 16, cfg.pred_dim_bot, requires_grad=True)
+    pred = {
+        "feat_bot": feat_bot,
+        "feat_mid": torch.randn(B, T * 4 * 4, cfg.pred_dim_mid),
+        "feat_top": torch.randn(B, T, cfg.pred_dim_top),
+    }
+    pred_rgb = model.decode_predicted(pred, B=B, T=T)
+    assert pred_rgb.shape == (B * T, 3, 64, 64)
+    pred_rgb.mean().backward()
+    if detach_parents:
+        assert feat_bot.grad is None
+    else:
+        assert feat_bot.grad is not None

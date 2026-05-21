@@ -14,6 +14,20 @@ from PIL import Image, ImageDraw, ImageFont
 from model.vid.lfq_vqvae import LFQVAE
 
 
+def flatten_video_batch(batch: torch.Tensor) -> torch.Tensor:
+    """
+    Collapse video clips into a flat image batch for per-frame VQ-VAE training/viz.
+
+    (B, T, C, H, W) -> (B*T, C, H, W). Already-flat (B, C, H, W) batches pass through.
+    """
+    if batch.dim() == 5:
+        b, t, c, h, w = batch.shape
+        return batch.reshape(b * t, c, h, w)
+    if batch.dim() == 4:
+        return batch
+    raise ValueError(f"Expected batch dim 4 or 5, got shape {tuple(batch.shape)}")
+
+
 _PAD = 4
 _LEFT_LABEL_W = 100
 _HEADER_H = 22
@@ -108,11 +122,7 @@ def save_recon_panel(
 ) -> str:
     """Simple grid: inputs on top row, reconstructions on bottom row."""
     model.eval()
-    if batch.dim() == 5:
-        B, T, C, H, W = batch.shape
-        frames = batch.reshape(B * T, C, H, W)
-    else:
-        frames = batch
+    frames = flatten_video_batch(batch)
 
     n = min(max_samples, frames.shape[0])
     x = frames[:n].to(device)
@@ -168,13 +178,8 @@ def save_video_panel(
 
     # --- Reconstruction row (all frames) ---
     flat = vid.reshape(Tp1, C, H, W)
-    if model.is_hierarchical:
-        enc_flat = model.encoder(flat)
-        recon_flat, _ = model.decoder(enc_flat)
-    else:
-        out = model(flat)
-        recon_flat = out["x_hat"]
-    recon_flat = recon_flat.clamp(0.0, 1.0)
+    # Use model.forward so progressive depth matches training (not always depth=3).
+    recon_flat = model(flat)["x_hat"].clamp(0.0, 1.0)
     row_labels.append("Recon")
     row_tiles.append([_to_uint8_chw(recon_flat[t]) for t in range(Tp1)])
 
@@ -231,7 +236,10 @@ def save_video_panel(
             f"mid={usage['mid']}/{k_mid} top={usage['top']}/{k_top}"
         )
     else:
-        print(f"  [viz] {tag} step {step} -> {out_path}")
+        depth_note = ""
+        if model.is_hierarchical and cfg.train_mode == "progressive":
+            depth_note = f" depth={model.progressive_depth}"
+        print(f"  [viz] {tag} step {step}{depth_note} -> {out_path}")
 
     model.train()
     return out_path

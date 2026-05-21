@@ -238,6 +238,10 @@ class LFQHierarchicalDecoder(nn.Module):
         h = self.block_bot.forward_no_ce(h, quant_bot)
         return self.image_tail(h)
 
+    def decode_bot_to_image(self, quant_bot: torch.Tensor) -> torch.Tensor:
+        """Decode bot-stage features directly to RGB through image tail only."""
+        return self.image_tail(quant_bot)
+
     def gamma_values(self) -> List[float]:
         """Collect learnable gamma scalars when fusion='gamma'."""
         gammas: List[float] = []

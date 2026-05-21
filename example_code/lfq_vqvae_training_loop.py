@@ -25,13 +25,13 @@ Activate the project environment first, then install the VQ dependency if needed
         --dataset_size 500 --batch_size 4 --num_workers 0 ^
         --epochs 10 --viz_every 50 --log_dir logs/lfq_vqvae_joint
 
-3) Disjoint predictor training (load recon checkpoint, freeze VQ stack):
+3) Disjoint predictor training (same 10k/context-5 dataset, load progressive checkpoint):
 
     python example_code/lfq_vqvae_training_loop.py ^
         --quantization_mode hierarchical --enable_video_predictor ^
         --train_mode disjoint --context_length 5 ^
-        --load_ckpt logs/lfq_vqvae_recon/checkpoints/epoch_020_step_XXXXXX_final.pt ^
-        --dataset_size 500 --batch_size 4 --num_workers 0 ^
+        --load_ckpt logs/lfq_vqvae_recon_progressive/checkpoints/epoch_XXX_step_XXXXXX_best_recon.pt ^
+        --dataset_size 10000 --batch_size 16 --num_workers 4 ^
         --epochs 10 --viz_every 50 --log_dir logs/lfq_vqvae_disjoint
 
 4) Bottleneck mode smoke test:
@@ -45,9 +45,9 @@ Activate the project environment first, then install the VQ dependency if needed
 
     python example_code/lfq_vqvae_training_loop.py ^
         --quantization_mode hierarchical --train_mode progressive ^
-        --progressive_steps_per_stage 5000 --progressive_freeze_parents ^
-        --dataset_size 2000 --batch_size 16 --context_length 1 ^
-        --epochs 500 --viz_every 100 ^
+        --progressive_stage_steps 12000 15000 15000 --progressive_freeze_parents ^
+        --dataset_size 10000 --batch_size 16 --context_length 5 ^
+        --max_steps 42000 --entropy_decay_start_step 0 --viz_every 100 ^
         --log_dir logs/lfq_vqvae_recon_progressive
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.vid.vid_shape_synthetic_dataset import VIDShapeSyntheticDataset  # noqa: E402
 from model.vid.lfq_vqvae import LFQVAE, LFQVAEConfig  # noqa: E402
-from lfq_vqvae_viz import save_recon_panel, save_video_panel  # noqa: E402
+from lfq_vqvae_viz import flatten_video_batch, save_recon_panel, save_video_panel  # noqa: E402
 
 
 class CSVLogger:
@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LFQ VQ-VAE training")
 
     p.add_argument("--image_size", type=int, default=64)
-    p.add_argument("--context_length", type=int, default=1,
+    p.add_argument("--context_length", type=int, default=5,
                    help="Frames per sample. recon_only flattens to images; disjoint/joint use full video (T+1).")
     p.add_argument("--stage_sizes", type=int, nargs="+", default=[16, 4, 1])
     p.add_argument("--stage_channels", type=int, nargs="+", default=[64, 128, 256])
@@ -190,7 +190,7 @@ def parse_args() -> argparse.Namespace:
         "--stage_codebook_sizes",
         type=int,
         nargs="+",
-        default=[32, 512, 4096],
+        default=[16, 64, 512],
         help="Hierarchical: bot, mid, top codebook sizes.",
     )
     p.add_argument(
@@ -224,10 +224,18 @@ def parse_args() -> argparse.Namespace:
         help="recon_only/progressive: VQ-VAE only, disjoint: selected predictor/decoder tail, joint: end-to-end video.",
     )
     p.add_argument(
+        "--progressive_stage_steps",
+        type=int,
+        nargs=3,
+        default=[8000, 3000, 3000],
+        metavar=("TOP", "MID", "BOT"),
+        help="Progressive mode: per-stage step budget [top, mid, bot].",
+    )
+    p.add_argument(
         "--progressive_steps_per_stage",
         type=int,
-        default=5000,
-        help="Progressive mode: steps to train before activating the next stage.",
+        default=None,
+        help="Deprecated alias. If set, expands to [N, N, N] when progressive_stage_steps is left default.",
     )
     p.add_argument(
         "--progressive_freeze_parents",
@@ -276,7 +284,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_ce", type=float, default=1.0)
     p.add_argument("--lambda_pred_mse", type=float, default=0.0)
 
-    p.add_argument("--dataset_size", type=int, default=2000)
+    p.add_argument("--dataset_size", type=int, default=10000)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=4)
 
@@ -324,6 +332,9 @@ def main() -> None:
         stage_lfq_dims = [
             int(math.log2(k)) for k in args.stage_codebook_sizes
         ]
+    progressive_stage_steps = tuple(args.progressive_stage_steps)
+    if args.progressive_steps_per_stage is not None and args.progressive_stage_steps == [8000, 8000, 8000]:
+        progressive_stage_steps = (args.progressive_steps_per_stage,) * 3
 
     cfg_max_t = args.max_T if args.max_T > 0 else max(1, args.context_length - 1)
 
@@ -347,6 +358,7 @@ def main() -> None:
         enable_video_predictor=args.enable_video_predictor,
         predictor_mode="vanilla",
         train_mode=args.train_mode,
+        progressive_stage_steps=progressive_stage_steps,
         progressive_steps_per_stage=args.progressive_steps_per_stage,
         progressive_freeze_parents=args.progressive_freeze_parents,
         progressive_prior_ce=args.progressive_prior_ce,
@@ -382,6 +394,8 @@ def main() -> None:
         strict = not (args.enable_video_predictor and args.train_mode == "disjoint")
         model.load_state_dict(ckpt["model_state"], strict=strict)
         print(f"Loaded checkpoint: {args.load_ckpt}")
+        if args.train_mode in ("disjoint", "joint") and model.is_hierarchical:
+            model.set_progressive_depth(3)
 
     if args.train_mode in ("disjoint", "joint") and not cfg.enable_video_predictor:
         raise ValueError("train_mode disjoint/joint requires --enable_video_predictor")
@@ -398,6 +412,34 @@ def main() -> None:
         print("Warning: progressive mode trains reconstruction only; predictor modules stay unused.")
     if args.train_mode == "progressive" and cfg.quantization_mode != "hierarchical":
         raise ValueError("train_mode progressive requires --quantization_mode hierarchical")
+    if args.train_mode == "progressive":
+        boundaries = []
+        acc = 0
+        for n_steps in cfg.progressive_stage_steps[:-1]:
+            acc += n_steps
+            boundaries.append(acc)
+        print(
+            f"Progressive schedule [top, mid, bot]={cfg.progressive_stage_steps}, "
+            f"transitions at steps {boundaries}"
+        )
+        if args.max_steps == 0:
+            args.max_steps = sum(cfg.progressive_stage_steps)
+            print(f"Progressive max_steps auto-set to {args.max_steps}")
+    if (
+        args.train_mode == "disjoint"
+        and args.disjoint_target == "predictor_only"
+        and args.lambda_pred_mse > 0
+        and args.detach_parent_features
+    ):
+        print(
+            "Warning: predictor_only + lambda_pred_mse>0 + detach_parent_features=True "
+            "detaches pred-MSE from predictor parameters."
+        )
+    if args.train_mode == "progressive" and args.entropy_decay_start_step > 0:
+        print(
+            "Warning: entropy decay is enabled during progressive training; "
+            "consider --entropy_decay_start_step 0 for stability."
+        )
 
     trainable: list[torch.nn.Parameter]
     if args.train_mode == "progressive":
@@ -465,10 +507,18 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
+    images_per_step = args.batch_size * max(1, args.context_length)
     print(
         f"Dataset: {args.dataset_size} samples, {len(loader)} batches/epoch "
-        f"(bs={args.batch_size}, context={args.context_length})"
+        f"(clips_bs={args.batch_size}, context={args.context_length}, "
+        f"images/step={images_per_step})"
     )
+    if args.train_mode in ("recon_only", "progressive") and args.context_length > 1:
+        print(
+            f"Encoder finetuning: each clip contributes {args.context_length} independent "
+            f"frames -> effective batch {args.batch_size} x {args.context_length} = "
+            f"{images_per_step} images per optimizer step"
+        )
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -483,14 +533,7 @@ def main() -> None:
         epoch_t0 = time.time()
         for batch in loader:
             last_batch = batch
-            if batch.dim() == 5 and batch.shape[1] > 1:
-                B, TS, C, H, W = batch.shape
-                frames = batch.reshape(B * TS, C, H, W)
-            elif batch.dim() == 5:
-                frames = batch[:, 0]
-            else:
-                frames = batch
-            frames = frames.to(device)
+            frames = flatten_video_batch(batch).to(device)
             batch_video = batch.to(device) if batch.dim() == 5 else None
 
             if args.train_mode == "progressive":

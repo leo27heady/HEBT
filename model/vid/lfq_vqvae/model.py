@@ -116,10 +116,13 @@ class LFQVAE(nn.Module):
     def update_progressive(self, step: int) -> Optional[int]:
         if not self.is_hierarchical or self.cfg.train_mode != "progressive":
             return None
-        desired = min(
-            len(self.cfg.stage_sizes),
-            1 + (step // max(1, self.cfg.progressive_steps_per_stage)),
-        )
+        desired = 1
+        boundary = 0
+        for stage_steps in self.cfg.progressive_stage_steps[:-1]:
+            boundary += stage_steps
+            if step >= boundary:
+                desired += 1
+        desired = min(len(self.cfg.stage_sizes), desired)
         if desired > self._progressive_depth:
             self._progressive_depth = desired
             return desired
@@ -345,20 +348,16 @@ class LFQVAE(nn.Module):
         }
 
     def decode_predicted(self, pred: Dict[str, torch.Tensor], B: int, T: int) -> torch.Tensor:
-        """Decode predicted stage features into RGB for target frames [1..T]."""
+        """Decode predicted bot features into RGB for target frames [1..T]."""
         if not self.is_hierarchical:
             raise RuntimeError("Predicted decode is supported only in hierarchical mode.")
-        s_bot, s_mid, s_top = self.cfg.stage_sizes
-        c_bot, c_mid, c_top = self.cfg.stage_channels
-
-        top_tokens = self.pred_to_quant_top(pred["feat_top"])
-        mid_tokens = self.pred_to_quant_mid(pred["feat_mid"])
+        s_bot, _, _ = self.cfg.stage_sizes
+        c_bot, _, _ = self.cfg.stage_channels
         bot_tokens = self.pred_to_quant_bot(pred["feat_bot"])
-
-        top = self._unflatten_stage_tokens(top_tokens, B=B, T=T, S=s_top, C=c_top)
-        mid = self._unflatten_stage_tokens(mid_tokens, B=B, T=T, S=s_mid, C=c_mid)
-        bot = self._unflatten_stage_tokens(bot_tokens, B=B, T=T, S=s_bot, C=c_bot)
-        return self.decoder.decode_from_stages(top, mid, bot)
+        quant_bot = self._unflatten_stage_tokens(bot_tokens, B=B, T=T, S=s_bot, C=c_bot)
+        if self.cfg.detach_parent_features:
+            quant_bot = quant_bot.detach()
+        return self.decoder.decode_bot_to_image(quant_bot)
 
     def _flatten_encoded_video(
         self, enc_video: Dict[str, torch.Tensor], B: int, Tp1: int
@@ -430,7 +429,7 @@ class LFQVAE(nn.Module):
 
         if train_mode == "joint":
             enc_flat = self._flatten_encoded_video(enc_video, B=B, Tp1=Tp1)
-            x_hat, prior_ces = self.decoder(enc_flat)
+            x_hat, prior_ces = self.decoder(enc_flat, depth=3)
             recon = self._recon_loss(x_hat, all_frames)
             vq = enc_flat["vq_loss"]
             recon_total = recon + self.cfg.vq_loss_weight * vq
