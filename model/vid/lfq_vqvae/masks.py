@@ -60,3 +60,41 @@ def build_cross_attn_mask_mid_to_bot(T: int, device: torch.device) -> torch.Tens
     for t in range(T):
         full[t * s_child:(t + 1) * s_child, t * s_parent:(t + 1) * s_parent] = frame_mask
     return full
+
+
+def build_ebt_self_attn_mask(
+    T: int,
+    S: int,
+    temporal_window: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build EBT self-attention mask for concatenated [real | predicted] sequences.
+
+    Layout (rows=query, cols=key) over sequence length 2*(T*S):
+      - real -> real: causal with temporal window
+      - real -> predicted: blocked
+      - predicted -> real: causal with temporal window
+      - predicted -> predicted: same-frame only
+
+    Returns:
+        (2*T*S, 2*T*S) boolean mask, True means allowed.
+    """
+    seq_len = T * S
+    real_real = build_temporal_window_mask(T, S, temporal_window, device)
+
+    real_pred = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+    pred_real = real_real.clone()
+
+    pred_pred = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+    for t in range(T):
+        start = t * S
+        end = (t + 1) * S
+        pred_pred[start:end, start:end] = True
+
+    full = torch.zeros(2 * seq_len, 2 * seq_len, dtype=torch.bool, device=device)
+    full[:seq_len, :seq_len] = real_real
+    full[:seq_len, seq_len:] = real_pred
+    full[seq_len:, :seq_len] = pred_real
+    full[seq_len:, seq_len:] = pred_pred
+    return full

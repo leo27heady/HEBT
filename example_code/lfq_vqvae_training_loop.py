@@ -254,6 +254,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pred_dim_top", type=int, default=256)
     p.add_argument("--pred_dim_mid", type=int, default=128)
     p.add_argument("--pred_dim_bot", type=int, default=64)
+    p.add_argument(
+        "--predictor_mode",
+        type=str,
+        default="vanilla",
+        choices=["vanilla", "ebt"],
+        help="Predictor architecture: vanilla transformer or EBT-MCMC refinement.",
+    )
+    p.add_argument("--ebt_mcmc_steps", type=int, default=5)
+    p.add_argument("--ebt_mcmc_step_size", type=float, default=1.0)
+    p.add_argument(
+        "--ebt_initial_condition",
+        type=str,
+        default="random",
+        choices=["random", "zero"],
+        help="EBT initialization distribution over codebook logits.",
+    )
     p.add_argument("--window_top", type=int, default=-1)
     p.add_argument("--window_mid", type=int, default=2)
     p.add_argument("--window_bot", type=int, default=1)
@@ -283,6 +299,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lambda_ce", type=float, default=1.0)
     p.add_argument("--lambda_pred_mse", type=float, default=0.0)
+    p.add_argument(
+        "--soft_target_tau",
+        type=float,
+        default=0.0,
+        help="Soft CE temperature over codebook distances (>0 enables soft targets).",
+    )
 
     p.add_argument("--dataset_size", type=int, default=10000)
     p.add_argument("--batch_size", type=int, default=8)
@@ -356,7 +378,7 @@ def main() -> None:
         prior_ce_weights=args.prior_ce_weights,
         gamma_l2=args.gamma_l2,
         enable_video_predictor=args.enable_video_predictor,
-        predictor_mode="vanilla",
+        predictor_mode=args.predictor_mode,
         train_mode=args.train_mode,
         progressive_stage_steps=progressive_stage_steps,
         progressive_steps_per_stage=args.progressive_steps_per_stage,
@@ -367,6 +389,9 @@ def main() -> None:
         pred_dim_top=args.pred_dim_top,
         pred_dim_mid=args.pred_dim_mid,
         pred_dim_bot=args.pred_dim_bot,
+        ebt_mcmc_steps=args.ebt_mcmc_steps,
+        ebt_mcmc_step_size=args.ebt_mcmc_step_size,
+        ebt_initial_condition=args.ebt_initial_condition,
         window_top=args.window_top,
         window_mid=args.window_mid,
         window_bot=args.window_bot,
@@ -378,11 +403,14 @@ def main() -> None:
         detach_parent_features=args.detach_parent_features,
         lambda_ce=args.lambda_ce,
         lambda_pred_mse=args.lambda_pred_mse,
+        soft_target_tau=args.soft_target_tau,
     )
     model = LFQVAE(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
     print(f"Mode: {cfg.quantization_mode}  fusion: {cfg.fusion}  train_mode: {cfg.train_mode}")
+    if cfg.enable_video_predictor:
+        print(f"Predictor mode: {cfg.predictor_mode}")
     print(f"Stages: {cfg.spatial_sizes_descending()}  channels: {cfg.stage_channels}")
     if cfg.quantization_mode == "hierarchical":
         print(f"Codebooks: {cfg.stage_codebook_sizes}  lfq_dims: {cfg.stage_lfq_dims}")

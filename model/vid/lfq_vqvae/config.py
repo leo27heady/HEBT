@@ -49,7 +49,7 @@ class LFQVAEConfig:
 
     # Video predictor
     enable_video_predictor: bool = False
-    predictor_mode: Literal["vanilla"] = "vanilla"
+    predictor_mode: Literal["vanilla", "ebt"] = "vanilla"
     train_mode: Literal["recon_only", "disjoint", "joint", "progressive"] = "recon_only"
     progressive_stage_steps: tuple[int, ...] = (8000, 8000, 8000)
     progressive_steps_per_stage: int | None = None
@@ -69,10 +69,14 @@ class LFQVAEConfig:
     max_T: int = 16
     detach_encoder_for_predictor: bool = True
     detach_parent_features: bool = True
+    ebt_mcmc_steps: int = 5
+    ebt_mcmc_step_size: float = 0.1
+    ebt_initial_condition: Literal["random", "zero"] = "random"
 
     # Video losses
     lambda_ce: float = 1.0
     lambda_pred_mse: float = 0.0
+    soft_target_tau: float = 0.0
 
     # Loss
     recon_loss: str = "mse"  # "mse" | "l1"
@@ -101,8 +105,10 @@ class LFQVAEConfig:
             raise ValueError(
                 f"prior_ce_weights must be 'spatial' or 'uniform', got {self.prior_ce_weights!r}"
             )
-        if self.predictor_mode != "vanilla":
-            raise ValueError(f"predictor_mode must be 'vanilla', got {self.predictor_mode!r}")
+        if self.predictor_mode not in ("vanilla", "ebt"):
+            raise ValueError(
+                f"predictor_mode must be 'vanilla' or 'ebt', got {self.predictor_mode!r}"
+            )
         if self.train_mode not in ("recon_only", "disjoint", "joint", "progressive"):
             raise ValueError(
                 f"train_mode must be one of recon_only/disjoint/joint/progressive, got {self.train_mode!r}"
@@ -163,6 +169,19 @@ class LFQVAEConfig:
             raise ValueError(f"recon_loss must be 'mse' or 'l1', got {self.recon_loss!r}")
         if self.max_T < 1:
             raise ValueError(f"max_T must be >= 1, got {self.max_T}")
+        if self.ebt_mcmc_steps < 1:
+            raise ValueError(f"ebt_mcmc_steps must be >= 1, got {self.ebt_mcmc_steps}")
+        if self.ebt_mcmc_step_size <= 0:
+            raise ValueError(
+                f"ebt_mcmc_step_size must be > 0, got {self.ebt_mcmc_step_size}"
+            )
+        if self.ebt_initial_condition not in ("random", "zero"):
+            raise ValueError(
+                "ebt_initial_condition must be 'random' or 'zero', got "
+                f"{self.ebt_initial_condition!r}"
+            )
+        if self.soft_target_tau < 0:
+            raise ValueError(f"soft_target_tau must be >= 0, got {self.soft_target_tau}")
 
         if self.enable_video_predictor:
             if self.quantization_mode != "hierarchical":

@@ -14,6 +14,7 @@ from example_code.lfq_vqvae_viz import flatten_video_batch
 from model.vid.lfq_vqvae import (
     LFQVAE,
     LFQVAEConfig,
+    build_ebt_self_attn_mask,
     build_cross_attn_mask_mid_to_bot,
     build_cross_attn_mask_top_to_mid,
     build_temporal_window_mask,
@@ -52,13 +53,18 @@ def _small_progressive_cfg(fusion: str = "conv") -> LFQVAEConfig:
     )
 
 
-def _small_video_cfg(train_mode: str = "joint") -> LFQVAEConfig:
+def _small_video_cfg(
+    train_mode: str = "joint",
+    predictor_mode: str = "vanilla",
+    soft_target_tau: float = 0.0,
+) -> LFQVAEConfig:
     return LFQVAEConfig(
         quantization_mode="hierarchical",
         stage_channels=(32, 64, 128),
         stage_codebook_sizes=(8, 32, 128),
         stage_lfq_dims=(3, 5, 7),
         enable_video_predictor=True,
+        predictor_mode=predictor_mode,  # type: ignore[arg-type]
         train_mode=train_mode,  # type: ignore[arg-type]
         pred_n_heads=4,
         pred_n_layers=2,
@@ -66,6 +72,7 @@ def _small_video_cfg(train_mode: str = "joint") -> LFQVAEConfig:
         pred_dim_mid=64,
         pred_dim_bot=32,
         max_T=8,
+        soft_target_tau=soft_target_tau,
     )
 
 
@@ -124,6 +131,15 @@ def test_config_rejects_predictor_dim_mismatch():
             pred_dim_top=64,
             stage_channels=(32, 64, 128),
         )
+
+
+def test_config_accepts_predictor_mode_ebt():
+    cfg = LFQVAEConfig(
+        quantization_mode="hierarchical",
+        enable_video_predictor=True,
+        predictor_mode="ebt",
+    )
+    assert cfg.predictor_mode == "ebt"
 
 
 def test_forward_shapes_bottleneck():
@@ -231,6 +247,21 @@ def test_cross_attention_masks():
     assert m_mb.shape == (t * 256, t * 16)
 
 
+def test_ebt_self_attention_mask_quadrants():
+    t, s = 3, 16
+    m = build_ebt_self_attn_mask(t, s, temporal_window=2, device=torch.device("cpu"))
+    n = t * s
+    assert m.shape == (2 * n, 2 * n)
+    # real->pred is blocked
+    assert not bool(m[0, n])
+    # pred->real is allowed causally at same-frame token
+    assert bool(m[n, 0])
+    # pred->pred across frames should be blocked
+    assert not bool(m[n + s, n])
+    # pred->pred inside same frame should be allowed
+    assert bool(m[n, n + 1])
+
+
 def test_encode_video_shapes():
     model = LFQVAE(_small_video_cfg(train_mode="joint"))
     video = torch.randn(2, 4, 3, 64, 64)
@@ -241,8 +272,9 @@ def test_encode_video_shapes():
     assert enc["idx_bot"].shape == (2, 4, 16, 16)
 
 
-def test_predict_video_shapes():
-    model = LFQVAE(_small_video_cfg(train_mode="joint"))
+@pytest.mark.parametrize("predictor_mode", ["vanilla", "ebt"])
+def test_predict_video_shapes(predictor_mode: str):
+    model = LFQVAE(_small_video_cfg(train_mode="joint", predictor_mode=predictor_mode))
     video = torch.randn(2, 4, 3, 64, 64)
     enc = model.encode_video(video)
     pred = model.predict_video(enc, T=3)
@@ -312,6 +344,27 @@ def test_video_loss_disjoint_backward():
     loss.backward()
     assert torch.isfinite(loss)
     assert "ce" in metrics and "pred_mse" in metrics
+
+
+def test_video_loss_disjoint_backward_ebt():
+    model = LFQVAE(_small_video_cfg(train_mode="disjoint", predictor_mode="ebt"))
+    for p in model.vqvae_params():
+        p.requires_grad_(False)
+    video = torch.randn(2, 4, 3, 64, 64)
+    loss, metrics = model.video_loss(video, train_mode="disjoint")
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["ce"])
+
+
+def test_video_loss_soft_target_tau_path():
+    model = LFQVAE(_small_video_cfg(train_mode="joint", predictor_mode="vanilla", soft_target_tau=0.2))
+    video = torch.randn(2, 4, 3, 64, 64)
+    loss, metrics = model.video_loss(video, train_mode="joint")
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["ce_top"])
+    assert torch.isfinite(metrics["ce_mid"])
+    assert torch.isfinite(metrics["ce_bot"])
 
 
 def test_progressive_depth_schedule():

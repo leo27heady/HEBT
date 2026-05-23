@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .config import LFQVAEConfig
 from .decoder import LFQDecoder
+from .ebt_predictor import EBTPredictorStage
 from .encoder import LFQEncoder
 from .hierarchical_decoder import LFQHierarchicalDecoder
 from .hierarchical_encoder import LFQHierarchicalEncoder
@@ -30,9 +31,9 @@ class LFQVAE(nn.Module):
             self.encoder = LFQHierarchicalEncoder(cfg)
             self.decoder = LFQHierarchicalDecoder(cfg)
 
-        self.predictor_top: PredictorStage | None = None
-        self.predictor_mid: PredictorStage | None = None
-        self.predictor_bot: PredictorStage | None = None
+        self.predictor_top: nn.Module | None = None
+        self.predictor_mid: nn.Module | None = None
+        self.predictor_bot: nn.Module | None = None
         self.pred_to_quant_top: nn.Module = nn.Identity()
         self.pred_to_quant_mid: nn.Module = nn.Identity()
         self.pred_to_quant_bot: nn.Module = nn.Identity()
@@ -53,44 +54,90 @@ class LFQVAE(nn.Module):
         d_bot, d_mid, d_top = cfg.stage_lfq_dims
         s_bot, s_mid, s_top = cfg.stage_sizes
 
-        self.predictor_top = PredictorStage(
-            dim=cfg.pred_dim_top,
-            n_heads=cfg.pred_n_heads,
-            n_layers=cfg.pred_n_layers,
-            codebook_size=k_top,
-            spatial_size=s_top * s_top,
-            temporal_window=cfg.window_top,
-            has_parent=False,
-            lfq_dim=d_top,
-            max_T=cfg.max_T,
-            use_gumbel_softmax=cfg.use_gumbel_softmax,
-        )
-        self.predictor_mid = PredictorStage(
-            dim=cfg.pred_dim_mid,
-            n_heads=cfg.pred_n_heads,
-            n_layers=cfg.pred_n_layers,
-            codebook_size=k_mid,
-            spatial_size=s_mid * s_mid,
-            temporal_window=cfg.window_mid,
-            has_parent=True,
-            parent_dim=cfg.pred_dim_top,
-            lfq_dim=d_mid,
-            max_T=cfg.max_T,
-            use_gumbel_softmax=cfg.use_gumbel_softmax,
-        )
-        self.predictor_bot = PredictorStage(
-            dim=cfg.pred_dim_bot,
-            n_heads=cfg.pred_n_heads,
-            n_layers=cfg.pred_n_layers,
-            codebook_size=k_bot,
-            spatial_size=s_bot * s_bot,
-            temporal_window=cfg.window_bot,
-            has_parent=True,
-            parent_dim=cfg.pred_dim_mid,
-            lfq_dim=d_bot,
-            max_T=cfg.max_T,
-            use_gumbel_softmax=cfg.use_gumbel_softmax,
-        )
+        if cfg.predictor_mode == "ebt":
+            self.predictor_top = EBTPredictorStage(
+                dim=cfg.pred_dim_top,
+                n_heads=cfg.pred_n_heads,
+                n_layers=cfg.pred_n_layers,
+                codebook_size=k_top,
+                spatial_size=s_top * s_top,
+                temporal_window=cfg.window_top,
+                has_parent=False,
+                lfq_dim=d_top,
+                max_T=cfg.max_T,
+                mcmc_num_steps=cfg.ebt_mcmc_steps,
+                mcmc_step_size=cfg.ebt_mcmc_step_size,
+                initial_condition=cfg.ebt_initial_condition,
+            )
+            self.predictor_mid = EBTPredictorStage(
+                dim=cfg.pred_dim_mid,
+                n_heads=cfg.pred_n_heads,
+                n_layers=cfg.pred_n_layers,
+                codebook_size=k_mid,
+                spatial_size=s_mid * s_mid,
+                temporal_window=cfg.window_mid,
+                has_parent=True,
+                parent_dim=cfg.pred_dim_top,
+                lfq_dim=d_mid,
+                max_T=cfg.max_T,
+                mcmc_num_steps=cfg.ebt_mcmc_steps,
+                mcmc_step_size=cfg.ebt_mcmc_step_size,
+                initial_condition=cfg.ebt_initial_condition,
+            )
+            self.predictor_bot = EBTPredictorStage(
+                dim=cfg.pred_dim_bot,
+                n_heads=cfg.pred_n_heads,
+                n_layers=cfg.pred_n_layers,
+                codebook_size=k_bot,
+                spatial_size=s_bot * s_bot,
+                temporal_window=cfg.window_bot,
+                has_parent=True,
+                parent_dim=cfg.pred_dim_mid,
+                lfq_dim=d_bot,
+                max_T=cfg.max_T,
+                mcmc_num_steps=cfg.ebt_mcmc_steps,
+                mcmc_step_size=cfg.ebt_mcmc_step_size,
+                initial_condition=cfg.ebt_initial_condition,
+            )
+        else:
+            self.predictor_top = PredictorStage(
+                dim=cfg.pred_dim_top,
+                n_heads=cfg.pred_n_heads,
+                n_layers=cfg.pred_n_layers,
+                codebook_size=k_top,
+                spatial_size=s_top * s_top,
+                temporal_window=cfg.window_top,
+                has_parent=False,
+                lfq_dim=d_top,
+                max_T=cfg.max_T,
+                use_gumbel_softmax=cfg.use_gumbel_softmax,
+            )
+            self.predictor_mid = PredictorStage(
+                dim=cfg.pred_dim_mid,
+                n_heads=cfg.pred_n_heads,
+                n_layers=cfg.pred_n_layers,
+                codebook_size=k_mid,
+                spatial_size=s_mid * s_mid,
+                temporal_window=cfg.window_mid,
+                has_parent=True,
+                parent_dim=cfg.pred_dim_top,
+                lfq_dim=d_mid,
+                max_T=cfg.max_T,
+                use_gumbel_softmax=cfg.use_gumbel_softmax,
+            )
+            self.predictor_bot = PredictorStage(
+                dim=cfg.pred_dim_bot,
+                n_heads=cfg.pred_n_heads,
+                n_layers=cfg.pred_n_layers,
+                codebook_size=k_bot,
+                spatial_size=s_bot * s_bot,
+                temporal_window=cfg.window_bot,
+                has_parent=True,
+                parent_dim=cfg.pred_dim_mid,
+                lfq_dim=d_bot,
+                max_T=cfg.max_T,
+                use_gumbel_softmax=cfg.use_gumbel_softmax,
+            )
 
         self.pred_to_quant_top = nn.Linear(cfg.pred_dim_top, c_top)
         self.pred_to_quant_mid = nn.Linear(cfg.pred_dim_mid, c_mid)
@@ -217,6 +264,25 @@ class LFQVAE(nn.Module):
     def _weighted_prior_ce(self, prior_ces: List[torch.Tensor]) -> torch.Tensor:
         ascending = list(self.cfg.spatial_sizes_ascending())
         return self._weighted_stage_ce(prior_ces, ascending[: len(prior_ces)])
+
+    @staticmethod
+    def _soft_ce_loss(
+        logits: torch.Tensor,
+        target_indices: torch.Tensor,
+        codebook_weights: torch.Tensor,
+        tau: float,
+    ) -> torch.Tensor:
+        if tau <= 0:
+            raise ValueError("tau must be > 0 for soft CE loss.")
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        log_probs = F.log_softmax(flat_logits, dim=-1)
+        target_codes = codebook_weights[target_indices.long()]
+        codebook = codebook_weights.to(flat_logits.device)
+        target_sq = (target_codes ** 2).sum(dim=-1, keepdim=True)
+        codebook_sq = (codebook ** 2).sum(dim=-1).unsqueeze(0)
+        dists = target_sq + codebook_sq - 2.0 * (target_codes @ codebook.t())
+        soft_targets = F.softmax(-dists / max(tau, 1e-6), dim=-1)
+        return -(soft_targets * log_probs).sum(dim=-1).mean()
 
     def loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         out = self.forward(x)
@@ -406,9 +472,30 @@ class LFQVAE(nn.Module):
         tgt_mid = enc_video["idx_mid"][:, 1:].reshape(B * T * (s_mid * s_mid)).long()
         tgt_bot = enc_video["idx_bot"][:, 1:].reshape(B * T * (s_bot * s_bot)).long()
 
-        ce_top = F.cross_entropy(pred["logits_top"].reshape(-1, k_top), tgt_top)
-        ce_mid = F.cross_entropy(pred["logits_mid"].reshape(-1, k_mid), tgt_mid)
-        ce_bot = F.cross_entropy(pred["logits_bot"].reshape(-1, k_bot), tgt_bot)
+        if self.cfg.soft_target_tau > 0:
+            assert self.predictor_top and self.predictor_mid and self.predictor_bot
+            ce_top = self._soft_ce_loss(
+                pred["logits_top"],
+                tgt_top,
+                self.predictor_top.codebook_weights,  # type: ignore[attr-defined]
+                self.cfg.soft_target_tau,
+            )
+            ce_mid = self._soft_ce_loss(
+                pred["logits_mid"],
+                tgt_mid,
+                self.predictor_mid.codebook_weights,  # type: ignore[attr-defined]
+                self.cfg.soft_target_tau,
+            )
+            ce_bot = self._soft_ce_loss(
+                pred["logits_bot"],
+                tgt_bot,
+                self.predictor_bot.codebook_weights,  # type: ignore[attr-defined]
+                self.cfg.soft_target_tau,
+            )
+        else:
+            ce_top = F.cross_entropy(pred["logits_top"].reshape(-1, k_top), tgt_top)
+            ce_mid = F.cross_entropy(pred["logits_mid"].reshape(-1, k_mid), tgt_mid)
+            ce_bot = F.cross_entropy(pred["logits_bot"].reshape(-1, k_bot), tgt_bot)
         ce_weighted = self._weighted_stage_ce([ce_top, ce_mid, ce_bot], [s_top, s_mid, s_bot])
 
         if self.cfg.lambda_pred_mse > 0:
